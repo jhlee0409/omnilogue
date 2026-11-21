@@ -739,5 +739,30 @@ describe("metadataSlice", () => {
         settings: { liveRefresh: true },
       });
     });
+
+    it("two toggles before the first save answers flip twice", async () => {
+      const useStore = createTestStore();
+      let answerFirst: (metadata: UserMetadata) => void = () => {};
+      mockInvoke.mockImplementationOnce(
+        () => new Promise<UserMetadata>((resolve) => (answerFirst = resolve))
+      );
+      mockInvoke.mockImplementationOnce((_command: string, args: { settings: UserMetadata["settings"] }) =>
+        Promise.resolve({ ...DEFAULT_USER_METADATA, settings: args.settings })
+      );
+
+      const first = useStore.getState().toggleLiveRefresh();
+      const second = useStore.getState().toggleLiveRefresh();
+      await vi.waitFor(() => expect(mockInvoke).toHaveBeenCalledTimes(1));
+      answerFirst({ ...DEFAULT_USER_METADATA, settings: { liveRefresh: false } });
+      await Promise.all([first, second]);
+
+      expect(mockInvoke).toHaveBeenNthCalledWith(1, "update_user_settings", {
+        settings: { liveRefresh: false },
+      });
+      expect(mockInvoke).toHaveBeenNthCalledWith(2, "update_user_settings", {
+        settings: { liveRefresh: true },
+      });
+      expect(useStore.getState().userMetadata.settings.liveRefresh).toBe(true);
+    });
   });
 });

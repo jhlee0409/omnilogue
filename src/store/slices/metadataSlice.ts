@@ -15,7 +15,7 @@ import type {
   ClaudeAiExportAdded,
   WslSettings,
 } from "../../types";
-import { DEFAULT_USER_METADATA, isLiveRefreshOn } from "../../types";
+import { DEFAULT_USER_METADATA } from "../../types";
 import { matchGlobPattern } from "../../utils/globUtils";
 import {
   CLAUDE_AI_PROVIDER_ID,
@@ -30,6 +30,11 @@ import { toast } from "sonner";
 import i18n from "@/i18n";
 import { favoritesMissingRef, libraryRefOf, projectListing } from "@/navigation/library";
 import type { SessionRef } from "@/navigation/place";
+
+/** A settings update, or a function of the settings current at write time. */
+export type SettingsUpdate =
+  | Partial<UserSettings>
+  | ((settings: UserSettings) => Partial<UserSettings>);
 
 // ============================================================================
 // State Interface
@@ -84,8 +89,11 @@ export interface MetadataSliceActions {
     projectPath: string,
     update: Partial<ProjectMetadata>
   ) => Promise<void>;
-  /** Update global user settings */
-  updateUserSettings: (update: Partial<UserSettings>) => Promise<void>;
+  /**
+   * Update global user settings. A function computes the update from the
+   * settings current when the write runs, after earlier queued writes.
+   */
+  updateUserSettings: (update: SettingsUpdate) => Promise<void>;
   /**
    * User metadata as the backend last saved it, from any window (issue #656):
    * it replaces this window's copy; another window's change of the custom
@@ -338,12 +346,12 @@ export const createMetadataSlice: StateCreator<
       }
     }),
 
-  updateUserSettings: (update: Partial<UserSettings>) =>
+  updateUserSettings: (update: SettingsUpdate) =>
     inTurn(async () => {
       const { userMetadata } = get();
       const mergedSettings: UserSettings = {
         ...userMetadata.settings,
-        ...update,
+        ...(typeof update === "function" ? update(userMetadata.settings) : update),
       };
 
       try {
@@ -538,7 +546,8 @@ export const createMetadataSlice: StateCreator<
 
   toggleLiveRefresh: async () => {
     try {
-      await get().updateUserSettings({ liveRefresh: !isLiveRefreshOn(get().userMetadata) });
+      // Read in turn: two quick toggles must flip twice, not save one value.
+      await get().updateUserSettings((settings) => ({ liveRefresh: settings.liveRefresh === false }));
     } catch {
       // `updateUserSettings` has recorded the failure in `metadataError`.
     }
