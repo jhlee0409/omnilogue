@@ -993,6 +993,37 @@ fn extend_in_scope(
     Ok(())
 }
 
+/// Run the [`SEARCH_ADAPTERS`] of `providers`, in table order. Blocking: the
+/// adapters walk their stores synchronously, a filtered search the whole
+/// store, so callers run it off the async runtime.
+fn search_adapters(
+    query: &str,
+    providers: &[String],
+    filters: &serde_json::Value,
+    max_results: usize,
+) -> Vec<ClaudeMessage> {
+    let filters = SearchFilters::parse(filters);
+    let mut hits = Vec::new();
+    for (id, label, adapter) in &SEARCH_ADAPTERS {
+        if !providers.iter().any(|p| p == id) {
+            continue;
+        }
+        match adapter {
+            SearchAdapter::Scoped(search) => {
+                hits.extend(search(query, max_results, &filters));
+            }
+            SearchAdapter::Capped(search) => {
+                if let Err(e) = extend_in_scope(&mut hits, &filters, max_results, |limit| {
+                    search(query, limit)
+                }) {
+                    log::warn!("{label} search failed: {e}");
+                }
+            }
+        }
+    }
+    hits
+}
+
 /// Search across all (or selected) providers
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
@@ -1012,6 +1043,11 @@ pub async fn search_all_providers(
         filters.unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::default()));
     crate::commands::session::validate_search_filters(&search_filters)?;
     let parsed_filters = SearchFilters::parse(&search_filters);
+    // Nothing can be returned: do not walk any store (a filtered search would
+    // otherwise ask capped adapters for every hit only to drop them all).
+    if max_results == 0 {
+        return Ok(Vec::new());
+    }
 
     let providers_to_search = active_providers.unwrap_or_else(|| {
         vec![
@@ -1128,25 +1164,19 @@ pub async fn search_all_providers(
         }
     }
 
-    for (id, label, adapter) in &SEARCH_ADAPTERS {
-        if !providers_to_search.iter().any(|p| p == id) {
-            continue;
-        }
-        match adapter {
-            SearchAdapter::Scoped(search) => {
-                all_results.extend(search(&query, max_results, &parsed_filters));
-            }
-            SearchAdapter::Capped(search) => {
-                if let Err(e) =
-                    extend_in_scope(&mut all_results, &parsed_filters, max_results, |limit| {
-                        search(&query, limit)
-                    })
-                {
-                    log::warn!("{label} search failed: {e}");
-                }
-            }
-        }
-    }
+    let adapter_hits = {
+        let (query, providers, filters) = (
+            query.clone(),
+            providers_to_search.clone(),
+            search_filters.clone(),
+        );
+        tauri::async_runtime::spawn_blocking(move || {
+            search_adapters(&query, &providers, &filters, max_results)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?
+    };
+    all_results.extend(adapter_hits);
 
     // WSL search
     if wsl_enabled.unwrap_or(false) && !wsl_search_providers.is_empty() {
@@ -1673,6 +1703,18 @@ mod tests {
             });
             fs::write(chats.join("session-1.json"), session.to_string()).unwrap();
         }
+        // A developer's `GEMINI_HOME` would otherwise replace the sandbox store.
+        struct RestoreGeminiHome(Option<std::ffi::OsString>);
+        impl Drop for RestoreGeminiHome {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("GEMINI_HOME", value),
+                    None => std::env::remove_var("GEMINI_HOME"),
+                }
+            }
+        }
+        let _gemini_home = RestoreGeminiHome(std::env::var_os("GEMINI_HOME"));
+        std::env::set_var("GEMINI_HOME", home.path().join(".gemini"));
         let projects = scan_only("gemini").await;
         assert_eq!(projects.len(), 2);
         for project in &projects {
