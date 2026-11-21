@@ -1,11 +1,12 @@
 //! Backend logging (#821). Without a logger every `log::` call was a no-op,
 //! so a user hitting a hang or missing data had nothing to attach.
 //!
-//! - Desktop: [`desktop_plugin`] writes to the OS app log directory
+//! - Desktop: [`install_desktop`] writes to the OS app log directory
 //!   (`app_log_dir()`, e.g. `~/Library/Logs/com.claude.history-viewer` on
 //!   macOS, `%LOCALAPPDATA%\com.claude.history-viewer\logs` on Windows), plus
 //!   stderr in debug builds. Each record is flushed as it is written, so a
-//!   hard freeze keeps the lines before it.
+//!   hard freeze keeps the lines before it. A log file that cannot be opened
+//!   falls back to stderr; the app still starts.
 //! - `cchv-server`: [`init_stderr`] logs to stderr, level from `RUST_LOG`.
 //! - Both write `[date][time][target][LEVEL] message`, time in UTC.
 //!
@@ -27,9 +28,19 @@ const DEPENDENCY_LEVEL: LevelFilter = LevelFilter::Warn;
 const MAX_LOG_FILE_BYTES: u128 = 2 * 1024 * 1024;
 const KEPT_LOG_FILES: usize = 3;
 
-/// The desktop log plugin: rotating file in the app log directory, and
-/// stderr in debug builds.
-pub fn desktop_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
+/// Install the desktop log plugin: rotating file in the app log directory,
+/// and stderr in debug builds. Installed from `setup`, not with
+/// `Builder::plugin`: a plugin whose setup fails there fails `build()`, and
+/// the app would not start because its log folder is not writable.
+pub fn install_desktop<R: tauri::Runtime>(app: &tauri::AppHandle<R>) {
+    if let Err(error) = app.plugin(desktop_plugin()) {
+        // The plugin attaches its logger only after its file opened.
+        init_stderr();
+        log::error!("log file unavailable, logging to stderr: {error}");
+    }
+}
+
+fn desktop_plugin<R: tauri::Runtime>() -> tauri::plugin::TauriPlugin<R> {
     use tauri_plugin_log::{RotationStrategy, Target, TargetKind};
 
     let mut targets = vec![Target::new(TargetKind::LogDir { file_name: None })];
@@ -112,7 +123,10 @@ impl Log for StderrLogger {
 
     fn log(&self, record: &Record<'_>) {
         if self.enabled(record.metadata()) {
-            eprintln!(
+            use std::io::Write;
+            // `eprintln!` panics when stderr is closed; a log line must not.
+            let _ = writeln!(
+                std::io::stderr().lock(),
                 "{}[{}][{}] {}",
                 chrono::Utc::now().format("[%Y-%m-%d][%H:%M:%S]"),
                 record.target(),

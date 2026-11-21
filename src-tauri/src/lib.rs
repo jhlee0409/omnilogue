@@ -176,8 +176,6 @@ fn run_tauri() {
                 log::error!("single_instance callback panicked; argv dropped");
             }
         }))
-        // Logging next, so the other plugins' setup can already log (#821).
-        .plugin(logging::desktop_plugin())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -202,6 +200,7 @@ fn run_tauri() {
         // panics before the window is shown. The app runs on without the
         // native menu (macOS keeps Tauri's default one).
         .setup(|app| {
+            logging::install_desktop(app.handle());
             log::info!(
                 "Omnilogue {} starting ({} {})",
                 env!("CARGO_PKG_VERSION"),
