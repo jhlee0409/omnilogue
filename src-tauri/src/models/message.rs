@@ -191,7 +191,7 @@ impl RawLogEntry {
 }
 
 /// A queued command the user typed, with a prompt: text, or content blocks.
-fn is_queued_human_prompt(attachment: &serde_json::Value) -> bool {
+pub(crate) fn is_queued_human_prompt(attachment: &serde_json::Value) -> bool {
     let str_at = |pointer: &str| attachment.pointer(pointer).and_then(|v| v.as_str());
     str_at("/type") == Some("queued_command")
         && str_at("/commandMode") == Some("prompt")
