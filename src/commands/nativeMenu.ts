@@ -70,6 +70,7 @@ export const MENU_CHECKS: Partial<Record<CommandId, (state: AppStore) => boolean
   "view.toggleInspector": (state) => state.isInspectorOpen,
   "view.toggleMinimap": (state) => state.isMinimapOpen,
   "view.toggleInlineTokens": (state) => state.showInlineTokenUsage,
+  "view.toggleExpandLongMessages": (state) => state.expandLongMessages,
   "view.toggleLiveRefresh": (state) => isLiveRefreshOn(state.userMetadata),
 };
 

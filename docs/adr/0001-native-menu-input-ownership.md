@@ -103,6 +103,7 @@ Measured in the real macOS app (WKWebView, System Events key presses, a page pro
    | `view.toggleInspector` | `app` - its open state is app-wide (`stateScope.ts`) | runs; `enabled` is re-checked on the tab in front |
    | `view.toggleMinimap` | `app` - its open state is app-wide | runs |
    | `view.toggleInlineTokens` | `app` - a saved display preference, app-wide | runs |
+   | `view.toggleExpandLongMessages` | `app` - a saved display preference, app-wide | runs |
    | `view.toggleLiveRefresh` | `app` - a saved setting for the desktop's history-folder watcher, app-wide | runs |
    | `view.zoomIn` `view.zoomOut` `view.actualSize` | `app` - the window's zoom | runs |
    | `tab.new` | `app` - a new tab at the end, whatever is in front | runs |

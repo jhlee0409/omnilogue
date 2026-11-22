@@ -33,6 +33,11 @@ export interface SettingsSliceState {
   sessionEntrypointFilter: SessionEntrypointFilter;
   /** Show each assistant message's token usage inline in its header (#570). */
   showInlineTokenUsage: boolean;
+  /**
+   * Long message text (over the collapse threshold) starts expanded (#574).
+   * A message's own Show more / Show less choice still wins.
+   */
+  expandLongMessages: boolean;
 }
 
 export interface SettingsSliceActions {
@@ -51,6 +56,8 @@ export interface SettingsSliceActions {
   setSessionEntrypointFilter: (filter: SessionEntrypointFilter) => Promise<void>;
   setShowInlineTokenUsage: (show: boolean) => Promise<void>;
   toggleInlineTokenUsage: () => void;
+  setExpandLongMessages: (expand: boolean) => Promise<void>;
+  toggleExpandLongMessages: () => void;
   /**
    * Apply preference `key` saved by another window (`settings.json` keys this
    * store holds): in memory only - that window saved it. Unknown keys and
@@ -85,6 +92,7 @@ const initialSettingsState: SettingsSliceState = {
   sessionSortOrder: "newest",
   sessionEntrypointFilter: "all",
   showInlineTokenUsage: false,
+  expandLongMessages: false,
 };
 
 // ============================================================================
@@ -177,10 +185,12 @@ export const createSettingsSlice: StateCreator<
       const savedFontScale = await store.get<number>("fontScale");
       const savedHighContrast = await store.get<boolean>("highContrast");
       const savedInlineTokenUsage = await store.get<boolean>("showInlineTokenUsage");
+      const savedExpandLongMessages = await store.get<boolean>("expandLongMessages");
       set({
         fontScale: normalizeFontScale(savedFontScale),
         highContrast: typeof savedHighContrast === "boolean" ? savedHighContrast : null,
         showInlineTokenUsage: savedInlineTokenUsage === true,
+        expandLongMessages: savedExpandLongMessages === true,
       });
     } catch (error) {
       console.warn("Failed to load persisted settings:", error);
@@ -254,6 +264,21 @@ export const createSettingsSlice: StateCreator<
     void get().setShowInlineTokenUsage(!get().showInlineTokenUsage);
   },
 
+  setExpandLongMessages: async (expand: boolean) => {
+    set({ expandLongMessages: expand });
+
+    try {
+      await saveSetting("expandLongMessages", expand);
+    } catch (error) {
+      // Intentionally non-blocking: the display is already applied in-memory for this session.
+      console.warn("Failed to save long message expand setting:", error);
+    }
+  },
+
+  toggleExpandLongMessages: () => {
+    void get().setExpandLongMessages(!get().expandLongMessages);
+  },
+
   applySharedSetting: (key: string, value: unknown) => {
     switch (key) {
       case "fontScale":
@@ -264,6 +289,9 @@ export const createSettingsSlice: StateCreator<
         return;
       case "showInlineTokenUsage":
         set({ showInlineTokenUsage: value === true });
+        return;
+      case "expandLongMessages":
+        set({ expandLongMessages: value === true });
         return;
       case "sessionSortOrder":
         if (value === "newest" || value === "oldest") set({ sessionSortOrder: value });

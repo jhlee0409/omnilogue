@@ -162,6 +162,8 @@ export interface AppStoreState {
   sessionEntrypointFilter: import("../../types/metadata.types").SessionEntrypointFilter;
   /** Show each assistant message's token usage inline in its header (#570). */
   showInlineTokenUsage: boolean;
+  /** Long message text starts expanded; a message's own choice wins (#574). */
+  expandLongMessages: boolean;
 
   // Global stats state
   globalSummary: GlobalStatsSummary | null;
@@ -403,6 +405,8 @@ export interface AppStoreActions {
   ) => Promise<void>;
   setShowInlineTokenUsage: (show: boolean) => Promise<void>;
   toggleInlineTokenUsage: () => void;
+  setExpandLongMessages: (expand: boolean) => Promise<void>;
+  toggleExpandLongMessages: () => void;
   /** A preference saved by another window (`settingsSync.ts`): applied in memory. */
   applySharedSetting: (key: string, value: unknown) => void;
 
