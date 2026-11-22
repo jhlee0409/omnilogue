@@ -91,6 +91,8 @@ use crate::multi_window::{get_window_target, open_window};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    utils::init_global_thread_pool();
+
     // Headless session export (issue #343): `--export <id|path> [--format html|json]
     // [--output <file>]`. Handled before any GUI/webview so it works over SSH/CI
     // with no display.

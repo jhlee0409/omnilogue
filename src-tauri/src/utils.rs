@@ -588,6 +588,20 @@ pub fn ms_to_iso(ms: u64) -> String {
         .unwrap_or_default()
 }
 
+/// Size rayon's global pool to every core but one, so the full history scan at
+/// launch (and the file watcher's first walk next to it) leaves a core for the
+/// OS and the UI (#819). `RAYON_NUM_THREADS`, when set, still decides.
+pub fn init_global_thread_pool() {
+    if std::env::var_os("RAYON_NUM_THREADS").is_some() {
+        return;
+    }
+    let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
+    // Already built (it can only be built once per process): keep it.
+    let _ = rayon::ThreadPoolBuilder::new()
+        .num_threads(cores.saturating_sub(1).max(1))
+        .build_global();
+}
+
 /// Max threads a single provider scanner may use for its per-workspace work.
 /// ~27 scanners already run concurrently on the blocking pool (#434), so each
 /// one stays modest instead of grabbing every core.

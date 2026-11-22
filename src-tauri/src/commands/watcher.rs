@@ -355,12 +355,10 @@ pub(crate) fn collect_watch_paths() -> Vec<PathBuf> {
         }
     }
 
-    for vscode_base in providers::vscode::get_base_paths() {
-        let ws_storage = vscode_base.join("workspaceStorage");
-        if ws_storage.is_dir() {
-            paths.push(ws_storage);
-        }
-    }
+    // VS Code `workspaceStorage` is not watched: no extractor maps a Copilot
+    // Chat file to an event, and the folder holds every extension's caches
+    // (cpptools' IntelliSense database alone can be gigabytes), so watching it
+    // only cost a full walk at launch and a stream of ignored events (#819).
 
     // The whole desktop store, not just `brain/` and `conversations/`:
     // `conversation_summaries.db` lives at its root, the rpc-cache under
@@ -383,7 +381,25 @@ pub(crate) fn collect_watch_paths() -> Vec<PathBuf> {
     paths
         .into_iter()
         .filter(|p| seen.insert(p.clone()))
+        .filter(|p| {
+            // A network path (a WSL distro's `\\wsl.localhost\…` custom Claude
+            // folder, a share) would be walked and watched over the network at
+            // launch (#819); its sessions are still read, just not watched.
+            let network = cfg!(windows) && is_network_path(&p.to_string_lossy());
+            if network {
+                log::info!("Not watching network path {}", p.display());
+            }
+            !network
+        })
         .collect::<Vec<_>>()
+}
+
+/// A Windows network path: UNC (`\\server\share`, `\\wsl.localhost\…`,
+/// `\\wsl$\…`) or its extended form `\\?\UNC\…`. Local extended paths
+/// (`\\?\C:\…`) and device paths (`\\.\…`) are not.
+fn is_network_path(path: &str) -> bool {
+    path.starts_with(r"\\?\UNC\")
+        || (path.starts_with(r"\\") && !path.starts_with(r"\\?\") && !path.starts_with(r"\\.\"))
 }
 
 /// Convert a debounced filesystem event into a [`FileWatchEvent`] if applicable.
@@ -1930,5 +1946,27 @@ mod tests {
         }
 
         assert!(result.is_none(), "active lock files are not sessions");
+    }
+
+    /// Network roots are left out of the watcher (#819); local extended and
+    /// device paths are not network paths.
+    #[test]
+    fn network_paths_are_recognised() {
+        for path in [
+            r"\\wsl.localhost\Ubuntu\home\u\.claude\projects",
+            r"\\wsl$\Ubuntu\home\u\.claude\projects",
+            r"\\server\share\.claude\projects",
+            r"\\?\UNC\wsl.localhost\Ubuntu\home\u\.claude\projects",
+        ] {
+            assert!(is_network_path(path), "{path}");
+        }
+        for path in [
+            r"C:\Users\u\.claude\projects",
+            r"\\?\C:\Users\u\.claude\projects",
+            r"\\.\pipe\x",
+            "/home/u/.claude/projects",
+        ] {
+            assert!(!is_network_path(path), "{path}");
+        }
     }
 }
