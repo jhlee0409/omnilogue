@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Turning live refresh back on updates the open session** (desktop). A session written to while **Live refresh** was off stayed as it was until its file changed again. Turning the setting on now refreshes the open session and its project's session list once, the way a live update does (it waits while you are scrolled up), in every window. (#828)
+
 ## [2.1.0] - 2026-11-22
 
 ### Added
