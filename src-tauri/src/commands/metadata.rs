@@ -116,7 +116,11 @@ where
         .unwrap_or_else(UserMetadata::new);
 
     let (saved, result) = tauri::async_runtime::spawn_blocking(move || {
+        // Taken before `mutate`: a whole-metadata save brings the caller's
+        // copy, whose revision may be older than the cached one.
+        let revision = metadata.revision + 1;
         let result = mutate(&mut metadata);
+        metadata.revision = revision;
         save_metadata_to_disk(&metadata).map(|()| (metadata, result))
     })
     .await
@@ -575,6 +579,24 @@ mod tests {
         ));
         assert!(failed.is_err());
         assert_eq!(heard.lock().unwrap().len(), 2);
+    }
+
+    /// Issue #829: every save carries a higher revision than the one before,
+    /// also when the caller's whole copy (`save_user_metadata`) is older.
+    #[test]
+    #[serial_test::serial]
+    fn each_save_bumps_the_revision() {
+        let _home = crate::test_utils::SandboxHome::new();
+        let state = MetadataState::default();
+        let save = |mutate: Box<dyn FnOnce(&mut UserMetadata) + Send>| {
+            tauri::async_runtime::block_on(mutate_and_save(&state, mutate))
+                .unwrap()
+                .revision
+        };
+        assert_eq!(save(Box::new(|m| m.settings.live_refresh = Some(false))), 1);
+        let stale = UserMetadata::new();
+        assert_eq!(save(Box::new(move |m| *m = stale)), 2);
+        assert_eq!(save(Box::new(|_| {})), 3);
     }
 
     #[test]

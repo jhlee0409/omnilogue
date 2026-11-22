@@ -211,11 +211,16 @@ describe("settings shared by every window", () => {
 });
 
 describe("user metadata shared by every window", () => {
-  const metadata = (names: Record<string, string>): UserMetadata => ({
+  const metadata = (
+    names: Record<string, string>,
+    revision?: number,
+    settings: UserMetadata["settings"] = {},
+  ): UserMetadata => ({
     version: 1,
     sessions: Object.fromEntries(Object.entries(names).map(([id, customName]) => [id, { customName }])),
     projects: {},
-    settings: {},
+    settings,
+    revision,
   });
 
   it("takes each announced save", async () => {
@@ -228,15 +233,44 @@ describe("user metadata shared by every window", () => {
   });
 
   it("never lets an answer older than an announcement land over it", async () => {
-    useAppStore.setState({ userMetadata: metadata({}) });
+    useAppStore.setState({ userMetadata: metadata({}, 1) });
     let answer: (value: UserMetadata) => void = () => {};
     api.mockImplementation(() => new Promise((resolve) => (answer = resolve)));
     const writing = useAppStore.getState().updateSessionMetadata("s1", { customName: "mine" });
     await flush();
     // Another window saved after this one: announced before this answer arrives.
-    useAppStore.getState().applySharedMetadata(metadata({ s1: "mine", s2: "theirs" }));
-    answer(metadata({ s1: "mine" }));
+    useAppStore.getState().applySharedMetadata(metadata({ s1: "mine", s2: "theirs" }, 3));
+    answer(metadata({ s1: "mine" }, 2));
     await writing;
     expect(Object.keys(useAppStore.getState().userMetadata.sessions).sort()).toEqual(["s1", "s2"]);
+  });
+
+  // #829: another window's save, made before this one's, announced while
+  // this window's request is out. The answer still lands, so the next queued
+  // write builds on it instead of losing it.
+  it("builds each queued write on this window's previous save", async () => {
+    useAppStore.setState({ userMetadata: metadata({}, 1) });
+    const answers: Array<(value: UserMetadata) => void> = [];
+    api.mockImplementation(() => new Promise((resolve) => answers.push(resolve)));
+    const first = useAppStore.getState().toggleLiveRefresh();
+    const second = useAppStore.getState().toggleLiveRefresh();
+    await flush();
+    expect(api).toHaveBeenLastCalledWith("update_user_settings", {
+      settings: { liveRefresh: false },
+    });
+
+    useAppStore.getState().applySharedMetadata(metadata({ s2: "theirs" }, 2));
+    answers[0]?.(metadata({ s2: "theirs" }, 3, { liveRefresh: false }));
+    await flush();
+    // A late copy of the older save changes nothing either.
+    useAppStore.getState().applySharedMetadata(metadata({ s2: "theirs" }, 2));
+    await flush();
+    expect(api).toHaveBeenLastCalledWith("update_user_settings", {
+      settings: { liveRefresh: true },
+    });
+
+    answers[1]?.(metadata({ s2: "theirs" }, 4, { liveRefresh: true }));
+    await Promise.all([first, second]);
+    expect(useAppStore.getState().userMetadata.settings.liveRefresh).toBe(true);
   });
 });
