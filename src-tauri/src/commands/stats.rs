@@ -835,7 +835,9 @@ fn cursor_virtual_paths_match(left: &str, right: &str) -> bool {
 #[inline]
 /// Parse a raw log entry with simd-json.
 fn parse_raw_log_entry_simd(line: &mut [u8]) -> Option<RawLogEntry> {
-    simd_json::serde::from_slice(line).ok()
+    let mut entry: RawLogEntry = simd_json::serde::from_slice(line).ok()?;
+    entry.promote_queued_prompt();
+    Some(entry)
 }
 
 /// Track session-title rows for stats: the last Claude Code `ai-title` and the
@@ -882,6 +884,36 @@ struct GlobalStatsLogEntry {
     tool_use: Option<GlobalStatsToolUse>,
     #[serde(rename = "toolUseResult")]
     tool_use_result: Option<GlobalStatsToolUseResult>,
+    /// For a queued prompt (`type: "attachment"`), see [`Self::promote_queued_prompt`].
+    attachment: Option<serde_json::Value>,
+}
+
+impl GlobalStatsLogEntry {
+    /// The global-stats counterpart of `RawLogEntry::promote_queued_prompt`
+    /// (#815): a message the user sent while Claude Code was working counts as
+    /// the user message it is, as in project and session statistics.
+    fn promote_queued_prompt(&mut self) {
+        if self.message_type != "attachment" || self.message.is_some() {
+            return;
+        }
+        let Some(attachment) = self
+            .attachment
+            .as_mut()
+            .filter(|a| crate::models::is_queued_human_prompt(a))
+        else {
+            return;
+        };
+        let content = attachment["prompt"].take();
+        self.message_type = "user".to_string();
+        self.message = Some(GlobalStatsMessageContent {
+            role: "user".to_string(),
+            id: None,
+            content: Some(content),
+            model: None,
+            usage: None,
+            cost_usd: None,
+        });
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -914,7 +946,9 @@ struct GlobalStatsToolUseResult {
 #[inline]
 /// Parse a lightweight global-stats entry with simd-json.
 fn parse_global_stats_entry_simd(line: &mut [u8]) -> Option<GlobalStatsLogEntry> {
-    simd_json::serde::from_slice(line).ok()
+    let mut entry: GlobalStatsLogEntry = simd_json::serde::from_slice(line).ok()?;
+    entry.promote_queued_prompt();
+    Some(entry)
 }
 
 /// Read the first numeric token field that a provider exposes under one of
@@ -6478,6 +6512,7 @@ mod tests {
             compact_metadata: None,
             microcompact_metadata: None,
             content: None,
+            attachment: None,
             is_meta: None,
         };
 
@@ -6542,6 +6577,7 @@ mod tests {
             compact_metadata: None,
             microcompact_metadata: None,
             content: None,
+            attachment: None,
             is_meta: None,
         };
 
@@ -6596,6 +6632,7 @@ mod tests {
             compact_metadata: None,
             microcompact_metadata: None,
             content: None,
+            attachment: None,
             is_meta: None,
         };
 
@@ -6647,6 +6684,7 @@ mod tests {
             compact_metadata: None,
             microcompact_metadata: None,
             content: None,
+            attachment: None,
             is_meta: None,
         };
 
@@ -6698,6 +6736,7 @@ mod tests {
             compact_metadata: None,
             microcompact_metadata: None,
             content: None,
+            attachment: None,
             is_meta: None,
         };
 
@@ -7683,6 +7722,60 @@ mod tests {
             2,
             "appended file must be re-parsed exactly once"
         );
+    }
+
+    /// A message sent while Claude Code was working (a `queued_command`
+    /// attachment, #815) counts as a user message, and global, project and
+    /// session statistics agree on the count; a queued task notification is
+    /// not counted.
+    #[tokio::test]
+    #[serial]
+    async fn test_stats_count_queued_prompts_as_user_messages_at_every_level() {
+        let home = crate::test_utils::SandboxHome::new();
+        let claude_dir = home.path().join(".claude");
+        let project_dir = claude_dir.join("projects").join("queued");
+        fs::create_dir_all(&project_dir).expect("failed to create project dir");
+        let lines = [
+            r#"{"uuid":"u1","sessionId":"s1","timestamp":"2025-01-01T10:00:00Z","type":"user","message":{"role":"user","content":"check A"},"isSidechain":false}"#,
+            r#"{"uuid":"a1","sessionId":"s1","timestamp":"2025-01-01T10:00:01Z","type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"checking"}],"id":"m1","model":"claude-sonnet-4","usage":{"input_tokens":10,"output_tokens":1}},"isSidechain":false}"#,
+            r#"{"uuid":"q1","sessionId":"s1","timestamp":"2025-01-01T10:00:02Z","type":"attachment","attachment":{"type":"queued_command","prompt":"also check B","commandMode":"prompt","origin":{"kind":"human"}},"isSidechain":false}"#,
+            r#"{"uuid":"q2","sessionId":"s1","timestamp":"2025-01-01T10:00:03Z","type":"attachment","attachment":{"type":"queued_command","prompt":"<task-notification/>","commandMode":"task-notification"},"isSidechain":false}"#,
+        ];
+        let session_path = project_dir.join("s1.jsonl");
+        fs::write(&session_path, lines.join("\n") + "\n").expect("failed to write session");
+        let mode = || Some("billing_total".to_string());
+
+        let global = get_global_stats_summary(
+            claude_dir.to_string_lossy().to_string(),
+            Some(vec!["claude".to_string()]),
+            mode(),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("global summary");
+        let project = get_project_stats_summary(
+            project_dir.to_string_lossy().to_string(),
+            None,
+            None,
+            mode(),
+        )
+        .await
+        .expect("project summary");
+        let session = get_session_token_stats(
+            session_path.to_string_lossy().to_string(),
+            None,
+            None,
+            mode(),
+        )
+        .await
+        .expect("session stats");
+
+        let global_messages = usize::try_from(global.total_messages).unwrap();
+        assert_eq!(global_messages, 3);
+        assert_eq!(project.total_messages, global_messages);
+        assert_eq!(session.message_count, global_messages);
     }
 
     #[tokio::test]
@@ -9252,6 +9345,7 @@ mod tests {
             compact_metadata: None,
             microcompact_metadata: None,
             content: None,
+            attachment: None,
             is_meta: None,
         };
         ClaudeMessage::try_from(raw).expect("test message construction")
