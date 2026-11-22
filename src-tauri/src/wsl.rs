@@ -93,29 +93,68 @@ fn is_tool_distro(name: &str) -> bool {
 #[cfg(target_os = "windows")]
 const WSL_HOME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// How long a failed home lookup is reused before `wsl.exe` is asked again.
+#[cfg(target_os = "windows")]
+const WSL_HOME_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A distro's home, or the error and when it was seen.
+#[cfg(any(target_os = "windows", test))]
+type HomeEntry = Result<PathBuf, (std::time::Instant, String)>;
+
+/// Each distro's `$HOME`, asked from `wsl.exe` once per run (#819). A failure
+/// (a first VM boot past the timeout, a stopped distro) is reused only for
+/// `retry_after`, then asked again.
+#[cfg(any(target_os = "windows", test))]
+struct HomeCache {
+    retry_after: std::time::Duration,
+    homes: std::sync::Mutex<std::collections::HashMap<String, HomeEntry>>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl HomeCache {
+    fn new(retry_after: std::time::Duration) -> Self {
+        Self {
+            retry_after,
+            homes: std::sync::Mutex::default(),
+        }
+    }
+
+    /// The cached home of `distro`, or `query`'s answer. The lock is held
+    /// while querying, so a scan and a search arriving together ask once.
+    fn resolve(
+        &self,
+        distro: &str,
+        query: impl FnOnce() -> Result<PathBuf, String>,
+    ) -> Result<PathBuf, String> {
+        let mut homes = self
+            .homes
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match homes.get(distro) {
+            Some(Ok(home)) => return Ok(home.clone()),
+            Some(Err((at, error))) if at.elapsed() < self.retry_after => return Err(error.clone()),
+            _ => {}
+        }
+        let resolved = query();
+        homes.insert(
+            distro.to_string(),
+            resolved
+                .clone()
+                .map_err(|error| (std::time::Instant::now(), error)),
+        );
+        resolved
+    }
+}
+
 /// The distro's `$HOME`. `wsl.exe` starts the WSL VM, and project scans and
-/// every message search ask for the same homes, so each distro is asked once
-/// per run (an error included) (#819).
+/// every message search ask for the same homes, so answers are cached
+/// ([`HomeCache`]).
 #[cfg(target_os = "windows")]
 pub fn resolve_home_path(distro: &str) -> Result<PathBuf, String> {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock, PoisonError};
-
-    static HOMES: OnceLock<Mutex<HashMap<String, Result<PathBuf, String>>>> = OnceLock::new();
-    let homes = HOMES.get_or_init(Mutex::default);
-    if let Some(known) = homes
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .get(distro)
-    {
-        return known.clone();
-    }
-    let resolved = query_home_path(distro);
-    homes
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .insert(distro.to_string(), resolved.clone());
-    resolved
+    static HOMES: std::sync::OnceLock<HomeCache> = std::sync::OnceLock::new();
+    HOMES
+        .get_or_init(|| HomeCache::new(WSL_HOME_RETRY_AFTER))
+        .resolve(distro, || query_home_path(distro))
 }
 
 #[cfg(target_os = "windows")]
@@ -306,5 +345,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(String::from_utf8_lossy(&quick.stdout).trim(), "/home/u");
+    }
+
+    /// A found home is asked once; a failure is reused until `retry_after`,
+    /// then asked again (a WSL VM that booted late is not lost for the run).
+    #[test]
+    fn home_cache_reuses_answers_and_retries_failures() {
+        use std::cell::Cell;
+        use std::time::Duration;
+
+        let asked = Cell::new(0);
+        let cache = HomeCache::new(Duration::from_secs(3600));
+        let ok = || {
+            asked.set(asked.get() + 1);
+            Ok(PathBuf::from("/home/u"))
+        };
+        assert_eq!(
+            cache.resolve("Ubuntu", ok).unwrap(),
+            PathBuf::from("/home/u")
+        );
+        assert_eq!(
+            cache.resolve("Ubuntu", ok).unwrap(),
+            PathBuf::from("/home/u")
+        );
+        assert_eq!(asked.get(), 1);
+
+        let failing = || {
+            asked.set(asked.get() + 1);
+            Err("timed out".to_string())
+        };
+        assert!(cache.resolve("Debian", failing).is_err());
+        assert!(cache.resolve("Debian", failing).is_err());
+        assert_eq!(asked.get(), 2, "a recent failure is reused");
+
+        let retrying = HomeCache::new(Duration::ZERO);
+        assert!(retrying.resolve("Debian", failing).is_err());
+        assert_eq!(
+            retrying.resolve("Debian", ok).unwrap(),
+            PathBuf::from("/home/u")
+        );
+        assert_eq!(asked.get(), 4, "an expired failure is asked again");
     }
 }

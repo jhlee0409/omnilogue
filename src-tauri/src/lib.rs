@@ -91,8 +91,6 @@ use crate::multi_window::{get_window_target, open_window};
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    utils::init_global_thread_pool();
-
     // Headless session export (issue #343): `--export <id|path> [--format html|json]
     // [--output <file>]`. Handled before any GUI/webview so it works over SSH/CI
     // with no display.
@@ -102,6 +100,7 @@ pub fn run() {
             .iter()
             .any(|a| a == "--export" || a.starts_with("--export="))
         {
+            utils::init_global_thread_pool();
             std::process::exit(export::run_export(&args));
         }
     }
@@ -144,6 +143,9 @@ fn run_tauri() {
     if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     }
+
+    // After the environment writes above: the pool starts its threads now.
+    utils::init_global_thread_pool();
 
     use tauri::{Emitter, Manager};
 
@@ -511,6 +513,8 @@ mod ime_environment_tests {
 #[cfg(feature = "webui-server")]
 fn run_server(args: &[String]) {
     use std::sync::Arc;
+
+    utils::init_global_thread_pool();
 
     logging::init_stderr();
     logging::log_panics();
