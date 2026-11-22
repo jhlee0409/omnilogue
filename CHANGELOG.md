@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **WSL project lists and searches no longer hold up other requests** (desktop on Windows, with WSL History Scanning on). Finding the WSL distributions, asking each for its home folder, locating their Claude Code folders and reading their GitHub Copilot history over `\\wsl.localhost` now run in the background instead of on the threads that answer the app's other requests. (#827)
+
 ## [2.1.0] - 2026-11-22
 
 ### Added
