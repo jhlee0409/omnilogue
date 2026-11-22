@@ -596,7 +596,15 @@ fn search_workspace_storage(
         let project = read_workspace_folder(&workspace_json, &ScanReport::default())
             .map(|folder| (project_name_for(&folder), project_path_for(&ws_path)));
 
-        for session_path in chat_session_files(&chat_dir, &ScanReport::default())? {
+        // One unreadable workspace must not discard the hits already found.
+        let session_files = match chat_session_files(&chat_dir, &ScanReport::default()) {
+            Ok(files) => files,
+            Err(error) => {
+                log::warn!("Copilot search skipped {}: {error}", chat_dir.display());
+                continue;
+            }
+        };
+        for session_path in session_files {
             if let Ok(messages) = load_messages(&session_path.to_string_lossy()) {
                 for mut msg in messages {
                     if results.len() >= limit {
