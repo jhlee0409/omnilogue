@@ -596,10 +596,16 @@ pub fn init_global_thread_pool() {
         return;
     }
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    // Already built (it can only be built once per process): keep it.
-    let _ = rayon::ThreadPoolBuilder::new()
+    // rayon builds its global pool once per process, eagerly here or on first
+    // use otherwise; if that build fails, every later use panics either way.
+    // Building it here only changes when that happens, so the error is
+    // reported instead of dropped.
+    if let Err(error) = rayon::ThreadPoolBuilder::new()
         .num_threads(cores.saturating_sub(1).max(1))
-        .build_global();
+        .build_global()
+    {
+        eprintln!("Could not size the global thread pool: {error}");
+    }
 }
 
 /// Max threads a single provider scanner may use for its per-workspace work.

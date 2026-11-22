@@ -101,13 +101,18 @@ const WSL_HOME_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs
 #[cfg(any(target_os = "windows", test))]
 type HomeEntry = Result<PathBuf, (std::time::Instant, String)>;
 
+/// A distro's cache slot; locked while its home is looked up.
+#[cfg(any(target_os = "windows", test))]
+type HomeSlot = std::sync::Arc<std::sync::Mutex<Option<HomeEntry>>>;
+
 /// Each distro's `$HOME`, asked from `wsl.exe` once per run (#819). A failure
 /// (a first VM boot past the timeout, a stopped distro) is reused only for
 /// `retry_after`, then asked again.
 #[cfg(any(target_os = "windows", test))]
 struct HomeCache {
     retry_after: std::time::Duration,
-    homes: std::sync::Mutex<std::collections::HashMap<String, HomeEntry>>,
+    /// One slot per distro: a slow lookup holds only its own distro's slot.
+    slots: std::sync::Mutex<std::collections::HashMap<String, HomeSlot>>,
 }
 
 #[cfg(any(target_os = "windows", test))]
@@ -115,29 +120,35 @@ impl HomeCache {
     fn new(retry_after: std::time::Duration) -> Self {
         Self {
             retry_after,
-            homes: std::sync::Mutex::default(),
+            slots: std::sync::Mutex::default(),
         }
     }
 
-    /// The cached home of `distro`, or `query`'s answer. The lock is held
-    /// while querying, so a scan and a search arriving together ask once.
+    /// The cached home of `distro`, or `query`'s answer. The distro's slot is
+    /// held while querying, so a scan and a search arriving together ask once;
+    /// other distros and cached answers do not wait for it.
     fn resolve(
         &self,
         distro: &str,
         query: impl FnOnce() -> Result<PathBuf, String>,
     ) -> Result<PathBuf, String> {
-        let mut homes = self
-            .homes
+        use std::sync::PoisonError;
+
+        let slot = self
+            .slots
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        match homes.get(distro) {
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(distro.to_string())
+            .or_default()
+            .clone();
+        let mut entry = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        match &*entry {
             Some(Ok(home)) => return Ok(home.clone()),
             Some(Err((at, error))) if at.elapsed() < self.retry_after => return Err(error.clone()),
             _ => {}
         }
         let resolved = query();
-        homes.insert(
-            distro.to_string(),
+        *entry = Some(
             resolved
                 .clone()
                 .map_err(|error| (std::time::Instant::now(), error)),
@@ -385,5 +396,42 @@ mod tests {
             PathBuf::from("/home/u")
         );
         assert_eq!(asked.get(), 4, "an expired failure is asked again");
+    }
+
+    /// A distro whose lookup hangs does not hold up another distro's lookup.
+    #[test]
+    fn home_cache_lookups_of_different_distros_do_not_wait_on_each_other() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let cache = Arc::new(HomeCache::new(Duration::from_secs(3600)));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let slow = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || {
+                cache.resolve("Slow", || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(PathBuf::from("/home/slow"))
+                })
+            })
+        };
+        started_rx.recv().unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let fast = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || {
+                done_tx
+                    .send(cache.resolve("Fast", || Ok(PathBuf::from("/home/fast"))))
+                    .unwrap();
+            })
+        };
+        let answer = done_rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).unwrap();
+        assert_eq!(answer.unwrap().unwrap(), PathBuf::from("/home/fast"));
+        assert_eq!(slow.join().unwrap().unwrap(), PathBuf::from("/home/slow"));
+        fast.join().unwrap();
     }
 }
