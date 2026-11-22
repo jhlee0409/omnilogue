@@ -7725,13 +7725,15 @@ mod tests {
     }
 
     /// A message sent while Claude Code was working (a `queued_command`
-    /// attachment, #815) counts as a user message in the global statistics,
-    /// as in project and session statistics; a queued task notification does
-    /// not.
+    /// attachment, #815) counts as a user message, and global, project and
+    /// session statistics agree on the count; a queued task notification is
+    /// not counted.
     #[tokio::test]
-    async fn test_global_stats_count_queued_prompts_as_user_messages() {
-        let temp_dir = TempDir::new().expect("failed to create temp dir");
-        let project_dir = temp_dir.path().join("projects").join("queued");
+    #[serial]
+    async fn test_stats_count_queued_prompts_as_user_messages_at_every_level() {
+        let home = crate::test_utils::SandboxHome::new();
+        let claude_dir = home.path().join(".claude");
+        let project_dir = claude_dir.join("projects").join("queued");
         fs::create_dir_all(&project_dir).expect("failed to create project dir");
         let lines = [
             r#"{"uuid":"u1","sessionId":"s1","timestamp":"2025-01-01T10:00:00Z","type":"user","message":{"role":"user","content":"check A"},"isSidechain":false}"#,
@@ -7739,20 +7741,41 @@ mod tests {
             r#"{"uuid":"q1","sessionId":"s1","timestamp":"2025-01-01T10:00:02Z","type":"attachment","attachment":{"type":"queued_command","prompt":"also check B","commandMode":"prompt","origin":{"kind":"human"}},"isSidechain":false}"#,
             r#"{"uuid":"q2","sessionId":"s1","timestamp":"2025-01-01T10:00:03Z","type":"attachment","attachment":{"type":"queued_command","prompt":"<task-notification/>","commandMode":"task-notification"},"isSidechain":false}"#,
         ];
-        fs::write(project_dir.join("s1.jsonl"), lines.join("\n") + "\n")
-            .expect("failed to write session");
+        let session_path = project_dir.join("s1.jsonl");
+        fs::write(&session_path, lines.join("\n") + "\n").expect("failed to write session");
+        let mode = || Some("billing_total".to_string());
 
-        let summary = get_global_stats_summary(
-            temp_dir.path().to_string_lossy().to_string(),
+        let global = get_global_stats_summary(
+            claude_dir.to_string_lossy().to_string(),
             Some(vec!["claude".to_string()]),
-            Some("billing_total".to_string()),
+            mode(),
             None,
             None,
             None,
         )
         .await
         .expect("global summary");
-        assert_eq!(summary.total_messages, 3);
+        let project = get_project_stats_summary(
+            project_dir.to_string_lossy().to_string(),
+            None,
+            None,
+            mode(),
+        )
+        .await
+        .expect("project summary");
+        let session = get_session_token_stats(
+            session_path.to_string_lossy().to_string(),
+            None,
+            None,
+            mode(),
+        )
+        .await
+        .expect("session stats");
+
+        let global_messages = usize::try_from(global.total_messages).unwrap();
+        assert_eq!(global_messages, 3);
+        assert_eq!(project.total_messages, global_messages);
+        assert_eq!(session.message_count, global_messages);
     }
 
     #[tokio::test]
