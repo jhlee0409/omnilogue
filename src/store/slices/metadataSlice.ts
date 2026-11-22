@@ -198,7 +198,7 @@ function landIfNewer(set: SetMetadata, get: GetMetadata, metadata: UserMetadata)
   if (isNewer(metadata, get().userMetadata)) set({ userMetadata: metadata });
 }
 
-/** Ask the backend to save; its answer, the whole metadata, lands if newer. */
+/** Ask the backend for the whole metadata (a load, or a save's answer); it lands if newer. */
 async function request(
   set: SetMetadata,
   get: GetMetadata,
@@ -222,8 +222,9 @@ export const createMetadataSlice: StateCreator<
     set({ isMetadataLoading: true, metadataError: null });
 
     try {
-      // The file as it is now, whatever this window held before.
-      set({ userMetadata: await api<UserMetadata>("load_user_metadata") });
+      // Lands only if newer: an announcement that arrived while the load
+      // was out may already hold a later save.
+      await request(set, get, "load_user_metadata");
       set({
         isMetadataLoaded: true,
         isMetadataLoading: false,

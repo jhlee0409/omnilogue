@@ -273,4 +273,17 @@ describe("user metadata shared by every window", () => {
     await Promise.all([first, second]);
     expect(useAppStore.getState().userMetadata.settings.liveRefresh).toBe(true);
   });
+
+  it("never lets a load older than an announcement land over it", async () => {
+    useAppStore.setState({ userMetadata: metadata({}) });
+    let answer: (value: UserMetadata) => void = () => {};
+    api.mockImplementation(() => new Promise((resolve) => (answer = resolve)));
+    const loading = useAppStore.getState().loadMetadata();
+    await flush();
+    useAppStore.getState().applySharedMetadata(metadata({ s1: "saved meanwhile" }, 5));
+    answer(metadata({}, 4));
+    await loading;
+    expect(useAppStore.getState().getSessionDisplayName("s1")).toBe("saved meanwhile");
+    expect(useAppStore.getState().isMetadataLoaded).toBe(true);
+  });
 });

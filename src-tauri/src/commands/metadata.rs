@@ -108,14 +108,24 @@ where
     T: Send + 'static,
 {
     let _write = state.write_lock.lock().await;
-    let mut metadata = state
+    let cached = state
         .metadata
         .lock()
         .map_err(|e| format!("Failed to lock metadata: {e}"))?
-        .clone()
-        .unwrap_or_else(UserMetadata::new);
+        .clone();
 
     let (saved, result) = tauri::async_runtime::spawn_blocking(move || {
+        // Nothing loaded yet (a save before any load, e.g. the WebUI server
+        // after a restart): start from the file, its records and revision,
+        // not from an empty copy that would overwrite them (#829). A file
+        // that no longer parses is replaced, as before.
+        let mut metadata = match cached {
+            Some(metadata) => metadata,
+            None => read_metadata_from_disk(&get_user_data_path()?).unwrap_or_else(|error| {
+                log::warn!("metadata: starting from defaults: {error}");
+                UserMetadata::new()
+            }),
+        };
         // Taken before `mutate`: a whole-metadata save brings the caller's
         // copy, whose revision may be older than the cached one.
         let revision = metadata.revision + 1;
@@ -210,17 +220,9 @@ pub async fn load_user_metadata(state: State<'_, MetadataState>) -> Result<UserM
     let path = get_user_data_path()?;
 
     // Perform blocking file I/O off the async runtime
-    let metadata = tauri::async_runtime::spawn_blocking(move || {
-        if path.exists() {
-            let content = fs::read_to_string(&path)
-                .map_err(|e| format!("Failed to read metadata file: {e}"))?;
-            serde_json::from_str(&content).map_err(|e| format!("Failed to parse metadata: {e}"))
-        } else {
-            Ok(UserMetadata::new())
-        }
-    })
-    .await
-    .map_err(|e| format!("Task join error: {e}"))??;
+    let metadata = tauri::async_runtime::spawn_blocking(move || read_metadata_from_disk(&path))
+        .await
+        .map_err(|e| format!("Task join error: {e}"))??;
 
     // Cache the metadata (lock is quick, no need to spawn_blocking)
     let mut cached = state
@@ -230,6 +232,16 @@ pub async fn load_user_metadata(state: State<'_, MetadataState>) -> Result<UserM
     *cached = Some(metadata.clone());
 
     Ok(metadata)
+}
+
+/// The metadata in `path`; defaults when there is no file yet. Blocking.
+fn read_metadata_from_disk(path: &Path) -> Result<UserMetadata, String> {
+    if !path.exists() {
+        return Ok(UserMetadata::new());
+    }
+    let content =
+        fs::read_to_string(path).map_err(|e| format!("Failed to read metadata file: {e}"))?;
+    serde_json::from_str(&content).map_err(|e| format!("Failed to parse metadata: {e}"))
 }
 
 /// Internal helper to save metadata to disk (blocking)
@@ -597,6 +609,33 @@ mod tests {
         let stale = UserMetadata::new();
         assert_eq!(save(Box::new(move |m| *m = stale)), 2);
         assert_eq!(save(Box::new(|_| {})), 3);
+    }
+
+    /// Issue #829: a save before any load (the `WebUI` server after a restart)
+    /// builds on the file, keeping its records and moving its revision on.
+    #[test]
+    #[serial_test::serial]
+    fn a_save_before_any_load_builds_on_the_file() {
+        let _home = crate::test_utils::SandboxHome::new();
+        let mut on_disk = UserMetadata::new();
+        on_disk.revision = 20;
+        on_disk.get_session_mut("kept").custom_name = Some("kept".to_string());
+        save_metadata_to_disk(&on_disk).unwrap();
+
+        let state = MetadataState::default();
+        let update = SessionMetadata {
+            custom_name: Some("new".to_string()),
+            ..Default::default()
+        };
+        let saved = tauri::async_runtime::block_on(update_session_metadata_in(
+            &state,
+            "new".to_string(),
+            update,
+        ))
+        .unwrap();
+        assert_eq!(saved.revision, 21);
+        assert!(saved.get_session("kept").is_some());
+        assert!(saved.get_session("new").is_some());
     }
 
     #[test]
