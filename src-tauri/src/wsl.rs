@@ -80,13 +80,19 @@ pub fn detect_distros() -> Vec<WslDistro> {
     Vec::new()
 }
 
-/// Docker Desktop and Rancher Desktop register helper distros (`docker-desktop`,
-/// `docker-desktop-data`, …) that hold no user history; asking them for a home
-/// directory only starts the WSL VM (#819).
+/// Docker Desktop and Rancher Desktop register helper distros that hold no
+/// user history; asking them for a home directory only starts the WSL VM
+/// (#819). Exact names: a user's own `docker-desktop-dev` is a real distro.
 #[cfg(any(target_os = "windows", test))]
 fn is_tool_distro(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    name.starts_with("docker-desktop") || name.starts_with("rancher-desktop")
+    [
+        "docker-desktop",
+        "docker-desktop-data",
+        "rancher-desktop",
+        "rancher-desktop-data",
+    ]
+    .iter()
+    .any(|helper| name.eq_ignore_ascii_case(helper))
 }
 
 /// How long `wsl.exe` may take to answer; a first call boots the WSL VM.
@@ -332,7 +338,7 @@ mod tests {
         ] {
             assert!(is_tool_distro(name), "{name}");
         }
-        for name in ["Ubuntu", "Debian", "docker-dev"] {
+        for name in ["Ubuntu", "Debian", "docker-dev", "docker-desktop-dev"] {
             assert!(!is_tool_distro(name), "{name}");
         }
     }
