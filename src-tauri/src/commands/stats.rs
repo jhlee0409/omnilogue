@@ -1185,6 +1185,10 @@ fn context_tier_min_tokens(model_name: &str, context_tokens: u64) -> u64 {
         "gpt-6.1-sol",
         "gpt-6-luna",
         "gpt-6-astra",
+        "gpt-6-cyber",
+        "gpt-6.1-terra",
+        "gpt-6.2-sol",
+        "gpt-6.2-astra",
     ]
     .into_iter()
     .any(matches_model)
