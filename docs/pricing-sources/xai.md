@@ -45,3 +45,10 @@ All rates USD per 1M tokens. xAI publishes no cache-write charge; cached prompt 
 
 - **Added `grok-4.7`** (https://docs.x.ai/developers/models/grok-4.7): "Input Tokens $2.00 … Cached tokens $0.50 … Output Tokens $6.00", with "different rates for requests which exceed the 200K context window" — long 4.00 / 1.00 / 12.00, threshold 200000. The OpenRouter feed's $1.6/$4.8 does not match the official page.
 - `grok-4.20-multi-agent-0309` re-confirmed (1.25 / 0.2 / 2.5, long 2.5 / 0.4 / 5).
+
+## 2026-11-22 full audit (pricing watch #647)
+
+Every xAI entry re-checked against https://docs.x.ai/developers/models and the `grok-4.5` / `grok-build-0.1` model pages.
+
+- **Rates unchanged** for grok-4.7, 4.6, 4.5 (aliases `grok-4.5-latest`, `grok-build-latest`), 4.3, 4.20-0309-reasoning / non-reasoning / multi-agent and grok-build-0.1, including the ≥200k rows.
+- **`grok-code-fast-1`, `grok-code-fast`, `grok-code-fast-1-0825`**: https://docs.x.ai/developers/models/grok-code-fast-1 now redirects to the models index and the `grok-build-0.1` page lists no aliases. Kept at the grok-build-0.1 rate with their 2026-09-02 `verifiedAt`. LiteLLM's 2026-05-15 shutdown for `grok-code-fast-1` (grok-4's date) and 2026-11-19 for `grok-build-0.1` are not published by xAI, which still lists grok-build-0.1 with pricing; both recorded as known feed differences.

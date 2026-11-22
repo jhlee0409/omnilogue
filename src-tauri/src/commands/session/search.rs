@@ -220,10 +220,11 @@ fn search_in_file(
         parse_buffer.clear();
         parse_buffer.extend_from_slice(raw_line);
 
-        let log_entry: RawLogEntry = match simd_json::serde::from_slice(&mut parse_buffer) {
+        let mut log_entry: RawLogEntry = match simd_json::serde::from_slice(&mut parse_buffer) {
             Ok(entry) => entry,
             Err(_) => continue,
         };
+        log_entry.promote_queued_prompt();
 
         if log_entry.message_type != "user" && log_entry.message_type != "assistant" {
             continue;
@@ -529,6 +530,18 @@ impl<'a> SearchFilters<'a> {
                     }
                 }),
         }
+    }
+
+    /// True when no filter is set, so every hit is in scope.
+    pub(crate) fn is_unrestricted(&self) -> bool {
+        self.message_type.is_none()
+            && self.projects.is_none()
+            && self.project_paths.is_none()
+            && self.session_ids.is_none()
+            && self.has_tool_calls.is_none()
+            && self.has_errors.is_none()
+            && self.has_file_changes.is_none()
+            && matches!(self.date_range, DateRangeFilter::Any)
     }
 
     pub(crate) fn matches_project(&self, path: Option<&str>, name: Option<&str>) -> bool {

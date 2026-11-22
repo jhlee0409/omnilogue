@@ -52,9 +52,11 @@ function makeContext(overrides: Partial<CommandContext> = {}): CommandContext {
     toggleInspector: vi.fn(),
     toggleMinimap: vi.fn(),
     toggleInlineTokenUsage: vi.fn(),
+    toggleLiveRefresh: vi.fn(),
     openSettingsManager: vi.fn(),
     openArchive: vi.fn(),
     openFeedback: vi.fn(),
+    openLogFolder: vi.fn(),
     checkForUpdates: vi.fn(),
     newWindow: vi.fn(),
     newTab: vi.fn(),
@@ -263,6 +265,24 @@ describe("command registry", () => {
       expect(runCommand("view.toggleInlineTokens", ctx)).toBe(true);
       expect(ctx.actions.toggleInlineTokenUsage).toHaveBeenCalledTimes(1);
     }
+  });
+
+  it("toggles live refresh on the desktop only; the WebUI server keeps its own watcher (#820)", () => {
+    const desktop = makeContext();
+    expect(runCommand("view.toggleLiveRefresh", desktop)).toBe(true);
+    expect(desktop.actions.toggleLiveRefresh).toHaveBeenCalledTimes(1);
+    const web = makeContext({ runtime: "web" });
+    expect(runCommand("view.toggleLiveRefresh", web)).toBe(false);
+    expect(web.actions.toggleLiveRefresh).not.toHaveBeenCalled();
+  });
+
+  it("opens the log folder on the desktop only; cchv-server logs to stderr (#821)", () => {
+    const desktop = makeContext();
+    expect(runCommand("help.openLogFolder", desktop)).toBe(true);
+    expect(desktop.actions.openLogFolder).toHaveBeenCalledTimes(1);
+    const web = makeContext({ runtime: "web" });
+    expect(runCommand("help.openLogFolder", web)).toBe(false);
+    expect(web.actions.openLogFolder).not.toHaveBeenCalled();
   });
 
   it("disables the archive for another provider's project, like the gear menu", () => {

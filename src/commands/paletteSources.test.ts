@@ -194,13 +194,20 @@ describe("message search coverage (provider parity)", () => {
       path.resolve(__dirname, "../../src-tauri/src/commands/multi_provider.rs"),
       "utf8",
     );
+    // Claude and Codex are searched inline in `search_all_providers`; every
+    // other provider through its `SEARCH_ADAPTERS` entry (`search_adapters`).
     const start = rust.indexOf("pub async fn search_all_providers(");
     const end = rust.indexOf("\n}\n", start);
     expect(start).toBeGreaterThan(-1);
     const body = rust.slice(start, end);
-    const searched = new Set(
-      Array.from(body.matchAll(/providers_to_search\.iter\(\)\.any\(\|p\| p == "([a-z-]+)"\)/g), (m) => m[1] as ProviderId),
-    );
+    const tableStart = rust.indexOf("const SEARCH_ADAPTERS:");
+    expect(tableStart).toBeGreaterThan(-1);
+    const table = rust.slice(tableStart, rust.indexOf("\n];\n", tableStart));
+    expect(body).toContain("search_adapters(");
+    const searched = new Set([
+      ...Array.from(body.matchAll(/providers_to_search\.iter\(\)\.any\(\|p\| p == "([a-z-]+)"\)/g), (m) => m[1] as ProviderId),
+      ...Array.from(table.matchAll(/\(\s*"([a-z-]+)",\s*"[^"]+",\s*SearchAdapter::/g), (m) => m[1] as ProviderId),
+    ]);
     expect([...searched].sort()).toEqual([...MESSAGE_SEARCH_PROVIDERS].sort());
   });
 });

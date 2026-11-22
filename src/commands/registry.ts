@@ -25,8 +25,10 @@ import {
   ChevronRight,
   ChevronUp,
   Coins,
+  FolderSync,
   Map as MinimapGlyph,
   MessageSquare,
+  ScrollText,
   Plus,
   RefreshCw,
   Scan,
@@ -86,9 +88,11 @@ export interface CommandActions {
   toggleInspector: () => void;
   toggleMinimap: () => void;
   toggleInlineTokenUsage: () => void;
+  toggleLiveRefresh: () => unknown;
   openSettingsManager: () => unknown;
   openArchive: () => unknown;
   openFeedback: () => void;
+  openLogFolder: () => unknown;
   checkForUpdates: () => void;
   /** Open another app window (desktop). */
   newWindow: () => unknown;
@@ -235,6 +239,14 @@ const HANDLERS: Record<CommandId, CommandHandler> = {
     target: APP_TARGET,
     run: (ctx) => ctx.actions.toggleInlineTokenUsage(),
   },
+  "view.toggleLiveRefresh": {
+    icon: FolderSync,
+    // The desktop app's history-folder watcher (#820); the WebUI server runs
+    // its own. A saved setting, app-wide.
+    target: APP_TARGET,
+    available: (ctx) => ctx.runtime === "desktop",
+    run: (ctx) => ctx.actions.toggleLiveRefresh(),
+  },
   "view.zoomIn": zoomCommand(ZoomIn, "in"),
   "view.zoomOut": zoomCommand(ZoomOut, "out"),
   "view.actualSize": zoomCommand(Scan, "reset"),
@@ -254,6 +266,13 @@ const HANDLERS: Record<CommandId, CommandHandler> = {
     icon: MessageSquare,
     target: APP_TARGET,
     run: (ctx) => ctx.actions.openFeedback(),
+  },
+  "help.openLogFolder": {
+    icon: ScrollText,
+    // The desktop app's log files (#821); `cchv-server` logs to stderr.
+    target: APP_TARGET,
+    available: (ctx) => ctx.runtime === "desktop",
+    run: (ctx) => ctx.actions.openLogFolder(),
   },
   "app.checkForUpdates": {
     icon: RefreshCw,

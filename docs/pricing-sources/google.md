@@ -129,3 +129,13 @@
 ## 2026-11-18 update (pricing watch #647)
 
 - **`gemini-3.8-flash`: unchanged.** https://ai.google.dev/gemini-api/docs/pricing#gemini-3.8-flash, Standard, paid tier: input "$0.75 through December 31, 2026. $1.50 starting January 1, 2027."; output "$3.75 through December 31, 2026. $7.50 starting January 1, 2027."; context caching "$0.075 through December 31, 2026. $0.15 starting January 1, 2027.". OpenRouter's $0.825 / $4.125 / $0.0825 is a flat 10% above the official rate; recorded as known feed differences.
+
+## 2026-11-22 full audit (pricing watch #647)
+
+Every Gemini entry re-checked against https://ai.google.dev/gemini-api/docs/pricing (Standard, paid tier), https://ai.google.dev/gemini-api/docs/models and https://ai.google.dev/gemini-api/docs/deprecations.
+
+- **Rates unchanged**: 3.8 Flash and 3.6 Flash (0.75 / 3.75 / 0.075 through 2026-12-31), 3.5 Flash-Lite (0.30 / 2.50 / 0.03), 3.1 Flash-Lite (0.25 / 1.50 / 0.025), 3.1 Pro Preview (2 / 12 / 0.20; >200k 4 / 18 / 0.40), 3 Flash Preview (0.50 / 3 / 0.05), 2.5 Pro (1.25 / 10 / 0.125; >200k 2.50 / 15 / 0.25), 2.5 Flash (0.30 / 2.50 / 0.03), 2.5 Flash-Lite (0.10 / 0.40 / 0.01).
+- **`gemini-2.5-pro` / `gemini-2.5-flash` retire 2026-12-01**: "Effective December 1, 2026, all API requests to `gemini-2.5-pro` will automatically route to `gemini-3.8-flash` and be billed at Gemini 3.8 Flash rates" (2.5 Flash → `gemini-3.5-flash-lite`). Recorded `deprecatedAt: 2026-12-01` with those `replacedBy`. `gemini-2.5-flash-lite` "is not deprecated".
+- **`gemini-3.7-flash` / `gemini-3.5-flash`**: not on the pricing page; the deprecations page says their endpoints "automatically route API requests to `gemini-3.8-flash`" / "`gemini-3.6-flash`". Kept at their recorded rates and dates.
+- **Added Gemini 4** (not on the Free tier; implicit caching only): `gemini-4-carbon` and `gemini-4-argon` "$2.00 through November 30, 2026. $4.00 starting December 1, 2026." input, $10 → $20 output, $0.10 → $0.20 caching — recorded at the current rate with the December rate in `note`, as for 3.8 Flash; `gemini-4-neon` 3 / 15 / 0.15; `gemini-4-hydrogen` 1.50 / 7.50 / 0.075. No long-context tier is published.
+- **Not added**: Gemini Omni Flash (`gemini-omni-1.1/1.2-flash`, video generation), Nano Banana 2.1 (image), TTS and Live models — not coding-assistant chat models.

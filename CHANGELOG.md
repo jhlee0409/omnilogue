@@ -7,8 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-11-22
+
+### Added
+- **Logs for bug reports** (desktop and WebUI server). The backend's log lines (startup, file watcher, provider and WSL errors, panics) were dropped because no logger was installed. The desktop app now writes them to the OS log folder (2 MB per file, 3 files kept; each line is written as it is logged, so a hard freeze keeps what came before it), and **Help → Open Log Folder** (also in the ⌘K palette) opens that folder. `cchv-server` writes them to stderr; `RUST_LOG` sets the level (default `info`). App events, paths and errors only, never conversation text. (#821)
+- **Turn off live refresh** (desktop). Since v2.0.0 the desktop app watches the history folders and walks them at launch so open sessions update as they change. **Gear menu → View → Live refresh**, the View menu and the ⌘K palette ("Turn Live Refresh On or Off") now switch this off: the watcher stops at once, does not start at the next launch, and sessions update when reloaded. On by default; saved with the other app settings and applied in every window. The WebUI server keeps its own watcher. (#820)
+
 ### Changed
 - Refreshed the public website with real Omnilogue screens, localized platform downloads, and separate desktop and self-hosted setup paths.
+- **Model prices re-audited on 2026-11-22** (desktop and WebUI). Every entry was checked against the providers' official pricing and deprecation pages. Newly priced: Claude Fable 5.2 and Mythos 5.2, GPT-6.2 Astra and Sol, GPT-6.1 Terra, GPT-6 Cyber, the GPT-5.x / o3 pro models (which were billed at their base model's rate by prefix, as Fable 5.2 was at Fable 5's), Gemini 4 Carbon, Argon, Neon and Hydrogen, and MiniMax M3.1 Flash. Retirement dates now shown: GPT-5 / 5 mini / 5 nano / o3 (2026-12-11), Gemini 2.5 Pro and Flash (2026-12-01), GPT-4o / 4o mini / 4.1 / 4.1 mini (2027-01-14), GPT-5.5 Cyber (2027-02-01), GPT-5.3 Codex / 5.4 nano / 5.1 (2027-04-01). No existing rate changed. (#647)
+
+### Fixed
+- **Less load right after launch** (desktop; WSL parts on Windows). Looking into a report of Windows freezing about a minute after start (#819): the desktop file watcher no longer watches VS Code's `workspaceStorage` (no event was ever produced from it, but the whole folder, extension caches included, was walked at launch) or network paths such as a `\\wsl.localhost\…` custom Claude folder (still read, no longer watched). With WSL scanning on, each distro's home is asked from `wsl.exe` once per run instead of on every scan and message search (a failed lookup is retried after a minute), without a console window and with a 15-second limit, and Docker / Rancher Desktop helper distros are skipped. Parallel history scans leave one CPU core free. (#819)
+- **Messages sent while Claude Code is working are shown** (desktop and WebUI). A message typed while Claude Code was still answering (Enter mid-turn, in the CLI or Claude Desktop) is recorded as a queued-command attachment, not a user line, so the viewer dropped its text and the reply looked unprompted. It now appears as a user message at that point, is included in exports and statistics, and is found by message search. Queued task notifications are not user input and are unchanged. (#815)
+- **README explains finding other assistants and WSL limits.** The Installation section notes that startup scans Claude Code only, points to **Sort and filter → Find other providers**, and says that WSL History Scanning covers Claude Code and GitHub Copilot (run `cchv-server` inside WSL for other assistants there). (#816)
+- **Scoped ⌘K search finds every match for the other providers too** (desktop and WebUI). Gemini, Cursor, OpenCode, Copilot and the other providers whose search stops at the result limit before it knows the filters are asked for all their hits when a project, session, date, message-type or tool filter is set, and only then cut to the limit, so a one-project search no longer returns fewer matches than exist. An unfiltered search is unchanged. (#806)
 
 ## [2.0.0] - 2026-11-19
 

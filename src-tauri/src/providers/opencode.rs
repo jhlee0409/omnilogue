@@ -1013,10 +1013,18 @@ pub fn search_at(
         return Ok(results);
     }
 
-    for project_entry in fs::read_dir(&session_root)
-        .map_err(|e| e.to_string())?
-        .flatten()
-    {
+    // An unreadable legacy store must not discard the SQLite hits above.
+    let project_entries = match fs::read_dir(&session_root) {
+        Ok(entries) => entries,
+        Err(error) => {
+            log::warn!(
+                "OpenCode search skipped {}: {error}",
+                session_root.display()
+            );
+            return Ok(results);
+        }
+    };
+    for project_entry in project_entries.flatten() {
         if project_entry.file_type().map_or(true, |ft| ft.is_symlink()) {
             continue;
         }

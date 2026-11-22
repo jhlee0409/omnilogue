@@ -59,6 +59,9 @@ pub fn detect_distros() -> Vec<WslDistro> {
             Ok(n) => n,
             Err(_) => continue,
         };
+        if is_tool_distro(&name) {
+            continue;
+        }
         distros.push(WslDistro {
             name,
             is_default: subkey_name == default_guid,
@@ -77,8 +80,103 @@ pub fn detect_distros() -> Vec<WslDistro> {
     Vec::new()
 }
 
+/// Docker Desktop and Rancher Desktop register helper distros that hold no
+/// user history; asking them for a home directory only starts the WSL VM
+/// (#819). Exact names: a user's own `docker-desktop-dev` is a real distro.
+#[cfg(any(target_os = "windows", test))]
+fn is_tool_distro(name: &str) -> bool {
+    [
+        "docker-desktop",
+        "docker-desktop-data",
+        "rancher-desktop",
+        "rancher-desktop-data",
+    ]
+    .iter()
+    .any(|helper| name.eq_ignore_ascii_case(helper))
+}
+
+/// How long `wsl.exe` may take to answer; a first call boots the WSL VM.
+#[cfg(target_os = "windows")]
+const WSL_HOME_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// How long a failed home lookup is reused before `wsl.exe` is asked again.
+#[cfg(target_os = "windows")]
+const WSL_HOME_RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// A distro's home, or the error and when it was seen.
+#[cfg(any(target_os = "windows", test))]
+type HomeEntry = Result<PathBuf, (std::time::Instant, String)>;
+
+/// A distro's cache slot; locked while its home is looked up.
+#[cfg(any(target_os = "windows", test))]
+type HomeSlot = std::sync::Arc<std::sync::Mutex<Option<HomeEntry>>>;
+
+/// Each distro's `$HOME`, asked from `wsl.exe` once per run (#819). A failure
+/// (a first VM boot past the timeout, a stopped distro) is reused only for
+/// `retry_after`, then asked again.
+#[cfg(any(target_os = "windows", test))]
+struct HomeCache {
+    retry_after: std::time::Duration,
+    /// One slot per distro: a slow lookup holds only its own distro's slot.
+    slots: std::sync::Mutex<std::collections::HashMap<String, HomeSlot>>,
+}
+
+#[cfg(any(target_os = "windows", test))]
+impl HomeCache {
+    fn new(retry_after: std::time::Duration) -> Self {
+        Self {
+            retry_after,
+            slots: std::sync::Mutex::default(),
+        }
+    }
+
+    /// The cached home of `distro`, or `query`'s answer. The distro's slot is
+    /// held while querying, so a scan and a search arriving together ask once;
+    /// other distros and cached answers do not wait for it.
+    fn resolve(
+        &self,
+        distro: &str,
+        query: impl FnOnce() -> Result<PathBuf, String>,
+    ) -> Result<PathBuf, String> {
+        use std::sync::PoisonError;
+
+        let slot = self
+            .slots
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(distro.to_string())
+            .or_default()
+            .clone();
+        let mut entry = slot.lock().unwrap_or_else(PoisonError::into_inner);
+        match &*entry {
+            Some(Ok(home)) => return Ok(home.clone()),
+            Some(Err((at, error))) if at.elapsed() < self.retry_after => return Err(error.clone()),
+            _ => {}
+        }
+        let resolved = query();
+        *entry = Some(
+            resolved
+                .clone()
+                .map_err(|error| (std::time::Instant::now(), error)),
+        );
+        resolved
+    }
+}
+
+/// The distro's `$HOME`. `wsl.exe` starts the WSL VM, and project scans and
+/// every message search ask for the same homes, so answers are cached
+/// ([`HomeCache`]).
 #[cfg(target_os = "windows")]
 pub fn resolve_home_path(distro: &str) -> Result<PathBuf, String> {
+    static HOMES: std::sync::OnceLock<HomeCache> = std::sync::OnceLock::new();
+    HOMES
+        .get_or_init(|| HomeCache::new(WSL_HOME_RETRY_AFTER))
+        .resolve(distro, || query_home_path(distro))
+}
+
+#[cfg(target_os = "windows")]
+fn query_home_path(distro: &str) -> Result<PathBuf, String> {
+    use std::os::windows::process::CommandExt;
     use std::process::Command;
 
     if !distro
@@ -88,10 +186,15 @@ pub fn resolve_home_path(distro: &str) -> Result<PathBuf, String> {
         return Err(format!("Invalid distro name: {distro}"));
     }
 
-    let output = Command::new("wsl")
-        .args(["-d", distro, "-e", "sh", "-c", "echo $HOME"])
-        .output()
-        .map_err(|e| format!("Failed to run wsl command: {e}"))?;
+    // No console window per call; a stuck distro cannot hold a scan forever.
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let output = run_with_timeout(
+        Command::new("wsl")
+            .args(["-d", distro, "-e", "sh", "-c", "echo $HOME"])
+            .creation_flags(CREATE_NO_WINDOW),
+        WSL_HOME_TIMEOUT,
+    )
+    .map_err(|e| format!("Failed to run wsl command for distro '{distro}': {e}"))?;
 
     if !output.status.success() {
         return Err(format!(
@@ -114,6 +217,36 @@ pub fn resolve_home_path(distro: &str) -> Result<PathBuf, String> {
 #[cfg(not(target_os = "windows"))]
 pub fn resolve_home_path(_distro: &str) -> Result<PathBuf, String> {
     Err("WSL is only available on Windows".to_string())
+}
+
+/// Run `command` to completion with its output captured, killing it after
+/// `timeout`. Its output must be small: it is read once the process exits.
+#[cfg(any(target_os = "windows", test))]
+fn run_with_timeout(
+    command: &mut std::process::Command,
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, String> {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait().map_err(|e| e.to_string())? {
+            Some(_) => return child.wait_with_output().map_err(|e| e.to_string()),
+            None if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(25)),
+            None => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!("timed out after {} ms", timeout.as_millis()));
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -193,5 +326,118 @@ mod tests {
         if !cfg!(target_os = "windows") {
             assert!(detect_distros().is_empty());
         }
+    }
+
+    #[test]
+    fn container_helper_distros_are_skipped() {
+        for name in [
+            "docker-desktop",
+            "docker-desktop-data",
+            "Rancher-Desktop",
+            "rancher-desktop-data",
+        ] {
+            assert!(is_tool_distro(name), "{name}");
+        }
+        for name in ["Ubuntu", "Debian", "docker-dev", "docker-desktop-dev"] {
+            assert!(!is_tool_distro(name), "{name}");
+        }
+    }
+
+    /// A process that does not answer is killed at the timeout instead of
+    /// holding the scan (#819); a quick one returns its output.
+    #[cfg(unix)]
+    #[test]
+    fn run_with_timeout_kills_a_stuck_process() {
+        use std::process::Command;
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        let stuck = run_with_timeout(Command::new("sleep").arg("5"), Duration::from_millis(200));
+        assert!(stuck.is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let quick = run_with_timeout(
+            Command::new("sh").args(["-c", "echo /home/u"]),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(String::from_utf8_lossy(&quick.stdout).trim(), "/home/u");
+    }
+
+    /// A found home is asked once; a failure is reused until `retry_after`,
+    /// then asked again (a WSL VM that booted late is not lost for the run).
+    #[test]
+    fn home_cache_reuses_answers_and_retries_failures() {
+        use std::cell::Cell;
+        use std::time::Duration;
+
+        let asked = Cell::new(0);
+        let cache = HomeCache::new(Duration::from_secs(3600));
+        let ok = || {
+            asked.set(asked.get() + 1);
+            Ok(PathBuf::from("/home/u"))
+        };
+        assert_eq!(
+            cache.resolve("Ubuntu", ok).unwrap(),
+            PathBuf::from("/home/u")
+        );
+        assert_eq!(
+            cache.resolve("Ubuntu", ok).unwrap(),
+            PathBuf::from("/home/u")
+        );
+        assert_eq!(asked.get(), 1);
+
+        let failing = || {
+            asked.set(asked.get() + 1);
+            Err("timed out".to_string())
+        };
+        assert!(cache.resolve("Debian", failing).is_err());
+        assert!(cache.resolve("Debian", failing).is_err());
+        assert_eq!(asked.get(), 2, "a recent failure is reused");
+
+        let retrying = HomeCache::new(Duration::ZERO);
+        assert!(retrying.resolve("Debian", failing).is_err());
+        assert_eq!(
+            retrying.resolve("Debian", ok).unwrap(),
+            PathBuf::from("/home/u")
+        );
+        assert_eq!(asked.get(), 4, "an expired failure is asked again");
+    }
+
+    /// A distro whose lookup hangs does not hold up another distro's lookup.
+    #[test]
+    fn home_cache_lookups_of_different_distros_do_not_wait_on_each_other() {
+        use std::sync::{mpsc, Arc};
+        use std::time::Duration;
+
+        let cache = Arc::new(HomeCache::new(Duration::from_secs(3600)));
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let slow = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || {
+                cache.resolve("Slow", || {
+                    started_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(PathBuf::from("/home/slow"))
+                })
+            })
+        };
+        started_rx.recv().unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel();
+        let fast = {
+            let cache = Arc::clone(&cache);
+            std::thread::spawn(move || {
+                done_tx
+                    .send(cache.resolve("Fast", || Ok(PathBuf::from("/home/fast"))))
+                    .unwrap();
+            })
+        };
+        let answer = done_rx.recv_timeout(Duration::from_secs(5));
+        release_tx.send(()).unwrap();
+        assert_eq!(answer.unwrap().unwrap(), PathBuf::from("/home/fast"));
+        assert_eq!(slow.join().unwrap().unwrap(), PathBuf::from("/home/slow"));
+        fast.join().unwrap();
     }
 }

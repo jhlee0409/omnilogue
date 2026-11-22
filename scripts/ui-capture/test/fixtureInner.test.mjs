@@ -8,6 +8,7 @@ import path from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { generateFixture, snapshotTree } from "../fixtures/generate.mjs";
 import { CJK_CASES, E15_RESULT, INNER_CASES } from "../fixtures/inner.mjs";
+import { FIXED_NOW_ISO } from "../fixtures/catalog.mjs";
 
 let scratch;
 let withInner;
@@ -128,10 +129,17 @@ describe("inner fixture", () => {
     expect(messages.filter((m) => m.role === "assistant").every((m) => typeof m.cost === "number")).toBe(true);
   });
 
-  it("uses no deprecated model (the app would toast about it over the phone's tab bar)", () => {
+  it("uses no retiring or retired model at the capture clock (the app would toast about it over the phone's tab bar)", () => {
     const pricing = JSON.parse(fs.readFileSync(path.resolve(import.meta.dirname, "../../../src/data/model-pricing.json"), "utf8"));
     const table = pricing.models ?? pricing;
-    const deprecated = new Set(Object.entries(table).filter(([, m]) => m && typeof m === "object" && m.deprecatedAt).map(([id]) => id));
+    // `getModelLifecycle`: retired or retiring within MODEL_RETIRING_WINDOW_DAYS
+    // (90) of the frozen capture clock.
+    const horizon = new Date(Date.parse(FIXED_NOW_ISO) + 90 * 86_400_000).toISOString().slice(0, 10);
+    const deprecated = new Set(
+      Object.entries(table)
+        .filter(([, m]) => m && typeof m === "object" && m.deprecatedAt && m.deprecatedAt <= horizon)
+        .map(([id]) => id),
+    );
     expect(deprecated.size).toBeGreaterThan(0);
     const used = new Set();
     const walk = (dir) => {

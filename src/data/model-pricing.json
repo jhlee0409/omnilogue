@@ -1,10 +1,50 @@
 {
-  "auditedAt": "2026-10-10",
+  "auditedAt": "2026-11-22",
   "models": {
+    "claude-fable-5-2": {
+      "provider": "anthropic",
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verifiedAt": "2026-11-22",
+      "note": "Cache reads are 0.025x base input ($0.20). Fast mode (speed: fast) bills $16/$80; cache multipliers stack on top.",
+      "input": 8,
+      "output": 40,
+      "cacheRead": 0.2,
+      "cacheWrite": 10,
+      "cacheWriteOneHour": 16,
+      "serviceTiers": {
+        "fast": {
+          "input": 16,
+          "output": 80,
+          "cacheRead": 0.4,
+          "cacheWrite": 20,
+          "cacheWriteOneHour": 32
+        }
+      }
+    },
+    "claude-mythos-5-2": {
+      "provider": "anthropic",
+      "source": "https://platform.claude.com/docs/en/about-claude/pricing",
+      "verifiedAt": "2026-11-22",
+      "note": "Limited availability. Cache reads are 0.025x base input ($0.20). Fast mode (speed: fast) bills $16/$80; cache multipliers stack on top.",
+      "input": 8,
+      "output": 40,
+      "cacheRead": 0.2,
+      "cacheWrite": 10,
+      "cacheWriteOneHour": 16,
+      "serviceTiers": {
+        "fast": {
+          "input": 16,
+          "output": 80,
+          "cacheRead": 0.4,
+          "cacheWrite": 20,
+          "cacheWriteOneHour": 32
+        }
+      }
+    },
     "claude-fable-5-1": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 10,
       "output": 50,
       "cacheRead": 0.25,
@@ -14,7 +54,7 @@
     "claude-mythos-5-1": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 10,
       "output": 50,
       "cacheRead": 0.25,
@@ -24,7 +64,7 @@
     "claude-fable-5": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 10,
       "output": 50,
       "cacheRead": 1,
@@ -34,7 +74,7 @@
     "claude-mythos-5": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 10,
       "output": 50,
       "cacheRead": 1,
@@ -55,7 +95,7 @@
     "claude-opus-5-5": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-10-01",
+      "verifiedAt": "2026-11-22",
       "note": "Cache reads are 0.05x base input ($0.20). Fast mode (speed: fast) bills $8/$40; cache multipliers stack on top.",
       "input": 4,
       "output": 20,
@@ -75,7 +115,7 @@
     "claude-opus-5": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "note": "Fast mode (speed: fast) bills $10/$50; cache multipliers stack on top.",
       "input": 5,
       "output": 25,
@@ -95,7 +135,7 @@
     "claude-opus-4-8": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "note": "Fast mode (speed: fast) bills $10/$50; cache multipliers stack on top.",
       "input": 5,
       "output": 25,
@@ -115,7 +155,7 @@
     "claude-opus-4-7": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 5,
       "output": 25,
       "cacheRead": 0.5,
@@ -125,7 +165,7 @@
     "claude-opus-4-6": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 5,
       "output": 25,
       "cacheRead": 0.5,
@@ -135,7 +175,7 @@
     "claude-opus-4-5": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 5,
       "output": 25,
       "cacheRead": 0.5,
@@ -145,7 +185,7 @@
     "claude-opus-4-1": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "deprecatedAt": "2026-08-05",
       "replacedBy": "claude-opus-4-8",
       "input": 15,
@@ -157,7 +197,7 @@
     "claude-opus-4": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-10-01",
+      "verifiedAt": "2026-11-22",
       "deprecatedAt": "2026-06-15",
       "replacedBy": "claude-opus-4-8",
       "input": 15,
@@ -169,7 +209,7 @@
     "claude-sonnet-5-5": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-10-10",
+      "verifiedAt": "2026-11-22",
       "note": "Cache reads are 0.05x base input ($0.10) since 2026-10-07; were $0.20 before.",
       "input": 2,
       "output": 10,
@@ -180,7 +220,7 @@
     "claude-sonnet-5": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 2,
       "output": 10,
       "cacheRead": 0.2,
@@ -190,7 +230,7 @@
     "claude-sonnet-4-6": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 3,
       "output": 15,
       "cacheRead": 0.3,
@@ -200,7 +240,7 @@
     "claude-sonnet-4-5": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-10-01",
+      "verifiedAt": "2026-11-22",
       "input": 3,
       "output": 15,
       "cacheRead": 0.3,
@@ -212,7 +252,7 @@
     "claude-sonnet-4": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "deprecatedAt": "2026-06-15",
       "replacedBy": "claude-sonnet-4-6",
       "input": 3,
@@ -224,7 +264,7 @@
     "claude-haiku-5-5": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-10-10",
+      "verifiedAt": "2026-11-22",
       "note": "Priced by prompt length: prompts over 100,000 tokens (input + cache reads + cache writes) bill the higher row. No fast mode.",
       "input": 0.1,
       "output": 0.5,
@@ -245,7 +285,7 @@
     "claude-haiku-4-5": {
       "provider": "anthropic",
       "source": "https://platform.claude.com/docs/en/about-claude/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 1,
       "output": 5,
       "cacheRead": 0.1,
@@ -316,10 +356,19 @@
       "cacheWrite": 0.3,
       "cacheWriteOneHour": 0.5
     },
+    "minimax-m3.1-flash": {
+      "provider": "minimax",
+      "source": "https://platform.minimax.io/docs/guides/pricing-paygo",
+      "verifiedAt": "2026-11-22",
+      "input": 0.15,
+      "output": 0.6,
+      "cacheRead": 0.015,
+      "cacheWrite": null
+    },
     "minimax-m3": {
       "provider": "minimax",
       "source": "https://platform.minimax.io/docs/guides/pricing-paygo",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "note": "Effective rates after the published permanent 50% discount. Priority tier (service_tier: priority) is 1.5x.",
       "input": 0.3,
       "output": 1.2,
@@ -400,7 +449,7 @@
       "provider": "minimax",
       "source": "https://platform.minimax.io/docs/guides/pricing-paygo",
       "verifiedAt": "2026-09-02",
-      "note": "Legacy model; existing subscribers only.",
+      "note": "Retired (MiniMax model list, retirement date not published); last published rate kept.",
       "input": 0.6,
       "output": 2.4,
       "cacheRead": 0.03,
@@ -410,7 +459,7 @@
       "provider": "minimax",
       "source": "https://platform.minimax.io/docs/guides/pricing-paygo",
       "verifiedAt": "2026-09-02",
-      "note": "Legacy model; existing subscribers only.",
+      "note": "Retired (MiniMax model list, retirement date not published); last published rate kept.",
       "input": 0.3,
       "output": 1.2,
       "cacheRead": 0.03,
@@ -420,16 +469,121 @@
       "provider": "minimax",
       "source": "https://platform.minimax.io/docs/guides/pricing-paygo",
       "verifiedAt": "2026-09-02",
-      "note": "Legacy model; existing subscribers only.",
+      "note": "Retired (MiniMax model list, retirement date not published); last published rate kept.",
       "input": 0.3,
       "output": 1.2,
       "cacheRead": 0.03,
       "cacheWrite": 0.375
     },
+    "gpt-6.2-astra": {
+      "provider": "openai",
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "verifiedAt": "2026-11-22",
+      "input": 8,
+      "output": 40,
+      "cacheRead": 0.4,
+      "cacheWrite": 10,
+      "contextTiers": [
+        {
+          "input": 16,
+          "output": 60,
+          "cacheRead": 0.8,
+          "cacheWrite": 20,
+          "minContextTokens": 272000
+        }
+      ],
+      "serviceTiers": {
+        "fast": {
+          "input": 16,
+          "output": 80,
+          "cacheRead": 0.8,
+          "cacheWrite": 20,
+          "contextTiers": [
+            {
+              "input": 32,
+              "output": 120,
+              "cacheRead": 1.6,
+              "cacheWrite": 40,
+              "minContextTokens": 272000
+            }
+          ]
+        }
+      }
+    },
+    "gpt-6.2-sol": {
+      "provider": "openai",
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "verifiedAt": "2026-11-22",
+      "input": 2,
+      "output": 10,
+      "cacheRead": 0.1,
+      "cacheWrite": 2.5,
+      "contextTiers": [
+        {
+          "input": 4,
+          "output": 15,
+          "cacheRead": 0.2,
+          "cacheWrite": 5,
+          "minContextTokens": 272000
+        }
+      ],
+      "serviceTiers": {
+        "fast": {
+          "input": 4,
+          "output": 20,
+          "cacheRead": 0.2,
+          "cacheWrite": 5,
+          "contextTiers": [
+            {
+              "input": 8,
+              "output": 30,
+              "cacheRead": 0.4,
+              "cacheWrite": 10,
+              "minContextTokens": 272000
+            }
+          ]
+        }
+      }
+    },
+    "gpt-6.1-terra": {
+      "provider": "openai",
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "verifiedAt": "2026-11-22",
+      "input": 1,
+      "output": 5,
+      "cacheRead": 0.05,
+      "cacheWrite": 1.25,
+      "contextTiers": [
+        {
+          "input": 2,
+          "output": 7.5,
+          "cacheRead": 0.1,
+          "cacheWrite": 2.5,
+          "minContextTokens": 272000
+        }
+      ],
+      "serviceTiers": {
+        "fast": {
+          "input": 2,
+          "output": 10,
+          "cacheRead": 0.1,
+          "cacheWrite": 2.5,
+          "contextTiers": [
+            {
+              "input": 4,
+              "output": 15,
+              "cacheRead": 0.2,
+              "cacheWrite": 5,
+              "minContextTokens": 272000
+            }
+          ]
+        }
+      }
+    },
     "gpt-6.1-sol": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-10-01",
+      "verifiedAt": "2026-11-22",
       "note": "Cached input is 5% of input (vs 10% on gpt-6-sol).",
       "input": 2,
       "output": 10,
@@ -465,7 +619,7 @@
     "gpt-6-sol": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/models/gpt-6-sol",
-      "verifiedAt": "2026-10-01",
+      "verifiedAt": "2026-11-22",
       "note": "Long-context and fast long-context rates derived from the model page rule (2x input/cache, 1.5x output above 272K; fast 2x); not on the pricing table.",
       "input": 2,
       "output": 10,
@@ -501,7 +655,7 @@
     "gpt-6-luna": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-10-01",
+      "verifiedAt": "2026-11-22",
       "input": 0.1,
       "output": 0.5,
       "cacheRead": 0.01,
@@ -536,7 +690,7 @@
     "gpt-6-astra": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-10-01",
+      "verifiedAt": "2026-11-22",
       "input": 10,
       "output": 50,
       "cacheRead": 1,
@@ -571,8 +725,8 @@
     "gpt-5.6-sol": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
-      "note": "Promotional pricing, published as valid at least through 2026-11-21.",
+      "verifiedAt": "2026-11-22",
+      "note": "Promotional pricing, published as valid until 2026-11-30.",
       "input": 4,
       "output": 20,
       "cacheRead": 0.4,
@@ -607,7 +761,7 @@
     "gpt-5.6-terra": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 2,
       "output": 12,
       "cacheRead": 0.2,
@@ -642,7 +796,7 @@
     "gpt-5.6-luna": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 0.2,
       "output": 1.2,
       "cacheRead": 0.02,
@@ -674,10 +828,29 @@
         }
       }
     },
+    "gpt-6-cyber": {
+      "provider": "openai",
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "verifiedAt": "2026-11-22",
+      "note": "Daybreak trusted-access cyber model.",
+      "input": 20,
+      "output": 100,
+      "cacheRead": 2,
+      "cacheWrite": 25,
+      "contextTiers": [
+        {
+          "input": 40,
+          "output": 150,
+          "cacheRead": 4,
+          "cacheWrite": null,
+          "minContextTokens": 272000
+        }
+      ]
+    },
     "gpt-5.6-cyber": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 12.5,
       "output": 75,
       "cacheRead": 1.25,
@@ -686,8 +859,8 @@
     "gpt-daybreak-blue-latest": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-10-01",
-      "note": "Alias currently pointing at gpt-5.6-sol; OpenAI re-points it as Daybreak models ship.",
+      "verifiedAt": "2026-11-22",
+      "note": "Deprecated alias (no shutdown date published) pointing at gpt-5.6-sol.",
       "input": 4,
       "output": 20,
       "cacheRead": 0.4,
@@ -722,8 +895,8 @@
     "gpt-daybreak-red-latest": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-10-01",
-      "note": "Alias currently pointing at gpt-5.6-cyber; OpenAI re-points it as Daybreak models ship.",
+      "verifiedAt": "2026-11-22",
+      "note": "Deprecated alias (no shutdown date published) pointing at gpt-5.6-cyber.",
       "input": 12.5,
       "output": 75,
       "cacheRead": 1.25,
@@ -732,16 +905,37 @@
     "gpt-5.5-cyber": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
+      "note": "API id gpt-5.5-cyber-preview.",
+      "deprecatedAt": "2027-02-01",
       "input": 12.5,
       "output": 75,
       "cacheRead": 1.25,
       "cacheWrite": null
     },
+    "gpt-5.5-pro": {
+      "provider": "openai",
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "verifiedAt": "2026-11-22",
+      "note": "No cached-input rate published.",
+      "input": 30,
+      "output": 180,
+      "cacheRead": 0,
+      "cacheWrite": null,
+      "contextTiers": [
+        {
+          "input": 60,
+          "output": 270,
+          "cacheRead": 0,
+          "cacheWrite": null,
+          "minContextTokens": 272000
+        }
+      ]
+    },
     "gpt-5.5": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 5,
       "output": 30,
       "cacheRead": 0.5,
@@ -764,10 +958,29 @@
         }
       }
     },
+    "gpt-5.4-pro": {
+      "provider": "openai",
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "verifiedAt": "2026-11-22",
+      "note": "No cached-input rate published.",
+      "input": 30,
+      "output": 180,
+      "cacheRead": 0,
+      "cacheWrite": null,
+      "contextTiers": [
+        {
+          "input": 60,
+          "output": 270,
+          "cacheRead": 0,
+          "cacheWrite": null,
+          "minContextTokens": 272000
+        }
+      ]
+    },
     "gpt-5.4": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 2.5,
       "output": 15,
       "cacheRead": 0.25,
@@ -793,7 +1006,7 @@
     "gpt-5.4-mini": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 0.75,
       "output": 4.5,
       "cacheRead": 0.075,
@@ -810,16 +1023,28 @@
     "gpt-5.4-nano": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
+      "deprecatedAt": "2027-04-01",
+      "replacedBy": "gpt-6-luna",
       "input": 0.2,
       "output": 1.25,
       "cacheRead": 0.02,
       "cacheWrite": null
     },
+    "gpt-5.2-pro": {
+      "provider": "openai",
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "verifiedAt": "2026-11-22",
+      "note": "No cached-input rate published.",
+      "input": 21,
+      "output": 168,
+      "cacheRead": 0,
+      "cacheWrite": null
+    },
     "gpt-5.2": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 1.75,
       "output": 14,
       "cacheRead": 0.175,
@@ -836,7 +1061,7 @@
     "chat-latest": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/models/chat-latest",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "note": "Points at the latest Instant model used in ChatGPT.",
       "input": 5,
       "output": 30,
@@ -868,8 +1093,10 @@
     "gpt-5.3-codex-fast": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/models/gpt-5.3-codex",
-      "verifiedAt": "2026-09-02",
-      "note": "Codex CLI encodes Fast mode in the model id. Rate is the gpt-5.3-codex fast tier; not on the official Fast table, corroborated by LiteLLM.",
+      "verifiedAt": "2026-11-22",
+      "note": "Codex CLI encodes Fast mode in the model id. Rate is the gpt-5.3-codex fast tier (official Codex Fast table).",
+      "deprecatedAt": "2027-04-01",
+      "replacedBy": "gpt-6-sol",
       "input": 3.5,
       "output": 28,
       "cacheRead": 0.35,
@@ -878,8 +1105,10 @@
     "gpt-5.3-codex": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/models/gpt-5.3-codex",
-      "verifiedAt": "2026-10-01",
-      "note": "Fast tier is not on the official Fast table; corroborated by LiteLLM priority rates.",
+      "verifiedAt": "2026-11-22",
+      "note": "Fast tier from the official Codex Fast table.",
+      "deprecatedAt": "2027-04-01",
+      "replacedBy": "gpt-6-sol",
       "input": 1.75,
       "output": 14,
       "cacheRead": 0.175,
@@ -951,7 +1180,9 @@
     "gpt-5.1": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
+      "deprecatedAt": "2027-04-01",
+      "replacedBy": "gpt-6-sol",
       "input": 1.25,
       "output": 10,
       "cacheRead": 0.125,
@@ -990,7 +1221,9 @@
     "gpt-5-mini": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
+      "deprecatedAt": "2026-12-11",
+      "replacedBy": "gpt-6.1-terra",
       "input": 0.25,
       "output": 2,
       "cacheRead": 0.025,
@@ -1007,16 +1240,32 @@
     "gpt-5-nano": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
+      "deprecatedAt": "2026-12-11",
+      "replacedBy": "gpt-6-luna",
       "input": 0.05,
       "output": 0.4,
       "cacheRead": 0.005,
       "cacheWrite": null
     },
+    "gpt-5-pro": {
+      "provider": "openai",
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "verifiedAt": "2026-11-22",
+      "note": "No cached-input rate published.",
+      "deprecatedAt": "2026-12-11",
+      "replacedBy": "gpt-6.1-sol",
+      "input": 15,
+      "output": 120,
+      "cacheRead": 0,
+      "cacheWrite": null
+    },
     "gpt-5": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
+      "deprecatedAt": "2026-12-11",
+      "replacedBy": "gpt-6.1-sol",
       "input": 1.25,
       "output": 10,
       "cacheRead": 0.125,
@@ -1033,7 +1282,9 @@
     "gpt-4.1-mini": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
+      "deprecatedAt": "2027-01-14",
+      "replacedBy": "gpt-6-luna",
       "input": 0.4,
       "output": 1.6,
       "cacheRead": 0.1,
@@ -1069,7 +1320,9 @@
     "gpt-4.1": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
+      "deprecatedAt": "2027-01-14",
+      "replacedBy": "gpt-6-luna",
       "input": 2,
       "output": 8,
       "cacheRead": 0.5,
@@ -1086,7 +1339,9 @@
     "gpt-4o-mini": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
+      "deprecatedAt": "2027-01-14",
+      "replacedBy": "gpt-6-luna",
       "input": 0.15,
       "output": 0.6,
       "cacheRead": 0.075,
@@ -1103,7 +1358,9 @@
     "gpt-4o": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
+      "deprecatedAt": "2027-01-14",
+      "replacedBy": "gpt-6-luna",
       "input": 2.5,
       "output": 10,
       "cacheRead": 1.25,
@@ -1164,10 +1421,24 @@
       "cacheRead": 0.55,
       "cacheWrite": null
     },
+    "o3-pro": {
+      "provider": "openai",
+      "source": "https://developers.openai.com/api/docs/pricing",
+      "verifiedAt": "2026-11-22",
+      "note": "No cached-input rate published.",
+      "deprecatedAt": "2026-12-11",
+      "replacedBy": "gpt-6.1-sol",
+      "input": 20,
+      "output": 80,
+      "cacheRead": 0,
+      "cacheWrite": null
+    },
     "o3": {
       "provider": "openai",
       "source": "https://developers.openai.com/api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
+      "deprecatedAt": "2026-12-11",
+      "replacedBy": "gpt-6.1-sol",
       "input": 2,
       "output": 8,
       "cacheRead": 0.5,
@@ -1223,10 +1494,50 @@
       "cacheRead": 0.375,
       "cacheWrite": null
     },
+    "gemini-4-carbon": {
+      "provider": "google",
+      "source": "https://ai.google.dev/gemini-api/docs/pricing",
+      "verifiedAt": "2026-11-22",
+      "note": "Promotional paid-tier rate through 2026-11-30; doubles from 2026-12-01 (input $4.00, output $20.00, cache read $0.20). Implicit caching only.",
+      "input": 2,
+      "output": 10,
+      "cacheRead": 0.1,
+      "cacheWrite": null
+    },
+    "gemini-4-neon": {
+      "provider": "google",
+      "source": "https://ai.google.dev/gemini-api/docs/pricing",
+      "verifiedAt": "2026-11-22",
+      "note": "Implicit caching only.",
+      "input": 3,
+      "output": 15,
+      "cacheRead": 0.15,
+      "cacheWrite": null
+    },
+    "gemini-4-argon": {
+      "provider": "google",
+      "source": "https://ai.google.dev/gemini-api/docs/pricing",
+      "verifiedAt": "2026-11-22",
+      "note": "Promotional paid-tier rate through 2026-11-30; doubles from 2026-12-01 (input $4.00, output $20.00, cache read $0.20). Implicit caching only.",
+      "input": 2,
+      "output": 10,
+      "cacheRead": 0.1,
+      "cacheWrite": null
+    },
+    "gemini-4-hydrogen": {
+      "provider": "google",
+      "source": "https://ai.google.dev/gemini-api/docs/pricing",
+      "verifiedAt": "2026-11-22",
+      "note": "Implicit caching only.",
+      "input": 1.5,
+      "output": 7.5,
+      "cacheRead": 0.075,
+      "cacheWrite": null
+    },
     "gemini-3.8-flash": {
       "provider": "google",
       "source": "https://ai.google.dev/gemini-api/docs/pricing",
-      "verifiedAt": "2026-10-01",
+      "verifiedAt": "2026-11-22",
       "note": "Promotional paid-tier rate through 2026-12-31; doubles from 2027-01-01 (input $1.50, output $7.50, cache read $0.15).",
       "input": 0.75,
       "output": 3.75,
@@ -1246,7 +1557,7 @@
     "gemini-3.6-flash": {
       "provider": "google",
       "source": "https://ai.google.dev/gemini-api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "note": "Promotional paid-tier rate through 2026-12-31; doubles from 2027-01-01 (input $1.50, output $7.50, cache read $0.15).",
       "input": 0.75,
       "output": 3.75,
@@ -1256,7 +1567,7 @@
     "gemini-3.5-flash-lite": {
       "provider": "google",
       "source": "https://ai.google.dev/gemini-api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 0.3,
       "output": 2.5,
       "cacheRead": 0.03,
@@ -1274,7 +1585,7 @@
     "gemini-3.1-pro-preview": {
       "provider": "google",
       "source": "https://ai.google.dev/gemini-api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 2,
       "output": 12,
       "cacheRead": 0.2,
@@ -1292,7 +1603,7 @@
     "gemini-3.1-flash-lite": {
       "provider": "google",
       "source": "https://ai.google.dev/gemini-api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "deprecatedAt": "2027-05-07",
       "replacedBy": "gemini-3.5-flash-lite",
       "input": 0.25,
@@ -1303,7 +1614,7 @@
     "gemini-3-flash-preview": {
       "provider": "google",
       "source": "https://ai.google.dev/gemini-api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 0.5,
       "output": 3,
       "cacheRead": 0.05,
@@ -1312,7 +1623,7 @@
     "gemini-2.5-flash-lite": {
       "provider": "google",
       "source": "https://ai.google.dev/gemini-api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 0.1,
       "output": 0.4,
       "cacheRead": 0.01,
@@ -1321,7 +1632,10 @@
     "gemini-2.5-flash": {
       "provider": "google",
       "source": "https://ai.google.dev/gemini-api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
+      "note": "Deprecated; from 2026-12-01 requests route to gemini-3.5-flash-lite and bill at its rates.",
+      "deprecatedAt": "2026-12-01",
+      "replacedBy": "gemini-3.5-flash-lite",
       "input": 0.3,
       "output": 2.5,
       "cacheRead": 0.03,
@@ -1330,7 +1644,10 @@
     "gemini-2.5-pro": {
       "provider": "google",
       "source": "https://ai.google.dev/gemini-api/docs/pricing",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
+      "note": "Deprecated; from 2026-12-01 requests route to gemini-3.8-flash and bill at its rates.",
+      "deprecatedAt": "2026-12-01",
+      "replacedBy": "gemini-3.8-flash",
       "input": 1.25,
       "output": 10,
       "cacheRead": 0.125,
@@ -1348,7 +1665,7 @@
     "grok-4.6": {
       "provider": "xai",
       "source": "https://docs.x.ai/developers/models/grok-4.6",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 2,
       "output": 6,
       "cacheRead": 0.5,
@@ -1366,7 +1683,7 @@
     "grok-4.7": {
       "provider": "xai",
       "source": "https://docs.x.ai/developers/models/grok-4.7",
-      "verifiedAt": "2026-10-01",
+      "verifiedAt": "2026-11-22",
       "input": 2,
       "output": 6,
       "cacheRead": 0.5,
@@ -1384,7 +1701,7 @@
     "grok-4.5": {
       "provider": "xai",
       "source": "https://docs.x.ai/developers/models/grok-4.5",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 2,
       "output": 6,
       "cacheRead": 0.3,
@@ -1402,7 +1719,7 @@
     "grok-build-latest": {
       "provider": "xai",
       "source": "https://docs.x.ai/developers/models/grok-4.5",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "note": "Alias of grok-4.5.",
       "input": 2,
       "output": 6,
@@ -1421,7 +1738,7 @@
     "grok-build-0.1": {
       "provider": "xai",
       "source": "https://docs.x.ai/developers/models/grok-code-fast-1",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 1,
       "output": 2,
       "cacheRead": 0.2,
@@ -1440,7 +1757,7 @@
       "provider": "xai",
       "source": "https://docs.x.ai/developers/models/grok-code-fast-1",
       "verifiedAt": "2026-09-02",
-      "note": "Alias of grok-build-0.1.",
+      "note": "Last documented as an alias of grok-build-0.1; xAI no longer documents this id.",
       "input": 1,
       "output": 2,
       "cacheRead": 0.2,
@@ -1459,7 +1776,7 @@
       "provider": "xai",
       "source": "https://docs.x.ai/developers/models/grok-code-fast-1",
       "verifiedAt": "2026-09-02",
-      "note": "Alias of grok-build-0.1.",
+      "note": "Last documented as an alias of grok-build-0.1; xAI no longer documents this id.",
       "input": 1,
       "output": 2,
       "cacheRead": 0.2,
@@ -1478,7 +1795,7 @@
       "provider": "xai",
       "source": "https://docs.x.ai/developers/models/grok-code-fast-1",
       "verifiedAt": "2026-09-02",
-      "note": "Alias of grok-build-0.1.",
+      "note": "Last documented as an alias of grok-build-0.1; xAI no longer documents this id.",
       "input": 1,
       "output": 2,
       "cacheRead": 0.2,
@@ -1496,7 +1813,7 @@
     "grok-4.3": {
       "provider": "xai",
       "source": "https://docs.x.ai/developers/models/grok-4.3",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 1.25,
       "output": 2.5,
       "cacheRead": 0.2,
@@ -1514,7 +1831,7 @@
     "grok-4.20-multi-agent-0309": {
       "provider": "xai",
       "source": "https://docs.x.ai/developers/models",
-      "verifiedAt": "2026-10-01",
+      "verifiedAt": "2026-11-22",
       "input": 1.25,
       "output": 2.5,
       "cacheRead": 0.2,
@@ -1532,7 +1849,7 @@
     "grok-4.20-0309-reasoning": {
       "provider": "xai",
       "source": "https://docs.x.ai/developers/models",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 1.25,
       "output": 2.5,
       "cacheRead": 0.2,
@@ -1550,7 +1867,7 @@
     "grok-4.20-0309-non-reasoning": {
       "provider": "xai",
       "source": "https://docs.x.ai/developers/models",
-      "verifiedAt": "2026-09-02",
+      "verifiedAt": "2026-11-22",
       "input": 1.25,
       "output": 2.5,
       "cacheRead": 0.2,

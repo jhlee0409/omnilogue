@@ -25,6 +25,8 @@ brew install --cask jhlee0409/tap/omnilogue
 
 Flatpak 및 기타 Linux 패키지는 [Linux 가이드](LINUX_BUILD.md#flatpak)를 참고하세요.
 
+**다른 어시스턴트:** 시작할 때는 Claude Code만 스캔합니다. Codex CLI, OpenCode 등 지원하는 다른 어시스턴트를 불러오려면 사이드바의 **정렬 및 필터** 메뉴에서 **다른 프로바이더 검색**을 선택하세요(빈 화면에도 같은 버튼이 있습니다). 찾은 프로바이더는 이후 실행할 때마다 자동으로 불러옵니다. Windows에서는 **설정 → WSL 히스토리 스캔**이 WSL 배포판 안의 Claude Code와 GitHub Copilot 기록을 읽습니다. WSL 안의 다른 어시스턴트(예: Codex CLI)는 WSL 안에서 `cchv-server --serve`를 실행해 WebUI로 보세요.
+
 ## 핵심 기능
 
 - **필요한 대화를 다시 찾기.** 프로젝트나 도구별로 기록을 살펴보고 여러 세션을 한 번에 검색하세요.

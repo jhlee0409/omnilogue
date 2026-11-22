@@ -14,6 +14,7 @@ import { selectPlace } from "@/store/slices/navigationSlice";
 import { useAppStore } from "@/store/useAppStore";
 import { activateTab, closeTab, cycleTab, newTab } from "@/navigation/tabs";
 import { openNewWindow } from "@/navigation/windows";
+import { api } from "@/services/api";
 import { toggleInspector } from "@/components/Inspector/inspectorFocus";
 import { MANUAL_UPDATE_CHECK_EVENT, OPEN_PREFERENCES_EVENT } from "./appEvents";
 import { focusFindTarget, hasFindTarget } from "./findTarget";
@@ -30,6 +31,7 @@ export function useCommandContext(): () => CommandContext {
   const screens = { openView };
   const toggleMinimap = useAppStore((s) => s.toggleMinimap);
   const toggleInlineTokenUsage = useAppStore((s) => s.toggleInlineTokenUsage);
+  const toggleLiveRefresh = useAppStore((s) => s.toggleLiveRefresh);
 
   const actions: CommandActions = {
     openPalette: () => openModal("globalSearch"),
@@ -45,9 +47,11 @@ export function useCommandContext(): () => CommandContext {
     toggleInspector,
     toggleMinimap,
     toggleInlineTokenUsage,
+    toggleLiveRefresh,
     openSettingsManager: switchToSettings,
     openArchive: switchToArchive,
     openFeedback: () => openModal("feedback"),
+    openLogFolder: () => api("open_log_folder"),
     checkForUpdates: () => window.dispatchEvent(new Event(MANUAL_UPDATE_CHECK_EVENT)),
     newWindow: () => openNewWindow(),
     newTab: () => newTab(),

@@ -25,6 +25,8 @@ brew install --cask jhlee0409/tap/omnilogue
 
 Flatpak などのパッケージは [Linux ガイド](LINUX_BUILD.md#flatpak)を参照してください。
 
+**他のアシスタント:** 起動時にスキャンするのは Claude Code のみです。Codex CLI、OpenCode などサポート対象の他のアシスタントを読み込むには、サイドバーの **並べ替えと絞り込み** メニューから **他のプロバイダーを検索** を選んでください（空の画面にも同じボタンがあります）。見つかったプロバイダーは次回以降の起動時にも読み込まれます。Windows では **設定 → WSL 履歴スキャン** が WSL ディストリビューション内の Claude Code と GitHub Copilot の履歴を読み込みます。WSL 内の他のアシスタント（Codex CLI など）は、WSL 内で `cchv-server --serve` を実行して WebUI で閲覧してください。
+
 ## 主な機能
 
 - **必要な会話を見つける。** プロジェクトやツールごとに履歴を表示し、セッションを横断して検索できます。

@@ -2,6 +2,7 @@ pub mod cli;
 pub mod cli_args;
 pub mod commands;
 pub mod export;
+pub mod logging;
 pub mod menu;
 pub mod models;
 pub mod multi_window;
@@ -99,6 +100,7 @@ pub fn run() {
             .iter()
             .any(|a| a == "--export" || a.starts_with("--export="))
         {
+            utils::init_global_thread_pool();
             std::process::exit(export::run_export(&args));
         }
     }
@@ -142,6 +144,9 @@ fn run_tauri() {
         std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
     }
 
+    // After the environment writes above: the pool starts its threads now.
+    utils::init_global_thread_pool();
+
     use tauri::{Emitter, Manager};
 
     // Parse CLI args for a session preload hint (e.g. `--session <uuid>`).
@@ -150,6 +155,7 @@ fn run_tauri() {
         &std::env::args().collect::<Vec<_>>(),
     ));
 
+    logging::log_panics();
     #[allow(unused_mut)]
     let mut builder = tauri::Builder::default()
         // Single-instance plugin MUST be registered first so the second
@@ -198,6 +204,13 @@ fn run_tauri() {
         // panics before the window is shown. The app runs on without the
         // native menu (macOS keeps Tauri's default one).
         .setup(|app| {
+            logging::install_desktop(app.handle());
+            log::info!(
+                "Omnilogue {} starting ({} {})",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            );
             if let Err(error) = menu::initial_menu(app.handle()).and_then(|menu| app.set_menu(menu))
             {
                 log::error!("native menu not installed: {error}");
@@ -307,6 +320,7 @@ fn run_tauri() {
             // File watcher commands
             start_file_watcher,
             stop_file_watcher,
+            logging::open_log_folder,
             // Multi-provider commands
             detect_providers,
             scan_all_projects,
@@ -499,6 +513,11 @@ mod ime_environment_tests {
 #[cfg(feature = "webui-server")]
 fn run_server(args: &[String]) {
     use std::sync::Arc;
+
+    utils::init_global_thread_pool();
+
+    logging::init_stderr();
+    logging::log_panics();
 
     match maybe_print_password_hash(args) {
         Ok(true) => return,

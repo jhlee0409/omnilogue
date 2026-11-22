@@ -18,7 +18,6 @@ import type {
   UserMetadata,
   SessionMetadata,
   ProjectMetadata,
-  UserSettings,
   ProviderId,
   ProviderInfo,
   StatsMode,
@@ -30,6 +29,7 @@ import type { ProjectTokenStatsPagination } from "./messageSlice";
 import type { BranchSelections } from "../../utils/conversationBranches";
 import type { AnalyticsState } from "../../types/analytics";
 import type { OwnedSetter } from "./analyticsSlice";
+import type { SettingsUpdate } from "./metadataSlice";
 import type { UpdateSettings } from "../../types/updateSettings";
 
 // ============================================================================
@@ -423,7 +423,7 @@ export interface AppStoreActions {
     projectPath: string,
     update: Partial<ProjectMetadata>
   ) => Promise<void>;
-  updateUserSettings: (update: Partial<UserSettings>) => Promise<void>;
+  updateUserSettings: (update: SettingsUpdate) => Promise<void>;
   /** User metadata as the backend last saved it (from any window, `settingsSync.ts`). */
   applySharedMetadata: (metadata: UserMetadata) => void;
   getSessionDisplayName: (

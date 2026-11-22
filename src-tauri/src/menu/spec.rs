@@ -340,6 +340,7 @@ mod tests {
             ids(win.submenu(MenuId::Help).unwrap()),
             vec![
                 "help.feedback",
+                "help.openLogFolder",
                 "-",
                 "app.checkForUpdates",
                 "-",
@@ -484,6 +485,7 @@ mod tests {
                 "view.toggleInspector",
                 "view.toggleMinimap",
                 "view.toggleInlineTokens",
+                "view.toggleLiveRefresh",
                 "-",
                 "view.zoomIn",
                 "view.zoomOut",

@@ -25,6 +25,8 @@ brew install --cask jhlee0409/tap/omnilogue
 
 Flatpak 和其他 Linux 安装包见 [Linux 指南](LINUX_BUILD.md#flatpak)。
 
+**其他助手：** 启动时只扫描 Claude Code。要加载 Codex CLI、OpenCode 等其他受支持的助手，请打开侧边栏的 **排序和筛选** 菜单并选择 **查找其他提供商**（空白界面也提供同一按钮）。找到的提供商会在之后每次启动时自动加载。在 Windows 上，**设置 → WSL 历史扫描** 会读取 WSL 发行版中的 Claude Code 和 GitHub Copilot 历史。对于 WSL 中的其他助手（如 Codex CLI），请在 WSL 中运行 `cchv-server --serve` 并使用 WebUI。
+
 ## 核心功能
 
 - **找回需要的对话。** 按项目或工具浏览记录，跨会话搜索。
