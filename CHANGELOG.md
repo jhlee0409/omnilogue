@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-11-22
+
 ### Added
 - **Logs for bug reports** (desktop and WebUI server). The backend's log lines (startup, file watcher, provider and WSL errors, panics) were dropped because no logger was installed. The desktop app now writes them to the OS log folder (2 MB per file, 3 files kept; each line is written as it is logged, so a hard freeze keeps what came before it), and **Help → Open Log Folder** (also in the ⌘K palette) opens that folder. `cchv-server` writes them to stderr; `RUST_LOG` sets the level (default `info`). App events, paths and errors only, never conversation text. (#821)
 - **Turn off live refresh** (desktop). Since v2.0.0 the desktop app watches the history folders and walks them at launch so open sessions update as they change. **Gear menu → View → Live refresh**, the View menu and the ⌘K palette ("Turn Live Refresh On or Off") now switch this off: the watcher stops at once, does not start at the next launch, and sessions update when reloaded. On by default; saved with the other app settings and applied in every window. The WebUI server keeps its own watcher. (#820)
