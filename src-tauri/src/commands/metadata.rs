@@ -118,13 +118,17 @@ where
         // Nothing loaded yet (a save before any load, e.g. the WebUI server
         // after a restart): start from the file, its records and revision,
         // not from an empty copy that would overwrite them (#829). A file
+        // that cannot be read fails the save, so it is never replaced; one
         // that no longer parses is replaced, as before.
         let mut metadata = match cached {
             Some(metadata) => metadata,
-            None => read_metadata_from_disk(&get_user_data_path()?).unwrap_or_else(|error| {
-                log::warn!("metadata: starting from defaults: {error}");
-                UserMetadata::new()
-            }),
+            None => match read_metadata_file(&get_user_data_path()?)? {
+                None => UserMetadata::new(),
+                Some(content) => parse_metadata(&content).unwrap_or_else(|error| {
+                    log::warn!("metadata: replacing a file that does not parse: {error}");
+                    UserMetadata::new()
+                }),
+            },
         };
         // Taken before `mutate`: a whole-metadata save brings the caller's
         // copy, whose revision may be older than the cached one.
@@ -220,9 +224,11 @@ pub async fn load_user_metadata(state: State<'_, MetadataState>) -> Result<UserM
     let path = get_user_data_path()?;
 
     // Perform blocking file I/O off the async runtime
-    let metadata = tauri::async_runtime::spawn_blocking(move || read_metadata_from_disk(&path))
-        .await
-        .map_err(|e| format!("Task join error: {e}"))??;
+    let metadata = tauri::async_runtime::spawn_blocking(move || {
+        read_metadata_file(&path)?.map_or_else(|| Ok(UserMetadata::new()), |c| parse_metadata(&c))
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))??;
 
     // Cache the metadata (lock is quick, no need to spawn_blocking)
     let mut cached = state
@@ -234,14 +240,18 @@ pub async fn load_user_metadata(state: State<'_, MetadataState>) -> Result<UserM
     Ok(metadata)
 }
 
-/// The metadata in `path`; defaults when there is no file yet. Blocking.
-fn read_metadata_from_disk(path: &Path) -> Result<UserMetadata, String> {
+/// The metadata file's text; `None` when there is no file yet. Blocking.
+fn read_metadata_file(path: &Path) -> Result<Option<String>, String> {
     if !path.exists() {
-        return Ok(UserMetadata::new());
+        return Ok(None);
     }
-    let content =
-        fs::read_to_string(path).map_err(|e| format!("Failed to read metadata file: {e}"))?;
-    serde_json::from_str(&content).map_err(|e| format!("Failed to parse metadata: {e}"))
+    fs::read_to_string(path)
+        .map(Some)
+        .map_err(|e| format!("Failed to read metadata file: {e}"))
+}
+
+fn parse_metadata(content: &str) -> Result<UserMetadata, String> {
+    serde_json::from_str(content).map_err(|e| format!("Failed to parse metadata: {e}"))
 }
 
 /// Internal helper to save metadata to disk (blocking)
@@ -636,6 +646,33 @@ mod tests {
         assert_eq!(saved.revision, 21);
         assert!(saved.get_session("kept").is_some());
         assert!(saved.get_session("new").is_some());
+    }
+
+    /// A file that cannot be read fails a save made before any load instead
+    /// of being replaced by a copy holding only that save.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_save_before_any_load_keeps_a_file_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _home = crate::test_utils::SandboxHome::new();
+        let mut on_disk = UserMetadata::new();
+        on_disk.get_session_mut("kept").custom_name = Some("kept".to_string());
+        save_metadata_to_disk(&on_disk).unwrap();
+        let path = get_user_data_path().unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let state = MetadataState::default();
+        let result = tauri::async_runtime::block_on(update_session_metadata_in(
+            &state,
+            "new".to_string(),
+            SessionMetadata::default(),
+        ));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(result.is_err());
+        let kept: UserMetadata = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(kept.get_session("kept").is_some());
     }
 
     #[test]
