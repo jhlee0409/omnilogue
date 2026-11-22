@@ -266,40 +266,48 @@ pub async fn scan_all_projects(
         let excluded = wsl_excluded_distros.unwrap_or_default();
         let scan_claude = providers_to_scan.iter().any(|p| p == "claude");
         let distros = active_wsl_distros(excluded, scan_claude).await?;
-
-        for (distro, _, claude_unc) in &distros {
-            let Some(unc_path) = claude_unc else {
-                continue;
-            };
-            let wsl_label = format!("WSL: {}", distro.name);
-            match crate::commands::project::scan_projects(unc_path.to_string_lossy().to_string())
-                .await
-            {
-                Ok(mut projects) => {
-                    for p in &mut projects {
-                        if p.provider.is_none() {
-                            p.provider = Some("claude".to_string());
-                        }
-                        p.custom_directory_label = Some(wsl_label.clone());
+        let scan_copilot = providers_to_scan.iter().any(|p| p == "copilot");
+        // One Copilot list per distro, so each distro's Claude projects come
+        // before its Copilot projects, distro by distro.
+        let (distros, copilot_projects) = tauri::async_runtime::spawn_blocking(move || {
+            let projects: Vec<Vec<ListedProject>> = distros
+                .iter()
+                .map(|(distro, home_path, _)| {
+                    if scan_copilot {
+                        scan_wsl_copilot(&distro.name, home_path)
+                    } else {
+                        Vec::new()
                     }
-                    all_projects.extend(projects.into_iter().map(ListedProject::from));
-                }
-                Err(e) => {
-                    log::warn!("WSL: Claude scan failed for '{}': {e}", distro.name);
+                })
+                .collect();
+            (distros, projects)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?;
+
+        for ((distro, _, claude_unc), copilot) in distros.iter().zip(copilot_projects) {
+            if let Some(unc_path) = claude_unc {
+                let wsl_label = format!("WSL: {}", distro.name);
+                match crate::commands::project::scan_projects(
+                    unc_path.to_string_lossy().to_string(),
+                )
+                .await
+                {
+                    Ok(mut projects) => {
+                        for p in &mut projects {
+                            if p.provider.is_none() {
+                                p.provider = Some("claude".to_string());
+                            }
+                            p.custom_directory_label = Some(wsl_label.clone());
+                        }
+                        all_projects.extend(projects.into_iter().map(ListedProject::from));
+                    }
+                    Err(e) => {
+                        log::warn!("WSL: Claude scan failed for '{}': {e}", distro.name);
+                    }
                 }
             }
-        }
-
-        if providers_to_scan.iter().any(|p| p == "copilot") {
-            let copilot_projects = tauri::async_runtime::spawn_blocking(move || {
-                distros
-                    .iter()
-                    .flat_map(|(distro, home_path, _)| scan_wsl_copilot(&distro.name, home_path))
-                    .collect::<Vec<_>>()
-            })
-            .await
-            .map_err(|e| format!("Task join error: {e}"))?;
-            all_projects.extend(copilot_projects);
+            all_projects.extend(copilot);
         }
     }
 
@@ -1123,53 +1131,58 @@ pub async fn search_all_providers(
         let excluded = wsl_excluded_distros.unwrap_or_default();
         let search_claude = wsl_search_providers.iter().any(|p| p == "claude");
         let distros = active_wsl_distros(excluded, search_claude).await?;
-
-        for (distro, _, claude_unc) in &distros {
-            let Some(unc_path) = claude_unc else {
-                continue;
-            };
-            match crate::commands::session::search_messages(
-                unc_path.to_string_lossy().to_string(),
-                query.clone(),
-                search_filters.clone(),
-                Some(max_results),
-            )
-            .await
-            {
-                Ok(mut results) => {
-                    for m in &mut results {
-                        if m.provider.is_none() {
-                            m.provider = Some("claude".to_string());
-                        }
+        let search_copilot = wsl_search_providers.iter().any(|p| p == "copilot");
+        // One Copilot hit list per distro, so hits keep the distro-by-distro
+        // order (Claude, then Copilot) that ties in the sort below fall back on.
+        let (query_copy, filters_copy) = (query.clone(), search_filters.clone());
+        let (distros, copilot_hits) = tauri::async_runtime::spawn_blocking(move || {
+            let filters = SearchFilters::parse(&filters_copy);
+            let hits: Vec<Vec<ClaudeMessage>> = distros
+                .iter()
+                .map(|(distro, home_path, _)| {
+                    let mut hits = Vec::new();
+                    if search_copilot {
+                        search_wsl_copilot(
+                            &mut hits,
+                            &distro.name,
+                            home_path,
+                            &query_copy,
+                            &filters,
+                            max_results,
+                        );
                     }
-                    all_results.extend(results);
-                }
-                Err(e) => {
-                    log::warn!("WSL Claude search failed for '{}': {e}", distro.name);
+                    hits
+                })
+                .collect();
+            (distros, hits)
+        })
+        .await
+        .map_err(|e| format!("Task join error: {e}"))?;
+
+        for ((distro, _, claude_unc), copilot) in distros.iter().zip(copilot_hits) {
+            if let Some(unc_path) = claude_unc {
+                match crate::commands::session::search_messages(
+                    unc_path.to_string_lossy().to_string(),
+                    query.clone(),
+                    search_filters.clone(),
+                    Some(max_results),
+                )
+                .await
+                {
+                    Ok(mut results) => {
+                        for m in &mut results {
+                            if m.provider.is_none() {
+                                m.provider = Some("claude".to_string());
+                            }
+                        }
+                        all_results.extend(results);
+                    }
+                    Err(e) => {
+                        log::warn!("WSL Claude search failed for '{}': {e}", distro.name);
+                    }
                 }
             }
-        }
-
-        if wsl_search_providers.iter().any(|p| p == "copilot") {
-            let (query, filters) = (query.clone(), search_filters.clone());
-            let copilot_hits = tauri::async_runtime::spawn_blocking(move || {
-                let filters = SearchFilters::parse(&filters);
-                let mut hits = Vec::new();
-                for (distro, home_path, _) in &distros {
-                    search_wsl_copilot(
-                        &mut hits,
-                        &distro.name,
-                        home_path,
-                        &query,
-                        &filters,
-                        max_results,
-                    );
-                }
-                hits
-            })
-            .await
-            .map_err(|e| format!("Task join error: {e}"))?;
-            all_results.extend(copilot_hits);
+            all_results.extend(copilot);
         }
     }
 
