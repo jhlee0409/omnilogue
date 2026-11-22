@@ -542,7 +542,7 @@ claude-code-history-viewer://session-title/auth%20bug
 | WSL内のセッションが表示されない (Windows) | **設定 → WSL 履歴スキャン**を有効にしてください。WSL ディストリビューション内の Claude Code と GitHub Copilot の履歴を読み込みます。WSL 内の他のアシスタント（Codex CLI など）は、WSL 内で `cchv-server --serve` を実行して WebUI で閲覧してください。 |
 | WebUIに接続できない | `cchv-server`のデフォルトポートは`3727`です。起動時のURLを使い、リモート接続ではポート競合とファイアウォール/プロキシの設定を確認してください。 |
 | 「Unauthorized」/ HTTP 401 | 起動時に表示されたトークン付きURLを使うか、`Authorization: Bearer <token>`を送信してください。固定トークンは`--token`または`CCHV_TOKEN`で設定できます。 |
-| パフォーマンスの問題 | 大量の履歴は初期読み込みが遅い場合あり — アプリは仮想スクロールを使用 |
+| パフォーマンスの問題 | 大量の履歴は初期読み込みが遅い場合あり — アプリは仮想スクロールを使用。デスクトップアプリでコンピューターが重くなる場合は **歯車メニュー → 表示 → リアルタイム更新** をオフにしてください（View メニューと ⌘K にもあります）。履歴フォルダーの監視が止まり、新しいメッセージは再読み込みで表示されます |
 | 更新の問題 | 自動更新が失敗した場合、[Releases](https://github.com/jhlee0409/claude-code-history-viewer/releases)から手動ダウンロード |
 
 ## コントリビュート

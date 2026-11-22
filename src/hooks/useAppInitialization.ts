@@ -6,6 +6,8 @@ import { type SupportedLanguage } from "@/i18n";
 import { useTranslation } from "react-i18next";
 import { useFileWatcher } from "./useFileWatcher";
 import { useEffectiveHighContrast } from "./useHighContrast";
+import { isLiveRefreshOn } from "@/types";
+import { isTauri } from "@/utils/platform";
 
 /**
  * App initialization side effects:
@@ -26,7 +28,11 @@ export function useAppInitialization(deps: {
   const reloadCurrent = useAppStore((s) => s.reloadCurrent);
   const fontScale = useAppStore((s) => s.fontScale);
   const highContrast = useEffectiveHighContrast();
-  const watcherEnabled = useAppStore((s) => s.watcherEnabled);
+  // Desktop live refresh off (#820): the backend runs no watcher, so do not
+  // listen either. The WebUI keeps its server's watcher.
+  const watcherEnabled = useAppStore(
+    (s) => s.watcherEnabled && (!isTauri() || isLiveRefreshOn(s.userMetadata))
+  );
   const triggerSessionRefresh = useAppStore((s) => s.triggerSessionRefresh);
 
   const handleSessionChanged = useCallback(

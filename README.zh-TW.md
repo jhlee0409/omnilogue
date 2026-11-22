@@ -542,7 +542,7 @@ claude-code-history-viewer://session-title/auth%20bug
 | 缺少 WSL 中的工作階段 (Windows) | 開啟 **設定 → WSL 歷史掃描**。它會讀取 WSL 發行版中的 Claude Code 與 GitHub Copilot 歷史。對於 WSL 中的其他助手（如 Codex CLI），請在 WSL 中執行 `cchv-server --serve` 並使用 WebUI。 |
 | 無法連線至 WebUI | `cchv-server` 預設使用 `3727` 連接埠。使用啟動時輸出的 URL；遠端連線時檢查連接埠衝突以及防火牆/代理規則。 |
 | 「Unauthorized」/ HTTP 401 | 使用啟動時輸出的權杖 URL，或傳送 `Authorization: Bearer <token>`。固定權杖可透過 `--token` 或 `CCHV_TOKEN` 設定。 |
-| 效能問題 | 大量歷史記錄可能導致初始載入較慢 — 應用程式使用虛擬捲動技術 |
+| 效能問題 | 大量歷史記錄可能導致初始載入較慢 — 應用程式使用虛擬捲動技術。如果桌面應用程式使電腦變慢，請關閉 **齒輪選單 → 檢視 → 即時重新整理**（View 選單和 ⌘K 中也有）。應用程式將停止監看歷史記錄資料夾，新訊息需要重新載入才會顯示 |
 | 更新問題 | 如果自動更新失敗，請從 [Releases](https://github.com/jhlee0409/claude-code-history-viewer/releases) 手動下載 |
 
 ## 貢獻

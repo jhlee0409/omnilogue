@@ -542,7 +542,7 @@ claude-code-history-viewer://session-title/auth%20bug
 | WSL 안의 세션이 보이지 않음 (Windows) | **설정 → WSL 히스토리 스캔**을 켜세요. WSL 배포판 안의 Claude Code와 GitHub Copilot 기록을 읽습니다. WSL 안의 다른 어시스턴트(예: Codex CLI)는 WSL 안에서 `cchv-server --serve`를 실행해 WebUI로 보세요. |
 | WebUI에 연결할 수 없음 | `cchv-server`의 기본 포트는 `3727`입니다. 시작 시 출력된 URL을 사용하고, 원격 접속이라면 포트 충돌과 방화벽/프록시 규칙을 확인하세요. |
 | "Unauthorized" / HTTP 401 | 시작 시 출력된 토큰 URL을 사용하거나 `Authorization: Bearer <token>`을 보내세요. 고정 토큰은 `--token` 또는 `CCHV_TOKEN`으로 설정할 수 있습니다. |
-| 성능 문제 | 대용량 대화 기록은 초기 로딩이 느릴 수 있음 — 앱은 가상 스크롤링 사용 |
+| 성능 문제 | 대용량 대화 기록은 초기 로딩이 느릴 수 있음 — 앱은 가상 스크롤링 사용. 데스크톱 앱 때문에 컴퓨터가 느려지면 **톱니바퀴 메뉴 → 보기 → 실시간 새로고침**을 끄세요(View 메뉴와 ⌘K에도 있음). 기록 폴더 감시를 멈추며, 새 메시지는 다시 불러와야 보입니다 |
 | 업데이트 오류 | 자동 업데이트 실패 시 [Releases](https://github.com/jhlee0409/claude-code-history-viewer/releases)에서 수동 다운로드 |
 
 ## 기여하기

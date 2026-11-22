@@ -542,7 +542,7 @@ The app includes accessibility features for keyboard-only, low-vision, and scree
 | Sessions inside WSL are missing (Windows) | Turn on **Settings → WSL History Scanning**. It reads Claude Code and GitHub Copilot history inside WSL distributions. For other assistants inside WSL (such as Codex CLI), run `cchv-server --serve` inside WSL and use the WebUI. |
 | Cannot connect to the WebUI | `cchv-server` defaults to port `3727`. Use the startup URL, check for port conflicts, and verify firewall or proxy rules when connecting remotely. |
 | "Unauthorized" / HTTP 401 | Use the token URL printed at startup or send `Authorization: Bearer <token>`. For a fixed token, use `--token` or `CCHV_TOKEN`. |
-| Performance issues | Large histories may be slow initially — the app uses virtual scrolling |
+| Performance issues | Large histories may be slow initially — the app uses virtual scrolling. If the desktop app slows the computer down, turn off **gear menu → View → Live refresh** (also in the View menu and ⌘K): the app then stops watching the history folders, and you reload to see new messages |
 | Update problems | If auto-updater fails, download manually from [Releases](https://github.com/jhlee0409/claude-code-history-viewer/releases) |
 
 ## Contributing
