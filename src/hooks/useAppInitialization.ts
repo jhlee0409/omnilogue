@@ -5,6 +5,7 @@ import { listenForSettingChanges, listenForUserMetadataChanges } from "@/service
 import { type SupportedLanguage } from "@/i18n";
 import { useTranslation } from "react-i18next";
 import { useFileWatcher } from "./useFileWatcher";
+import { useRefreshOnWatchResume } from "./useRefreshOnWatchResume";
 import { useEffectiveHighContrast } from "./useHighContrast";
 import { isLiveRefreshOn } from "@/types";
 import { isTauri } from "@/utils/platform";
@@ -48,6 +49,7 @@ export function useAppInitialization(deps: {
     enabled: watcherEnabled,
     debounceMs: 100,
   });
+  useRefreshOnWatchResume(watcherEnabled);
 
   // Language loading + app initialization
   useEffect(() => {
