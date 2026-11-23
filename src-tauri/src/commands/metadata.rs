@@ -108,15 +108,33 @@ where
     T: Send + 'static,
 {
     let _write = state.write_lock.lock().await;
-    let mut metadata = state
+    let cached = state
         .metadata
         .lock()
         .map_err(|e| format!("Failed to lock metadata: {e}"))?
-        .clone()
-        .unwrap_or_else(UserMetadata::new);
+        .clone();
 
     let (saved, result) = tauri::async_runtime::spawn_blocking(move || {
+        // Nothing loaded yet (a save before any load, e.g. the WebUI server
+        // after a restart): start from the file, its records and revision,
+        // not from an empty copy that would overwrite them (#829). A file
+        // that cannot be read fails the save, so it is never replaced; one
+        // that no longer parses is replaced, as before.
+        let mut metadata = match cached {
+            Some(metadata) => metadata,
+            None => match read_metadata_file(&get_user_data_path()?)? {
+                None => UserMetadata::new(),
+                Some(content) => parse_metadata(&content).unwrap_or_else(|error| {
+                    log::warn!("metadata: replacing a file that does not parse: {error}");
+                    UserMetadata::new()
+                }),
+            },
+        };
+        // Taken before `mutate`: a whole-metadata save brings the caller's
+        // copy, whose revision may be older than the cached one.
+        let revision = metadata.revision + 1;
         let result = mutate(&mut metadata);
+        metadata.revision = revision;
         save_metadata_to_disk(&metadata).map(|()| (metadata, result))
     })
     .await
@@ -207,13 +225,7 @@ pub async fn load_user_metadata(state: State<'_, MetadataState>) -> Result<UserM
 
     // Perform blocking file I/O off the async runtime
     let metadata = tauri::async_runtime::spawn_blocking(move || {
-        if path.exists() {
-            let content = fs::read_to_string(&path)
-                .map_err(|e| format!("Failed to read metadata file: {e}"))?;
-            serde_json::from_str(&content).map_err(|e| format!("Failed to parse metadata: {e}"))
-        } else {
-            Ok(UserMetadata::new())
-        }
+        read_metadata_file(&path)?.map_or_else(|| Ok(UserMetadata::new()), |c| parse_metadata(&c))
     })
     .await
     .map_err(|e| format!("Task join error: {e}"))??;
@@ -226,6 +238,20 @@ pub async fn load_user_metadata(state: State<'_, MetadataState>) -> Result<UserM
     *cached = Some(metadata.clone());
 
     Ok(metadata)
+}
+
+/// The metadata file's text; `None` when there is no file yet. Blocking.
+fn read_metadata_file(path: &Path) -> Result<Option<String>, String> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    fs::read_to_string(path)
+        .map(Some)
+        .map_err(|e| format!("Failed to read metadata file: {e}"))
+}
+
+fn parse_metadata(content: &str) -> Result<UserMetadata, String> {
+    serde_json::from_str(content).map_err(|e| format!("Failed to parse metadata: {e}"))
 }
 
 /// Internal helper to save metadata to disk (blocking)
@@ -575,6 +601,78 @@ mod tests {
         ));
         assert!(failed.is_err());
         assert_eq!(heard.lock().unwrap().len(), 2);
+    }
+
+    /// Issue #829: every save carries a higher revision than the one before,
+    /// also when the caller's whole copy (`save_user_metadata`) is older.
+    #[test]
+    #[serial_test::serial]
+    fn each_save_bumps_the_revision() {
+        let _home = crate::test_utils::SandboxHome::new();
+        let state = MetadataState::default();
+        let save = |mutate: Box<dyn FnOnce(&mut UserMetadata) + Send>| {
+            tauri::async_runtime::block_on(mutate_and_save(&state, mutate))
+                .unwrap()
+                .revision
+        };
+        assert_eq!(save(Box::new(|m| m.settings.live_refresh = Some(false))), 1);
+        let stale = UserMetadata::new();
+        assert_eq!(save(Box::new(move |m| *m = stale)), 2);
+        assert_eq!(save(Box::new(|_| {})), 3);
+    }
+
+    /// Issue #829: a save before any load (the `WebUI` server after a restart)
+    /// builds on the file, keeping its records and moving its revision on.
+    #[test]
+    #[serial_test::serial]
+    fn a_save_before_any_load_builds_on_the_file() {
+        let _home = crate::test_utils::SandboxHome::new();
+        let mut on_disk = UserMetadata::new();
+        on_disk.revision = 20;
+        on_disk.get_session_mut("kept").custom_name = Some("kept".to_string());
+        save_metadata_to_disk(&on_disk).unwrap();
+
+        let state = MetadataState::default();
+        let update = SessionMetadata {
+            custom_name: Some("new".to_string()),
+            ..Default::default()
+        };
+        let saved = tauri::async_runtime::block_on(update_session_metadata_in(
+            &state,
+            "new".to_string(),
+            update,
+        ))
+        .unwrap();
+        assert_eq!(saved.revision, 21);
+        assert!(saved.get_session("kept").is_some());
+        assert!(saved.get_session("new").is_some());
+    }
+
+    /// A file that cannot be read fails a save made before any load instead
+    /// of being replaced by a copy holding only that save.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_save_before_any_load_keeps_a_file_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _home = crate::test_utils::SandboxHome::new();
+        let mut on_disk = UserMetadata::new();
+        on_disk.get_session_mut("kept").custom_name = Some("kept".to_string());
+        save_metadata_to_disk(&on_disk).unwrap();
+        let path = get_user_data_path().unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let state = MetadataState::default();
+        let result = tauri::async_runtime::block_on(update_session_metadata_in(
+            &state,
+            "new".to_string(),
+            SessionMetadata::default(),
+        ));
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(result.is_err());
+        let kept: UserMetadata = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(kept.get_session("kept").is_some());
     }
 
     #[test]

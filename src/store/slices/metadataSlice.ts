@@ -171,11 +171,12 @@ export const initialMetadataState: MetadataSliceState = {
   store, so one queue.
 
   Several desktop windows (issue #656) each have a store and a queue; the
-  backend serializes their saves and announces each one, in order, to every
-  window (`applySharedMetadata`), so the last announcement is the newest
-  metadata. An answer to this window's own request is older than any
-  announcement that arrived while the request was out: it lands only when
-  none did (`announcements`).
+  backend serializes their saves, numbers each one (`revision`) and announces
+  it to every window (`applySharedMetadata`). Answers and announcements can
+  arrive in either order, so a window keeps whichever copy has the higher
+  revision (#829): an answer older than an announcement does not land over
+  it, and an older announcement does not land over this window's own newer
+  answer, which the next queued write then builds on.
 */
 let writes: Promise<unknown> = Promise.resolve();
 function inTurn<T>(write: () => Promise<T>): Promise<T> {
@@ -184,16 +185,28 @@ function inTurn<T>(write: () => Promise<T>): Promise<T> {
   return turn;
 }
 
-/** Saves announced by the backend so far (`applySharedMetadata`). */
-let announcements = 0;
+/** Whether `incoming` is a newer save than `current` (#829). */
+const isNewer = (incoming: UserMetadata, current: UserMetadata): boolean =>
+  (incoming.revision ?? 0) > (current.revision ?? -1);
 
-type SetMetadata = (partial: Pick<FullAppStore, "userMetadata">) => void;
+type Metadata = Pick<FullAppStore, "userMetadata">;
+type SetMetadata = (partial: Metadata) => void;
+type GetMetadata = () => Metadata;
 
-/** Ask the backend for the whole metadata; the answer lands unless a save was announced meanwhile. */
-async function request(set: SetMetadata, command: string, ...args: [Record<string, unknown>?]): Promise<UserMetadata> {
-  const sent = announcements;
+/** Keep a save's metadata unless this window already holds a newer one. */
+function landIfNewer(set: SetMetadata, get: GetMetadata, metadata: UserMetadata): void {
+  if (isNewer(metadata, get().userMetadata)) set({ userMetadata: metadata });
+}
+
+/** Ask the backend for the whole metadata (a load, or a save's answer); it lands if newer. */
+async function request(
+  set: SetMetadata,
+  get: GetMetadata,
+  command: string,
+  ...args: [Record<string, unknown>?]
+): Promise<UserMetadata> {
   const metadata = await api<UserMetadata>(command, ...args);
-  if (announcements === sent) set({ userMetadata: metadata });
+  landIfNewer(set, get, metadata);
   return metadata;
 }
 
@@ -209,7 +222,9 @@ export const createMetadataSlice: StateCreator<
     set({ isMetadataLoading: true, metadataError: null });
 
     try {
-      await request(set, "load_user_metadata");
+      // Lands only if newer: an announcement that arrived while the load
+      // was out may already hold a later save.
+      await request(set, get, "load_user_metadata");
       set({
         isMetadataLoaded: true,
         isMetadataLoading: false,
@@ -244,7 +259,7 @@ export const createMetadataSlice: StateCreator<
       const mergedSession: SessionMetadata = { ...existingSession, ...update };
 
       try {
-        await request(set, "update_session_metadata", {
+        await request(set, get, "update_session_metadata", {
           sessionId,
           update: mergedSession,
         });
@@ -263,7 +278,7 @@ export const createMetadataSlice: StateCreator<
         ? { ...existing, starred: undefined, ref: undefined }
         : { ...existing, starred: true, ref };
       try {
-        await request(set, "update_session_metadata", {
+        await request(set, get, "update_session_metadata", {
           sessionId: session.session_id,
           update,
         });
@@ -288,7 +303,7 @@ export const createMetadataSlice: StateCreator<
         const existing = get().userMetadata.sessions[sessionId];
         if (existing?.starred !== true || existing.ref) return;
         try {
-          await request(set, "update_session_metadata", {
+          await request(set, get, "update_session_metadata", {
             sessionId,
             update: { ...existing, ref },
           });
@@ -307,7 +322,7 @@ export const createMetadataSlice: StateCreator<
       const moved: SessionMetadata =
         existing.ref || existing.starred ? { ...existing, ref } : existing;
       try {
-        await request(set, "update_session_metadata", {
+        await request(set, get, "update_session_metadata", {
           sessionId: toId,
           update: moved,
         });
@@ -318,7 +333,7 @@ export const createMetadataSlice: StateCreator<
       }
       try {
         // An empty record removes the entry.
-        await request(set, "update_session_metadata", {
+        await request(set, get, "update_session_metadata", {
           sessionId: fromId,
           update: {},
         });
@@ -336,7 +351,7 @@ export const createMetadataSlice: StateCreator<
       const mergedProject: ProjectMetadata = { ...existingProject, ...update };
 
       try {
-        await request(set, "update_project_metadata", {
+        await request(set, get, "update_project_metadata", {
           projectPath,
           update: mergedProject,
         });
@@ -355,7 +370,7 @@ export const createMetadataSlice: StateCreator<
       };
 
       try {
-        await request(set, "update_user_settings", {
+        await request(set, get, "update_user_settings", {
           settings: mergedSettings,
         });
       } catch (error) {
@@ -367,10 +382,10 @@ export const createMetadataSlice: StateCreator<
     }),
 
   applySharedMetadata: (metadata: UserMetadata) => {
-    announcements += 1;
     const current = get().userMetadata;
-    // This window's own save, already landed from its answer.
-    if (JSON.stringify(current) === JSON.stringify(metadata)) return;
+    // This window's own save (already landed from its answer), or older
+    // than a save this window already holds.
+    if (!isNewer(metadata, current)) return;
     const foldersChanged =
       JSON.stringify(current.settings.customClaudePaths ?? []) !==
       JSON.stringify(metadata.settings.customClaudePaths ?? []);
@@ -480,7 +495,7 @@ export const createMetadataSlice: StateCreator<
         path,
         label: label ?? null,
       });
-      set({ userMetadata: result.metadata });
+      landIfNewer(set, get, result.metadata);
       return result;
     });
     const { activeProviders, setActiveProviders } = get();
@@ -497,7 +512,7 @@ export const createMetadataSlice: StateCreator<
     const ownsPlace = ownPlace(get);
     const metadata = await inTurn(async () => {
       const saved = await api<UserMetadata>("remove_claude_ai_export", { path });
-      set({ userMetadata: saved });
+      landIfNewer(set, get, saved);
       return saved;
     });
     const { activeProviders, setActiveProviders } = get();

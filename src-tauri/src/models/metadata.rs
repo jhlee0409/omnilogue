@@ -29,6 +29,12 @@ pub struct UserMetadata {
     /// Global user settings
     #[serde(default)]
     pub settings: UserSettings,
+
+    /// Bumped by every save (`mutate_and_save`), so a window holding two
+    /// copies (its own save's answer, another window's announcement) keeps
+    /// the newer one (#829). Files written before it read as 0.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 fn default_version() -> u32 {
@@ -43,6 +49,7 @@ impl UserMetadata {
             sessions: HashMap::new(),
             projects: HashMap::new(),
             settings: UserSettings::default(),
+            revision: 0,
         }
     }
 
