@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.1] - 2026-11-23
+
 ### Fixed
 - **WSL project lists and searches no longer hold up other requests** (desktop on Windows, with WSL History Scanning on). Finding the WSL distributions, asking each for its home folder, locating their Claude Code folders and reading their GitHub Copilot history over `\\wsl.localhost` now run in the background instead of on the threads that answer the app's other requests. (#827)
 - **Turning live refresh back on updates the open session** (desktop). A session written to while **Live refresh** was off stayed as it was until its file changed again. Turning the setting on now refreshes the open session and its project's session list once, the way a live update does (it waits while you are scrolled up), in every window. (#828)
