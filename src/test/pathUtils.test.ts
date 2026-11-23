@@ -262,7 +262,11 @@ describe("folderKey (#833)", () => {
   it("keeps different folders apart", () => {
     expect(folderKey("C:\\Code\\app")).not.toBe(folderKey("D:\\Code\\app"));
     expect(folderKey("C:\\Code\\app")).not.toBe(folderKey("C:\\Code\\app2"));
-    expect(folderKey("\\\\server\\share\\app")).toBe(folderKey("//server/share/app"));
+  });
+
+  it("treats a network share as one folder in any spelling or case", () => {
+    expect(folderKey("\\\\Server\\Share\\App")).toBe(folderKey("//server/share/app"));
+    expect(folderKey("//Server/Share/App")).toBe(folderKey("\\\\server\\share\\app\\"));
   });
 
   it("keeps POSIX case and only drops a trailing slash", () => {
