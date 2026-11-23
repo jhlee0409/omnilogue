@@ -15,7 +15,7 @@ import { useAppStore } from "@/store/useAppStore";
 import { ProjectItem } from "./ProjectItem";
 import { ProjectSessions } from "./ProjectSessions";
 import { GroupHeader } from "./GroupHeader";
-import { isProjectPathUnavailable, isProjectTemporary } from "../../../utils/pathUtils";
+import { folderKey, isProjectPathUnavailable, isProjectTemporary } from "../../../utils/pathUtils";
 
 interface GroupedProjectListProps {
   groupingMode: GroupingStrategy;
@@ -424,9 +424,10 @@ export const GroupedProjectList: React.FC<GroupedProjectListProps> = ({
 /**
  * One row per working directory. Several providers (Claude Code, Codex,
  * oh-my-pi…) record sessions for the same folder under different store
- * paths; showing them as five rows fragments the list. The selected
- * project leads its group so highlight and expansion follow the user;
- * otherwise the most recent one (input order) leads.
+ * paths, and on Windows in different spellings (`C:\a`, `c:/a`, `/c:/a`,
+ * see `folderKey`); showing them as five rows fragments the list. The
+ * selected project leads its group so highlight and expansion follow the
+ * user; otherwise the most recent one (input order) leads.
  */
 function mergeByFolder(
   list: ClaudeProject[],
@@ -435,7 +436,7 @@ function mergeByFolder(
   const byFolder: Record<string, ClaudeProject[]> = {};
   const order: string[] = [];
   for (const project of list) {
-    const key = project.actual_path || project.path;
+    const key = folderKey(project.actual_path || project.path);
     if (!byFolder[key]) {
       byFolder[key] = [];
       order.push(key);

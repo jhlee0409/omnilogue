@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   elideProjectRoot,
+  folderKey,
   getCompactParentPath,
   getDisplayPathParts,
   getPathLeaf,
@@ -244,5 +245,29 @@ describe("elideProjectRoot", () => {
         "\\\\server\\share\\repo"
       )
     ).toBe("src/a.ts");
+  });
+});
+
+describe("folderKey (#833)", () => {
+  it("gives every Windows spelling of one folder the same key", () => {
+    const keys = [
+      "C:\\Code\\ghidra-cellbe",
+      "c:/Code/ghidra-cellbe",
+      "/c:/Code/ghidra-cellbe",
+      "C:\\Code\\Ghidra-Cellbe\\",
+    ].map(folderKey);
+    expect(new Set(keys).size).toBe(1);
+  });
+
+  it("keeps different folders apart", () => {
+    expect(folderKey("C:\\Code\\app")).not.toBe(folderKey("D:\\Code\\app"));
+    expect(folderKey("C:\\Code\\app")).not.toBe(folderKey("C:\\Code\\app2"));
+    expect(folderKey("\\\\server\\share\\app")).toBe(folderKey("//server/share/app"));
+  });
+
+  it("keeps POSIX case and only drops a trailing slash", () => {
+    expect(folderKey("/Users/me/App/")).toBe("/Users/me/App");
+    expect(folderKey("/Users/me/App")).not.toBe(folderKey("/Users/me/app"));
+    expect(folderKey("/")).toBe("/");
   });
 });
