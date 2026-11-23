@@ -139,6 +139,11 @@ export interface UserMetadata {
   projects: Record<string, ProjectMetadata>;
   /** Global user settings */
   settings: UserSettings;
+  /**
+   * Bumped by every save on the backend: of two copies, the one with the
+   * higher revision is newer (#829). Absent until metadata was loaded.
+   */
+  revision?: number;
 }
 
 /** Default user metadata for initialization */
