@@ -98,3 +98,4 @@
 - **`minimax-m3` unchanged** (https://platform.minimax.io/docs/pricing/overview, LLM Standard: ≤512k $0.30 / $1.20 / $0.06, >512k $0.60 / $2.40 / $0.12, "Permanent 50% off"; Priority 1.5x).
 - **Added `minimax-m3.1-flash`**: `MiniMax-M3.1-Flash $0.15 $0.60 $0.015`, no cache-write column, no Priority row. OpenRouter's off-peak $0.075 / $0.3 is not an official rate.
 - **M2.1 / M2.1-highspeed / M2**: listed under "Retired Models" with no retirement date; notes updated, no `deprecatedAt`.
+- **2026-11-23 (watch):** the official page (https://platform.minimax.io/docs/pricing/overview) still lists M3.1-Flash at $0.15 / $0.60 / $0.015 with no off-peak row. OpenRouter's $0.075 / $0.3 / $0.0075 is recorded in `known-feed-differences.json`.
