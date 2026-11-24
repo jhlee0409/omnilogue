@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Expand long messages by default** (desktop and WebUI). An optional view setting, off by default, opens messages longer than the 12-line preview already expanded instead of behind "Show more". Turn it on from the gear menu's View section, the desktop View menu or the ⌘K palette ("Expand or Collapse Long Messages by Default"); it is saved in `settings.json` and applied in every window. A message's own Show more / Show less choice still wins, and thinking blocks, tool results, tables and diffs keep their own collapsed default. (#574)
+
 ### Fixed
 - **One Windows folder is one project row for every assistant** (desktop and WebUI). Assistants record the same Windows folder as `C:\Code\app`, `c:/Code/app` or `/c:/Code/app` (Copilot), and the project list merged rows only when the spelling matched exactly, so one folder could take three rows. Rows are now merged ignoring separators, the leading slash, a trailing separator and case (Windows paths only). The path shown is unchanged. (#833)
 

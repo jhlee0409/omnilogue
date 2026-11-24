@@ -12,6 +12,7 @@ import { layout } from "@/components/renderers";
 import { cn } from "@/lib/utils";
 import { REMARK_PLUGINS, REHYPE_PLUGINS } from "@/lib/markdownPlugins";
 import { useCaptureExpandState } from "@/contexts/CaptureExpandContext";
+import { useAppStore } from "@/store/useAppStore";
 
 // Source lines shown before "Show more". 3 collapsed almost every reply behind
 // a click; 12 keeps typical answers fully visible and only folds long dumps.
@@ -130,7 +131,10 @@ export const MessageContentDisplay: React.FC<MessageContentDisplayProps> = ({
 }) => {
   const { t } = useTranslation();
   const contentId = useId();
-  const [isExpanded, setIsExpanded] = useCaptureExpandState("content", false);
+  // Only message text follows the "expand long messages" preference (#574);
+  // a message's own Show more / Show less choice is stored and wins.
+  const expandLongMessages = useAppStore((s) => s.expandLongMessages);
+  const [isExpanded, setIsExpanded] = useCaptureExpandState("content", expandLongMessages);
 
   // Check if content needs expand (for both user and assistant)
   const textInfo = useMemo(() => {

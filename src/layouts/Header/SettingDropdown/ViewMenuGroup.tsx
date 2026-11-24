@@ -6,7 +6,7 @@ import {
 import { Switch } from "@/components/ui/switch";
 import { useAppStore } from "@/store/useAppStore";
 import { useTranslation } from "react-i18next";
-import { Coins, FolderSync, Map as MapIcon } from "lucide-react";
+import { Coins, FolderSync, Map as MapIcon, UnfoldVertical } from "lucide-react";
 import { DesktopOnly } from "@/contexts/platform";
 import { isLiveRefreshOn } from "@/types";
 import { getMinimapToggleKeysLabel } from "@/utils/minimapShortcut";
@@ -24,6 +24,8 @@ export const ViewMenuGroup = () => {
     toggleMinimap,
     showInlineTokenUsage,
     toggleInlineTokenUsage,
+    expandLongMessages,
+    toggleExpandLongMessages,
     userMetadata,
     toggleLiveRefresh,
   } = useAppStore();
@@ -70,6 +72,25 @@ export const ViewMenuGroup = () => {
         </span>
         <Switch
           checked={showInlineTokenUsage}
+          aria-hidden="true"
+          tabIndex={-1}
+          className="ml-2"
+        />
+      </DropdownMenuItem>
+      <DropdownMenuItem
+        role="menuitemcheckbox"
+        aria-checked={expandLongMessages}
+        onSelect={(e) => {
+          e.preventDefault();
+          toggleExpandLongMessages();
+        }}
+      >
+        <UnfoldVertical className="mr-2 h-4 w-4 text-foreground" />
+        <span className="flex-1">
+          {t("common.settings.view.expandLongMessages")}
+        </span>
+        <Switch
+          checked={expandLongMessages}
           aria-hidden="true"
           tabIndex={-1}
           className="ml-2"

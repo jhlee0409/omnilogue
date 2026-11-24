@@ -52,6 +52,7 @@ function makeContext(overrides: Partial<CommandContext> = {}): CommandContext {
     toggleInspector: vi.fn(),
     toggleMinimap: vi.fn(),
     toggleInlineTokenUsage: vi.fn(),
+    toggleExpandLongMessages: vi.fn(),
     toggleLiveRefresh: vi.fn(),
     openSettingsManager: vi.fn(),
     openArchive: vi.fn(),
