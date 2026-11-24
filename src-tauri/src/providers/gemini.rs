@@ -585,7 +585,10 @@ fn first_user_text(messages: &[Value]) -> Option<String> {
                 Value::String(text) => text.clone(),
                 Value::Array(parts) => parts
                     .iter()
-                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .filter_map(|part| {
+                        part.as_str()
+                            .or_else(|| part.get("text").and_then(Value::as_str))
+                    })
                     .collect::<Vec<_>>()
                     .join(" "),
                 _ => return None,
@@ -1231,13 +1234,13 @@ mod tests {
     #[test]
     fn session_title_falls_back_to_the_first_prompt() {
         let dir = tempfile::TempDir::new().unwrap();
-        let write = |name: &str, summary: Value| {
+        let write = |name: &str, summary: Value, prompt: Value| {
             let path = dir.path().join(name);
             let session = json!({
                 "sessionId": name, "kind": "main", "summary": summary,
                 "messages": [
                     {"id": "i1", "type": "info", "content": "Loaded"},
-                    {"id": "u1", "type": "user", "content": [{"text": "  Fix the\nflaky test  "}]},
+                    {"id": "u1", "type": "user", "content": prompt},
                     {"id": "g1", "type": "gemini", "content": "ok"}
                 ]
             });
@@ -1246,13 +1249,18 @@ mod tests {
                 .unwrap()
                 .summary
         };
+        let parts = json!([{"text": "  Fix the\nflaky test  "}]);
         assert_eq!(
-            write("a.json", Value::Null).as_deref(),
+            write("a.json", Value::Null, parts.clone()).as_deref(),
             Some("Fix the flaky test")
         );
         assert_eq!(
-            write("b.json", json!("Recorded title")).as_deref(),
+            write("b.json", json!("Recorded title"), parts).as_deref(),
             Some("Recorded title")
+        );
+        assert_eq!(
+            write("c.json", Value::Null, json!(["Fix the flaky test"])).as_deref(),
+            Some("Fix the flaky test")
         );
     }
 
