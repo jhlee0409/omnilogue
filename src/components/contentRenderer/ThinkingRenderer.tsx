@@ -19,13 +19,16 @@ type Props = {
 
 /**
  * The collapsed header's one-line preview as plain text: Gemini thoughts
- * open with a `**Subject**` line, which showed its asterisks.
+ * open with a `**Subject**` line, which showed its asterisks. Code spans
+ * keep their text as written (`__init__` stays), only their backticks go.
  */
 function previewText(line: string): string {
+  const code: string[] = [];
   return line
     .replace(/^#{1,6}\s+/, "")
+    .replace(/`([^`]+)`/g, (_, span: string) => `\uE000${code.push(span) - 1}\uE000`)
     .replace(/(\*\*|__)(.+?)\1/g, "$2")
-    .replace(/`([^`]+)`/g, "$1");
+    .replace(/\uE000(\d+)\uE000/g, (_, index: string) => code[Number(index)] ?? "");
 }
 
 export const ThinkingRenderer = memo(function ThinkingRenderer({

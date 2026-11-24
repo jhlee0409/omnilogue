@@ -28,4 +28,8 @@ describe("ThinkingRenderer preview", () => {
   it("keeps a single short line without an ellipsis", () => {
     expect(preview("**Done**").endsWith("Done")).toBe(true);
   });
+
+  it("keeps the text of code spans as written", () => {
+    expect(preview("Checking `__init__` and **`main.rs`**").endsWith("Checking __init__ and main.rs")).toBe(true);
+  });
 });
