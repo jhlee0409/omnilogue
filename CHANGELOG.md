@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **One Windows folder is one project row for every assistant** (desktop and WebUI). Assistants record the same Windows folder as `C:\Code\app`, `c:/Code/app` or `/c:/Code/app` (Copilot), and the project list merged rows only when the spelling matched exactly, so one folder could take three rows. Rows are now merged ignoring separators, the leading slash, a trailing separator and case (Windows paths only). The path shown is unchanged. (#833)
+
 ## [2.1.1] - 2026-11-23
 
 ### Fixed

@@ -125,6 +125,22 @@ describe("GroupedProjectList", () => {
     expectChevronExpandsAndRowOpens(project, handleProjectClick, setExpandedProjects);
   });
 
+  // #833: one Windows folder recorded in three spellings by three providers.
+  it("shows one row for one folder however each provider spells it (flat mode)", () => {
+    const spellings: Array<[string, string]> = [
+      ["C:\\Code\\app", "claude"],
+      ["c:/Code/app", "antigravity"],
+      ["/c:/Code/app", "copilot"],
+    ];
+    const projects = spellings.map(([actualPath, provider], index) => ({
+      ...createProject(`/store/${provider}/${index}`, "app"),
+      actual_path: actualPath,
+      provider,
+    }));
+    renderList({ groupingMode: "none", project: projects[0]!, projects, handleProjectClick: vi.fn() });
+    expect(screen.getAllByTestId(/^project-item-/)).toHaveLength(1);
+  });
+
   it("chevron expands without opening; the row opens (directory mode)", () => {
     const project = createProject("/work/project-a", "project-a");
     const handleProjectClick = vi.fn();
