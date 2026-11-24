@@ -17,6 +17,17 @@ type Props = {
   index?: number;
 };
 
+/**
+ * The collapsed header's one-line preview as plain text: Gemini thoughts
+ * open with a `**Subject**` line, which showed its asterisks.
+ */
+function previewText(line: string): string {
+  return line
+    .replace(/^#{1,6}\s+/, "")
+    .replace(/(\*\*|__)(.+?)\1/g, "$2")
+    .replace(/`([^`]+)`/g, "$1");
+}
+
 export const ThinkingRenderer = memo(function ThinkingRenderer({
   thinking,
   searchQuery,
@@ -37,8 +48,9 @@ export const ThinkingRenderer = memo(function ThinkingRenderer({
 
   if (!thinking) return null;
 
-  const firstLine = thinking.split("\n")[0]?.slice(0, 100) || "";
-  const hasMore = thinking.length > firstLine.length || thinking.includes("\n");
+  const rawFirstLine = thinking.split("\n")[0] ?? "";
+  const firstLine = previewText(rawFirstLine).slice(0, 100);
+  const hasMore = rawFirstLine.length > 100 || thinking.includes("\n");
 
   return (
     <div className={cn("bg-thinking border border-thinking-border mt-2 overflow-hidden", layout.rounded)}>
