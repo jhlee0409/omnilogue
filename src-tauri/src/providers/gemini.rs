@@ -552,10 +552,14 @@ fn extract_session_metadata(path: &Path, report: &ScanReport) -> Option<SessionM
             .is_some_and(|arr| !arr.is_empty())
     });
 
+    // Gemini CLI writes `summary` only for some sessions; the others are
+    // titled by their first prompt, as other providers' sessions are.
     let summary = record
         .get("summary")
         .and_then(Value::as_str)
-        .map(String::from);
+        .filter(|summary| !summary.trim().is_empty())
+        .map(String::from)
+        .or_else(|| first_user_text(&messages).map(|text| summarize(&text)));
 
     Some(SessionMetadata {
         session_id,
@@ -566,6 +570,41 @@ fn extract_session_metadata(path: &Path, report: &ScanReport) -> Option<SessionM
         has_tool_use,
         summary,
     })
+}
+
+/// Longest session title taken from a first prompt.
+const SUMMARY_MAX_CHARS: usize = 80;
+
+/// The text of the first user message with any text (a string or `text` parts).
+fn first_user_text(messages: &[Value]) -> Option<String> {
+    messages
+        .iter()
+        .filter(|message| message.get("type").and_then(Value::as_str) == Some("user"))
+        .find_map(|message| {
+            let text = match message.get("content")? {
+                Value::String(text) => text.clone(),
+                Value::Array(parts) => parts
+                    .iter()
+                    .filter_map(|part| part.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                _ => return None,
+            };
+            (!text.trim().is_empty()).then_some(text)
+        })
+}
+
+/// Collapse whitespace and clip to the summary length with an ellipsis.
+fn summarize(text: &str) -> String {
+    let cleaned = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    if cleaned.chars().count() > SUMMARY_MAX_CHARS {
+        format!(
+            "{}…",
+            cleaned.chars().take(SUMMARY_MAX_CHARS).collect::<String>()
+        )
+    } else {
+        cleaned
+    }
 }
 
 // ============================================================================
@@ -1185,6 +1224,36 @@ mod tests {
         let (meta, msgs) = parse_gemini_session(data).expect("metadata-only should parse");
         assert_eq!(meta.get("sessionId").and_then(Value::as_str), Some("s5"));
         assert_eq!(msgs, Vec::<serde_json::Value>::new());
+    }
+
+    /// A session without a `summary` is titled by its first prompt; a
+    /// recorded summary still wins.
+    #[test]
+    fn session_title_falls_back_to_the_first_prompt() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let write = |name: &str, summary: Value| {
+            let path = dir.path().join(name);
+            let session = json!({
+                "sessionId": name, "kind": "main", "summary": summary,
+                "messages": [
+                    {"id": "i1", "type": "info", "content": "Loaded"},
+                    {"id": "u1", "type": "user", "content": [{"text": "  Fix the\nflaky test  "}]},
+                    {"id": "g1", "type": "gemini", "content": "ok"}
+                ]
+            });
+            std::fs::write(&path, session.to_string()).unwrap();
+            extract_session_metadata(&path, &ScanReport::default())
+                .unwrap()
+                .summary
+        };
+        assert_eq!(
+            write("a.json", Value::Null).as_deref(),
+            Some("Fix the flaky test")
+        );
+        assert_eq!(
+            write("b.json", json!("Recorded title")).as_deref(),
+            Some("Recorded title")
+        );
     }
 
     #[test]
