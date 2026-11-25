@@ -35,6 +35,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ||||||| 692c984e
 - **Cline's own reminders are no longer shown as messages from you, and prompts lose their wrapper** (desktop and WebUI). When the model ends a turn without calling its completion tool, Cline adds a user-role note ("[SYSTEM] This run is not complete until you call … submit_and_exit"); in a looping session these made up most of the "your messages", and they inflated message counts. Cline also stores every prompt inside `<user_input mode="act">…</user_input>` tags, which showed up around your text and in titles of sessions without a saved title. The reminders are now left out and prompts show as you typed them. (#849)
 ||||||| 17be3362
+- **Mistral Vibe sessions keep their earlier turns after a compaction** (desktop and WebUI). After Vibe compacted a session's context, the app showed only what Vibe feeds the model afterwards: three injected wrapper messages (a preamble, the summary and a note about reduced items) displayed as if you had written them, and none of the turns that came before. Sessions now show the whole conversation from Vibe's own history, with each tool call next to its result and a "Context compacted" marker where the compaction happened. A tool call Vibe reports as failed, skipped or cancelled is marked as failed. Sessions without that history still show the checkpoint, minus the injected wrappers, with the summary kept as a compaction marker. (#860)
+||||||| 17be3362
 ||||||| f2b1ed96
 
 ## [2.1.1] - 2026-11-23
