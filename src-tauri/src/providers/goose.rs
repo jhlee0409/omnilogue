@@ -96,14 +96,20 @@ pub fn scan_projects() -> Result<Vec<ClaudeProject>, String> {
 }
 
 fn scan_in_conn(conn: &Connection) -> Result<Vec<ClaudeProject>, String> {
+    let schema = Schema::probe(conn);
+    // Counts cover only what the viewer lists: sub-agent/hidden sessions and
+    // agent-only messages are excluded (see `Schema`).
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT COALESCE(NULLIF(s.working_dir, ''), 'unknown') AS working_dir, \
                     COUNT(DISTINCT s.id) AS sess_cnt, \
                     COUNT(m.id) AS msg_cnt, MAX(s.updated_at) AS last_upd \
-             FROM sessions s LEFT JOIN messages m ON m.session_id = s.id \
+             FROM sessions s LEFT JOIN messages m ON m.session_id = s.id AND {} \
+             WHERE {} \
              GROUP BY COALESCE(NULLIF(s.working_dir, ''), 'unknown') ORDER BY last_upd DESC",
-        )
+            schema.visible_message_sql("m"),
+            schema.listed_session_sql("s"),
+        ))
         .map_err(|e| e.to_string())?;
 
     let projects = stmt
@@ -146,14 +152,17 @@ pub fn load_sessions(
 }
 
 fn load_sessions_conn(conn: &Connection, working_dir: &str) -> Result<Vec<ClaudeSession>, String> {
+    let schema = Schema::probe(conn);
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT s.id, s.name, s.description, s.created_at, s.updated_at, \
-                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id) AS msg_cnt \
+                    (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id AND {}) AS msg_cnt \
              FROM sessions s \
-             WHERE COALESCE(NULLIF(s.working_dir, ''), 'unknown') = ?1 \
+             WHERE COALESCE(NULLIF(s.working_dir, ''), 'unknown') = ?1 AND {} \
              ORDER BY s.updated_at DESC",
-        )
+            schema.visible_message_sql("m"),
+            schema.listed_session_sql("s"),
+        ))
         .map_err(|e| e.to_string())?;
 
     let project_name = PathBuf::from(working_dir)
@@ -210,11 +219,13 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
 }
 
 fn load_messages_conn(conn: &Connection, session_id: &str) -> Result<Vec<ClaudeMessage>, String> {
+    let schema = Schema::probe(conn);
     let mut stmt = conn
-        .prepare(
-            "SELECT id, role, content_json, created_timestamp, message_id \
+        .prepare(&format!(
+            "SELECT id, role, content_json, created_timestamp, message_id, {} \
              FROM messages WHERE session_id = ?1 ORDER BY id",
-        )
+            schema.metadata_column("messages"),
+        ))
         .map_err(|e| e.to_string())?;
 
     let rows = stmt
@@ -224,13 +235,21 @@ fn load_messages_conn(conn: &Connection, session_id: &str) -> Result<Vec<ClaudeM
             let content_json: String = row.get(2)?;
             let created: i64 = row.get(3)?;
             let message_id: Option<String> = row.get(4)?;
-            Ok((row_id, role, content_json, created, message_id))
+            let metadata_json: Option<String> = row.get(5)?;
+            Ok((
+                row_id,
+                role,
+                content_json,
+                created,
+                message_id,
+                metadata_json,
+            ))
         })
         .map_err(|e| e.to_string())?;
 
     let mut messages = Vec::new();
     for row in rows.flatten() {
-        let (row_id, role, content_json, created, message_id) = row;
+        let (row_id, role, content_json, created, message_id, metadata_json) = row;
         if let Some(msg) = build_message(
             session_id,
             row_id,
@@ -238,6 +257,7 @@ fn load_messages_conn(conn: &Connection, session_id: &str) -> Result<Vec<ClaudeM
             &content_json,
             created,
             message_id,
+            metadata_json.as_deref(),
         ) {
             messages.push(msg);
         }
@@ -256,14 +276,17 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<ClaudeMessage>, String> {
 fn search_conn(conn: &Connection, query: &str, limit: usize) -> Result<Vec<ClaudeMessage>, String> {
     let pattern = format!("%{query}%");
     let query_lower = query.to_lowercase();
+    let schema = Schema::probe(conn);
 
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             "SELECT s.working_dir, m.id, m.session_id, m.role, m.content_json, \
-                    m.created_timestamp, m.message_id \
+                    m.created_timestamp, m.message_id, {} \
              FROM messages m JOIN sessions s ON s.id = m.session_id \
-             WHERE m.content_json LIKE ?1",
-        )
+             WHERE m.content_json LIKE ?1 AND {}",
+            schema.metadata_column("m"),
+            schema.listed_session_sql("s"),
+        ))
         .map_err(|e| e.to_string())?;
 
     let rows = stmt
@@ -275,6 +298,7 @@ fn search_conn(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Claud
             let content_json: String = row.get(4)?;
             let created: i64 = row.get(5)?;
             let message_id: Option<String> = row.get(6)?;
+            let metadata_json: Option<String> = row.get(7)?;
             Ok((
                 working_dir,
                 row_id,
@@ -283,13 +307,23 @@ fn search_conn(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Claud
                 content_json,
                 created,
                 message_id,
+                metadata_json,
             ))
         })
         .map_err(|e| e.to_string())?;
 
     let mut results = Vec::new();
     for row in rows.flatten() {
-        let (working_dir, row_id, session_id, role, content_json, created, message_id) = row;
+        let (
+            working_dir,
+            row_id,
+            session_id,
+            role,
+            content_json,
+            created,
+            message_id,
+            metadata_json,
+        ) = row;
         let Some(mut msg) = build_message(
             &session_id,
             row_id,
@@ -297,6 +331,7 @@ fn search_conn(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Claud
             &content_json,
             created,
             message_id,
+            metadata_json.as_deref(),
         ) else {
             continue;
         };
@@ -343,6 +378,80 @@ fn project_path_for(cwd: &str) -> String {
 }
 
 // ============================================================================
+// Schema tolerance and visibility
+// ============================================================================
+
+/// Optional columns of the Goose store. Goose adds them by migration
+/// (`messages.metadata_json` in schema 3, `sessions.session_type` in 5), so a
+/// store that Goose has not opened since upgrading may lack them; queries then
+/// degrade to "everything visible / every session a user session".
+struct Schema {
+    message_metadata: bool,
+    session_type: bool,
+}
+
+impl Schema {
+    fn probe(conn: &Connection) -> Self {
+        Self {
+            message_metadata: has_column(conn, "messages", "metadata_json"),
+            session_type: has_column(conn, "sessions", "session_type"),
+        }
+    }
+
+    /// The `metadata_json` select expression for the `messages` table/alias.
+    fn metadata_column(&self, alias: &str) -> String {
+        if self.message_metadata {
+            format!("{alias}.metadata_json")
+        } else {
+            "NULL".to_string()
+        }
+    }
+
+    /// SQL condition: the message is shown to the user. Mirrors Goose's own
+    /// `user_visible_message_sql` (`COALESCE(userVisible, 1) != 0`): rows
+    /// Goose marks `userVisible:false` (per-turn `<turn-context>` events,
+    /// sub-agent delivery notices, `final_output` nudges, compaction
+    /// summaries) are agent-only context, not conversation.
+    fn visible_message_sql(&self, alias: &str) -> String {
+        if self.message_metadata {
+            format!(
+                "(CASE WHEN json_valid({alias}.metadata_json) \
+                 THEN COALESCE(json_extract({alias}.metadata_json, '$.userVisible'), 1) \
+                 ELSE 1 END) != 0"
+            )
+        } else {
+            "1".to_string()
+        }
+    }
+
+    /// SQL condition: the session is a top-level conversation. Delegated
+    /// `sub_agent` runs (also folded into the parent as a delivery message
+    /// and a tool result) and `hidden` sessions (`--no-session` runs) are not
+    /// listed, as the other providers skip their sub-agent sessions.
+    fn listed_session_sql(&self, alias: &str) -> String {
+        if self.session_type {
+            format!("COALESCE({alias}.session_type, 'user') NOT IN ('sub_agent', 'hidden')")
+        } else {
+            "1".to_string()
+        }
+    }
+}
+
+fn has_column(conn: &Connection, table: &str, column: &str) -> bool {
+    conn.prepare("SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2")
+        .and_then(|mut stmt| stmt.exists([table, column]))
+        .unwrap_or(false)
+}
+
+/// Whether a row's `metadata_json` marks it `userVisible:false`.
+fn is_agent_only(metadata_json: Option<&str>) -> bool {
+    metadata_json
+        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+        .and_then(|meta| meta.get("userVisible").and_then(Value::as_bool))
+        == Some(false)
+}
+
+// ============================================================================
 // Pure conversion (unit-testable)
 // ============================================================================
 
@@ -355,8 +464,9 @@ fn build_message(
     content_json: &str,
     created: i64,
     message_id: Option<String>,
+    metadata_json: Option<&str>,
 ) -> Option<ClaudeMessage> {
-    if !matches!(role, "user" | "assistant" | "system") {
+    if !matches!(role, "user" | "assistant" | "system") || is_agent_only(metadata_json) {
         return None;
     }
     let blocks = map_content(content_json);
@@ -413,10 +523,19 @@ fn map_content_item(item: &Value) -> Option<Value> {
         })),
         "toolRequest" => {
             let id = item.get("id").and_then(Value::as_str).unwrap_or("");
-            let value = item.get("toolCall").and_then(|tc| tc.get("value"));
+            let tool_call = item.get("toolCall");
+            let value = tool_call.and_then(|tc| tc.get("value"));
             let name = value
                 .and_then(|v| v.get("name"))
                 .and_then(Value::as_str)
+                // A call Goose could not decode is recorded as
+                // `{"status":"error","error":..}` without a name.
+                .or_else(|| {
+                    tool_call
+                        .and_then(|tc| tc.get("error"))
+                        .and_then(Value::as_str)
+                        .and_then(|error| errored_call_name(error, id))
+                })
                 .unwrap_or("unknown");
             let input = value
                 .and_then(|v| v.get("arguments"))
@@ -427,38 +546,107 @@ fn map_content_item(item: &Value) -> Option<Value> {
         "toolResponse" => {
             let id = item.get("id").and_then(Value::as_str).unwrap_or("");
             let result = item.get("toolResult");
-            let is_error =
+            // `status:"error"` is a tool that returned no result; a tool that
+            // ran and failed is `status:"success"` with `value.isError:true`
+            // (a shell command's non-zero exit, an unavailable tool, a call
+            // that could not be parsed).
+            let failed_call =
                 result.and_then(|r| r.get("status")).and_then(Value::as_str) == Some("error");
-            let content = if is_error {
-                result
+            let flag = result
+                .and_then(|r| r.get("value"))
+                .and_then(|v| v.get("isError"))
+                .and_then(Value::as_bool);
+            let is_error = failed_call || flag == Some(true);
+            let content = if failed_call {
+                json!(result
                     .and_then(|r| r.get("error"))
                     .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .to_string()
+                    .unwrap_or(""))
             } else {
-                // value.content is a Vec of MCP content items ({"type":"text","text":..}).
-                result
-                    .and_then(|r| r.get("value"))
-                    .and_then(|v| v.get("content"))
-                    .and_then(Value::as_array)
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|c| c.get("text").and_then(Value::as_str))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    })
-                    .unwrap_or_default()
+                tool_result_content(
+                    result
+                        .and_then(|r| r.get("value"))
+                        .and_then(|v| v.get("content"))
+                        .and_then(Value::as_array),
+                )
             };
             Some(json!({
                 "type": "tool_result",
                 "tool_use_id": id,
                 "content": content,
                 "is_error": is_error,
-                "is_error_source": "derived"
+                // Goose writes `isError` (rmcp `CallToolResult`) and the
+                // `status` tag itself; only a bare success is derived.
+                "is_error_source": if failed_call || flag.is_some() { "producer" } else { "derived" }
             }))
+        }
+        // An assistant message that failed (provider error, exhausted turn
+        // budget) holds only this block.
+        "error" => {
+            let message = item.get("message").and_then(Value::as_str).unwrap_or("");
+            if message.is_empty() {
+                None
+            } else {
+                Some(json!({ "type": "text", "text": format!("[Error] {message}") }))
+            }
         }
         _ => None,
     }
+}
+
+/// The tool name inside a decode-failure message. Goose's OpenAI/Databricks
+/// formats word it `Tool arguments for <name> (id <id>) ...` (the error is
+/// stored as `<code>: <message>`); other failures never name the tool.
+fn errored_call_name<'a>(error: &'a str, id: &str) -> Option<&'a str> {
+    const PREFIX: &str = "Tool arguments for ";
+    let rest = &error[error.find(PREFIX)? + PREFIX.len()..];
+    let (name, tail) = rest.split_once(" (id ")?;
+    let tail = tail.strip_prefix(id)?;
+    (tail.starts_with(')') && !name.is_empty() && !name.contains(char::is_whitespace))
+        .then_some(name)
+}
+
+/// A tool result's `content` (MCP content items). Text only stays a joined
+/// string; with an image it becomes Claude-style `text`/`image` blocks so the
+/// picture is shown.
+fn tool_result_content(items: Option<&Vec<Value>>) -> Value {
+    let items = items.map(Vec::as_slice).unwrap_or_default();
+    let has_image = items
+        .iter()
+        .any(|c| c.get("type").and_then(Value::as_str) == Some("image"));
+    if !has_image {
+        return json!(items
+            .iter()
+            .filter_map(|c| c.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n"));
+    }
+    Value::Array(
+        items
+            .iter()
+            .filter_map(|c| match c.get("type").and_then(Value::as_str) {
+                Some("image") => {
+                    let data = c.get("data").and_then(Value::as_str)?;
+                    Some(json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": c
+                                .get("mimeType")
+                                .and_then(Value::as_str)
+                                .unwrap_or("image/png"),
+                            "data": data,
+                        }
+                    }))
+                }
+                _ => c
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|t| !t.is_empty())
+                    .map(|t| json!({ "type": "text", "text": t })),
+            })
+            .collect(),
+    )
 }
 
 /// Convert an epoch timestamp (seconds or ms) to RFC3339.
@@ -491,121 +679,341 @@ fn normalize_ts(ts: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Minimal Goose schema + fixtures in an in-memory DB.
-    fn fixture_db() -> Connection {
+    const CWD: &str = "/home/user/demo";
+    const VISIBLE: &str = r#"{"userVisible":true,"agentVisible":true}"#;
+    const AGENT_ONLY: &str = r#"{"userVisible":false,"agentVisible":true}"#;
+
+    /// The columns of Goose's schema-18 `sessions`/`messages` tables that the
+    /// parser reads (types and defaults as `CREATE TABLE` in goose
+    /// `session_manager.rs`).
+    const SCHEMA: &str =
+        "CREATE TABLE sessions (id TEXT PRIMARY KEY, name TEXT NOT NULL DEFAULT '', \
+            description TEXT NOT NULL DEFAULT '', user_set_name INTEGER DEFAULT 0, \
+            session_type TEXT NOT NULL DEFAULT 'user', working_dir TEXT NOT NULL, \
+            created_at TEXT, updated_at TEXT, parent_session_id TEXT);
+         CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT, \
+            session_id TEXT NOT NULL, role TEXT NOT NULL, content_json TEXT NOT NULL, \
+            created_timestamp INTEGER NOT NULL, metadata_json TEXT);";
+
+    // Real records from a Goose 1.60.2 store (paths neutralised).
+    const TURN_CONTEXT: &str = r#"[{"type":"text","text":"<turn-context>\n<current-time>2026-11-25 12:32:00 +09:00</current-time>\n<working-directory>/home/user/demo</working-directory>\n</turn-context>"}]"#;
+    const DELIVERY: &str = r#"[{"type":"text","text":"Subagent 20261125_13 completed: {\"summary\":\"src contains math.js\"}"}]"#;
+    const NUDGE: &str = r#"[{"type":"text","text":"You MUST call the `final_output` tool NOW with the final output for the user."}]"#;
+    const TOOL_CALL: &str = r#"[{"type":"toolRequest","id":"6bc1adc4","toolCall":{"status":"success","value":{"name":"shell","arguments":{"command":"npm test"}}},"_meta":{"goose_extension":"developer","goose.executable":true}}]"#;
+    const FAILED_SHELL: &str = r#"[{"type":"toolResponse","id":"6bc1adc4","toolResult":{"status":"success","value":{"resultType":"complete","content":[{"type":"text","text":"\n> demo@1.0.0 test\n> node test.js\n\n4 !== 5\n"}],"structuredContent":{"stdout":"4 !== 5","stderr":"","exit_code":1},"isError":true}}}]"#;
+    const IMAGE_RESULT: &str = r#"{"type":"toolResponse","id":"call_3388a612","toolResult":{"status":"success","value":{"resultType":"complete","content":[{"type":"text","text":"Loaded image from /home/user/demo/logo.png (70 bytes, image/png, 1x1).","annotations":{"priority":0.0}},{"type":"image","data":"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==","mimeType":"image/png"}],"isError":false}}}"#;
+    const BROKEN_CALL: &str = r#"{"type":"toolRequest","id":"call_83536c45","toolCall":{"status":"error","error":"-32603: -32602: The model's response was truncated — it hit the output token limit while generating this tool call. Try increasing max_tokens for this provider or breaking the task into smaller steps.\nReceived 15 characters; cut off at: {not valid json"},"_meta":{"goose.toolCall.providerIndex":0}}"#;
+    const EXHAUSTED: &str = r#"[{"type":"error","kind":"resourceExhausted","message":"I've reached the maximum number of actions I can do without user input. Would you like me to continue?"}]"#;
+    const PROVIDER_FAILURE: &str = r#"[{"type":"error","kind":"other","message":"Ran into this error: Server error: Server error (500 Internal Server Error) at http://127.0.0.1:11878/v1/chat/completions: scripted provider failure.\n\nPlease retry if you think this is a transient or recoverable error."}]"#;
+
+    fn empty_db(schema: &str) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE sessions (id TEXT PRIMARY KEY, name TEXT, description TEXT, \
-                 working_dir TEXT NOT NULL, created_at TEXT, updated_at TEXT);
-             CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT, \
-                 session_id TEXT NOT NULL, role TEXT NOT NULL, content_json TEXT NOT NULL, \
-                 created_timestamp INTEGER NOT NULL);",
-        )
-        .unwrap();
+        conn.execute_batch(schema).unwrap();
+        conn
+    }
+
+    fn add_session(conn: &Connection, id: &str, name: &str, session_type: &str, cwd: &str) {
         conn.execute(
-            "INSERT INTO sessions VALUES ('s1','title-a','Fix login','/Users/jack/proj','2026-06-20 09:00:00','2026-06-21 10:00:00')",
-            [],
+            "INSERT INTO sessions (id, name, session_type, working_dir, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, '2026-06-20 09:00:00', '2026-06-21 10:00:00')",
+            [id, name, session_type, cwd],
         )
         .unwrap();
+    }
+
+    fn add_message(
+        conn: &Connection,
+        id: &str,
+        session: &str,
+        role: &str,
+        content: &str,
+        meta: &str,
+    ) {
         conn.execute(
-            "INSERT INTO sessions VALUES ('s2',NULL,NULL,'/Users/jack/proj','2026-06-19 09:00:00','2026-06-19 09:30:00')",
-            [],
+            "INSERT INTO messages (message_id, session_id, role, content_json, created_timestamp, metadata_json) \
+             VALUES (?1, ?2, ?3, ?4, 1750500000, ?5)",
+            [id, session, role, content, meta],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO sessions VALUES ('s3','other',NULL,'/Users/jack/other','2026-06-18 09:00:00','2026-06-18 09:30:00')",
-            [],
-        )
-        .unwrap();
-        let user = r#"[{"type":"text","text":"why does LOGIN fail?"}]"#;
-        let asst = r#"[{"type":"text","text":"Let me check"},{"type":"toolRequest","id":"call1","toolCall":{"status":"success","value":{"name":"developer__shell","arguments":{"command":"ls"}}}}]"#;
-        let toolresp = r#"[{"type":"toolResponse","id":"call1","toolResult":{"status":"success","value":{"content":[{"type":"text","text":"file.rs"}]}}}]"#;
-        conn.execute("INSERT INTO messages (message_id,session_id,role,content_json,created_timestamp) VALUES ('m1','s1','user',?1,1750500000)", [user]).unwrap();
-        conn.execute("INSERT INTO messages (message_id,session_id,role,content_json,created_timestamp) VALUES ('m2','s1','assistant',?1,1750500001)", [asst]).unwrap();
-        conn.execute("INSERT INTO messages (message_id,session_id,role,content_json,created_timestamp) VALUES ('m3','s1','user',?1,1750500002)", [toolresp]).unwrap();
+    }
+
+    /// A user session with a prompt, its stored turn-context, a shell call and
+    /// a failing result, plus the other session kinds Goose writes.
+    fn fixture_db() -> Connection {
+        let conn = empty_db(SCHEMA);
+        add_session(&conn, "s1", "title-a", "user", CWD);
+        add_session(&conn, "s2", "title-b", "user", CWD);
+        add_session(&conn, "s3", "other", "user", "/home/user/other");
+        add_session(&conn, "sub", "Delegated task", "sub_agent", CWD);
+        add_session(&conn, "hid", "Demo session", "hidden", CWD);
+        let prompt = r#"[{"type":"text","text":"Run npm test and tell me why it LOGIN fails."}]"#;
+        add_message(&conn, "m1", "s1", "user", prompt, VISIBLE);
+        add_message(
+            &conn,
+            "m1t",
+            "s1",
+            "user",
+            TURN_CONTEXT,
+            r#"{"userVisible":false,"agentVisible":true,"turnContext":true}"#,
+        );
+        add_message(&conn, "m2", "s1", "assistant", TOOL_CALL, VISIBLE);
+        add_message(&conn, "m3", "s1", "user", FAILED_SHELL, VISIBLE);
+        add_message(
+            &conn,
+            "m4",
+            "s1",
+            "user",
+            DELIVERY,
+            r#"{"userVisible":false,"agentVisible":true,"operations":{"foreground_subagent":{"delivered":"sub"}}}"#,
+        );
+        add_message(&conn, "m5", "s2", "user", prompt, VISIBLE);
+        add_message(
+            &conn,
+            "sub1",
+            "sub",
+            "user",
+            r#"[{"type":"text","text":"Subagent ID: sub\n\nSubtask: list files LOGIN"}]"#,
+            VISIBLE,
+        );
+        add_message(&conn, "hid1", "hid", "user", prompt, VISIBLE);
         conn
     }
 
     #[test]
-    fn scan_groups_by_working_dir() {
+    fn scan_groups_by_working_dir_without_sub_agent_hidden_or_agent_only() {
         let conn = fixture_db();
         let projects = scan_in_conn(&conn).unwrap();
         assert_eq!(projects.len(), 2);
-        let proj = projects.iter().find(|p| p.name == "proj").unwrap();
-        assert_eq!(proj.session_count, 2);
-        assert_eq!(proj.message_count, 3);
+        let proj = projects.iter().find(|p| p.name == "demo").unwrap();
+        assert_eq!(
+            proj.session_count, 2,
+            "sub_agent and hidden sessions are not listed"
+        );
+        // s1: prompt, call, result (turn-context + delivery excluded); s2: prompt.
+        assert_eq!(proj.message_count, 4);
         assert_eq!(proj.provider.as_deref(), Some("goose"));
         assert_eq!(proj.storage_type.as_deref(), Some("sqlite"));
-        assert_eq!(proj.path, "goose:///Users/jack/proj");
+        assert_eq!(proj.path, "goose:///home/user/demo");
         assert_eq!(proj.last_modified, "2026-06-21T10:00:00Z");
     }
 
     #[test]
-    fn load_sessions_filters_and_summarizes() {
+    fn project_with_only_sub_agent_sessions_is_not_listed() {
+        let conn = empty_db(SCHEMA);
+        add_session(&conn, "sub", "Delegated task", "sub_agent", CWD);
+        add_session(&conn, "hid", "Demo session", "hidden", CWD);
+        assert!(scan_in_conn(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn load_sessions_lists_top_level_sessions_with_visible_counts() {
         let conn = fixture_db();
-        let sessions = load_sessions_conn(&conn, "/Users/jack/proj").unwrap();
-        assert_eq!(sessions.len(), 2);
+        let sessions = load_sessions_conn(&conn, CWD).unwrap();
+        let mut ids: Vec<_> = sessions
+            .iter()
+            .map(|s| s.actual_session_id.as_str())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["s1", "s2"]);
         let s1 = sessions
             .iter()
             .find(|s| s.actual_session_id == "s1")
             .unwrap();
         assert_eq!(s1.message_count, 3);
-        assert_eq!(s1.summary.as_deref(), Some("Fix login")); // description wins
+        assert_eq!(s1.summary.as_deref(), Some("title-a"));
         assert_eq!(s1.file_path, "goose://s1");
-        // s2 has no name/description -> falls back to the session id.
-        let s2 = sessions
-            .iter()
-            .find(|s| s.actual_session_id == "s2")
-            .unwrap();
-        assert_eq!(s2.summary.as_deref(), Some("s2"));
+    }
+
+    /// Older Goose stores kept the session title in `description`; it still
+    /// wins when set, and an unnamed session falls back to its id.
+    #[test]
+    fn legacy_description_is_preferred_and_empty_names_fall_back_to_id() {
+        let conn = empty_db(SCHEMA);
+        add_session(&conn, "s1", "title-a", "user", CWD);
+        add_session(&conn, "s2", "", "user", CWD);
+        conn.execute(
+            "UPDATE sessions SET description = 'Fix login' WHERE id = 's1'",
+            [],
+        )
+        .unwrap();
+        let sessions = load_sessions_conn(&conn, CWD).unwrap();
+        let summary = |id: &str| {
+            sessions
+                .iter()
+                .find(|s| s.actual_session_id == id)
+                .unwrap()
+                .summary
+                .clone()
+        };
+        assert_eq!(summary("s1").as_deref(), Some("Fix login"));
+        assert_eq!(summary("s2").as_deref(), Some("s2"));
+    }
+
+    #[test]
+    fn load_messages_drops_agent_only_rows() {
+        let conn = fixture_db();
+        add_message(&conn, "m6", "s1", "user", NUDGE, AGENT_ONLY);
+        let msgs = load_messages_conn(&conn, "s1").unwrap();
+        let uuids: Vec<_> = msgs.iter().map(|m| m.uuid.as_str()).collect();
+        assert_eq!(
+            uuids,
+            ["m1", "m2", "m3"],
+            "turn-context, delivery and nudge are agent-only"
+        );
+        assert_eq!(msgs[0].role.as_deref(), Some("user"));
     }
 
     #[test]
     fn load_messages_maps_text_and_tools() {
         let conn = fixture_db();
         let msgs = load_messages_conn(&conn, "s1").unwrap();
-        assert_eq!(msgs.len(), 3);
 
-        assert_eq!(msgs[0].role.as_deref(), Some("user"));
-        assert_eq!(msgs[0].uuid, "m1");
-
-        // assistant: text + tool_use
         let asst = msgs[1].content.as_ref().unwrap().as_array().unwrap();
-        assert_eq!(asst[0]["type"], "text");
-        assert_eq!(asst[1]["type"], "tool_use");
-        assert_eq!(asst[1]["name"], "developer__shell");
-        assert_eq!(asst[1]["id"], "call1");
-        assert_eq!(asst[1]["input"]["command"], "ls");
+        assert_eq!(asst[0]["type"], "tool_use");
+        assert_eq!(asst[0]["name"], "shell");
+        assert_eq!(asst[0]["id"], "6bc1adc4");
+        assert_eq!(asst[0]["input"]["command"], "npm test");
 
-        // tool response -> tool_result with extracted text
+        // `status:"success"` + `isError:true` is a failed call.
         let tr = msgs[2].content.as_ref().unwrap().as_array().unwrap();
         assert_eq!(tr[0]["type"], "tool_result");
-        assert_eq!(tr[0]["tool_use_id"], "call1");
-        assert_eq!(tr[0]["content"], "file.rs");
-        assert_eq!(tr[0]["is_error"], false);
+        assert_eq!(tr[0]["tool_use_id"], "6bc1adc4");
+        assert!(tr[0]["content"].as_str().unwrap().contains("4 !== 5"));
+        assert_eq!(tr[0]["is_error"], true);
+        assert_eq!(tr[0]["is_error_source"], "producer");
     }
 
     #[test]
-    fn search_matches_content_and_tags_project() {
-        let conn = fixture_db();
-        let results = search_conn(&conn, "LOGIN", 10).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].project_name.as_deref(), Some("proj"));
-        let none = search_conn(&conn, "nonexistent-xyz", 10).unwrap();
-        assert!(none.is_empty());
-    }
-
-    #[test]
-    fn map_tool_response_error() {
+    fn tool_result_flags_follow_the_producer() {
+        let ok = r#"{"type":"toolResponse","id":"c","toolResult":{"status":"success","value":{"resultType":"complete","content":[{"type":"text","text":"x"}],"isError":false}}}"#;
+        let block = map_content_item(&serde_json::from_str(ok).unwrap()).unwrap();
+        assert_eq!(block["is_error"], false);
+        assert_eq!(block["is_error_source"], "producer");
+        // A tool that returned no result: `status:"error"`.
         let item = json!({
             "type": "toolResponse",
             "id": "c1",
             "toolResult": {"status": "error", "error": "boom"}
         });
         let block = map_content_item(&item).unwrap();
-        assert_eq!(block["type"], "tool_result");
         assert_eq!(block["is_error"], true);
         assert_eq!(block["content"], "boom");
+        assert_eq!(block["is_error_source"], "producer");
+    }
+
+    #[test]
+    fn tool_result_image_is_kept() {
+        let item: Value = serde_json::from_str(IMAGE_RESULT).unwrap();
+        let block = map_content_item(&item).unwrap();
+        assert_eq!(block["is_error"], false);
+        let parts = block["content"].as_array().unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0]["type"], "text");
+        assert!(parts[0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("Loaded image from"));
+        assert_eq!(parts[1]["type"], "image");
+        assert_eq!(parts[1]["source"]["type"], "base64");
+        assert_eq!(parts[1]["source"]["media_type"], "image/png");
+        assert!(parts[1]["source"]["data"]
+            .as_str()
+            .unwrap()
+            .starts_with("iVBORw0KGgo"));
+    }
+
+    #[test]
+    fn error_blocks_are_shown() {
+        for (content, needle) in [
+            (EXHAUSTED, "maximum number of actions"),
+            (PROVIDER_FAILURE, "scripted provider failure"),
+        ] {
+            let msg = build_message(
+                "s",
+                1,
+                "assistant",
+                content,
+                1750500000,
+                None,
+                Some(r#"{"userVisible":true,"agentVisible":false}"#),
+            )
+            .expect("an error-only assistant message is not dropped");
+            let blocks = msg.content.unwrap();
+            let text = blocks[0]["text"].as_str().unwrap();
+            assert!(
+                text.starts_with("[Error] ") && text.contains(needle),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn undecodable_call_keeps_what_the_record_names() {
+        // The real record carries no name: the tool stays `unknown`.
+        let item: Value = serde_json::from_str(BROKEN_CALL).unwrap();
+        let block = map_content_item(&item).unwrap();
+        assert_eq!(block["type"], "tool_use");
+        assert_eq!(block["name"], "unknown");
+        assert_eq!(block["id"], "call_83536c45");
+        // goose-provider-types `formats/openai.rs` words other decode failures
+        // `Tool arguments for <name> (id <id>) ...`, stored as `<code>: <message>`.
+        let named = json!({
+            "type": "toolRequest",
+            "id": "call_1",
+            "toolCall": {"status": "error", "error": "-32602: Tool arguments for shell (id call_1) must be a JSON object, got an array. Raw arguments: '[1]'"}
+        });
+        assert_eq!(map_content_item(&named).unwrap()["name"], "shell");
+        // Another call's id never names this one.
+        let other = json!({
+            "type": "toolRequest",
+            "id": "call_2",
+            "toolCall": {"status": "error", "error": "Tool arguments for shell (id call_1) must be a JSON object"}
+        });
+        assert_eq!(map_content_item(&other).unwrap()["name"], "unknown");
+    }
+
+    #[test]
+    fn search_skips_agent_only_messages_and_sub_agent_sessions() {
+        let conn = fixture_db();
+        let results = search_conn(&conn, "LOGIN", 10).unwrap();
+        let mut uuids: Vec<_> = results.iter().map(|m| m.uuid.as_str()).collect();
+        uuids.sort_unstable();
+        assert_eq!(
+            uuids,
+            ["m1", "m5"],
+            "sub_agent and hidden sessions are not searched"
+        );
+        assert_eq!(results[0].project_name.as_deref(), Some("demo"));
+        assert!(search_conn(&conn, "turn-context", 10).unwrap().is_empty());
+        assert!(search_conn(&conn, "nonexistent-xyz", 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Stores Goose has not migrated lack `metadata_json` and `session_type`.
+    #[test]
+    fn legacy_schema_without_optional_columns_still_loads() {
+        let conn = empty_db(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, name TEXT, description TEXT, \
+                 working_dir TEXT NOT NULL, created_at TEXT, updated_at TEXT);
+             CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT, \
+                 session_id TEXT NOT NULL, role TEXT NOT NULL, content_json TEXT NOT NULL, \
+                 created_timestamp INTEGER NOT NULL);",
+        );
+        conn.execute(
+            "INSERT INTO sessions VALUES ('s1','t','','/home/user/demo','2026-06-20 09:00:00','2026-06-20 09:30:00')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO messages (message_id,session_id,role,content_json,created_timestamp) VALUES ('m1','s1','user',?1,1750500000)",
+            [r#"[{"type":"text","text":"hi"}]"#],
+        )
+        .unwrap();
+        assert_eq!(scan_in_conn(&conn).unwrap()[0].message_count, 1);
+        assert_eq!(load_sessions_conn(&conn, CWD).unwrap().len(), 1);
+        assert_eq!(load_messages_conn(&conn, "s1").unwrap().len(), 1);
+        assert_eq!(search_conn(&conn, "hi", 10).unwrap().len(), 1);
     }
 
     #[test]
@@ -616,6 +1024,7 @@ mod tests {
         assert_eq!(b["thinking"], "hmm");
         assert!(map_content_item(&json!({"type":"image","image":{}})).is_none());
         assert!(map_content_item(&json!({"type":"text","text":""})).is_none());
+        assert!(map_content_item(&json!({"type":"error","kind":"other","message":""})).is_none());
     }
 
     #[test]
@@ -632,25 +1041,16 @@ mod tests {
     /// scan and resolvable by `load_sessions("unknown")`.
     #[test]
     fn empty_working_dir_rounds_trips_as_unknown() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE sessions (id TEXT PRIMARY KEY, name TEXT, description TEXT, \
-                 working_dir TEXT NOT NULL, created_at TEXT, updated_at TEXT);
-             CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT, \
-                 session_id TEXT NOT NULL, role TEXT NOT NULL, content_json TEXT NOT NULL, \
-                 created_timestamp INTEGER NOT NULL);",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO sessions VALUES ('s1',NULL,NULL,'','2026-06-20 09:00:00','2026-06-20 09:30:00')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages (message_id,session_id,role,content_json,created_timestamp) VALUES ('m1','s1','user',?1,1750500000)",
-            [r#"[{"type":"text","text":"hi"}]"#],
-        )
-        .unwrap();
+        let conn = empty_db(SCHEMA);
+        add_session(&conn, "s1", "", "user", "");
+        add_message(
+            &conn,
+            "m1",
+            "s1",
+            "user",
+            r#"[{"type":"text","text":"hi"}]"#,
+            VISIBLE,
+        );
 
         let projects = scan_in_conn(&conn).unwrap();
         assert_eq!(projects.len(), 1);
@@ -669,26 +1069,17 @@ mod tests {
 
     #[test]
     fn search_hits_carry_scanned_project_path_for_same_named_projects() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE sessions (id TEXT PRIMARY KEY, name TEXT, description TEXT, \
-                 working_dir TEXT NOT NULL, created_at TEXT, updated_at TEXT);
-             CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT, \
-                 session_id TEXT NOT NULL, role TEXT NOT NULL, content_json TEXT NOT NULL, \
-                 created_timestamp INTEGER NOT NULL);",
-        )
-        .unwrap();
+        let conn = empty_db(SCHEMA);
         for (id, cwd) in [("sa", "/work/client-a/app"), ("sb", "/work/client-b/app")] {
-            conn.execute(
-                "INSERT INTO sessions VALUES (?1,NULL,NULL,?2,'2026-06-20 09:00:00','2026-06-20 09:30:00')",
-                [id, cwd],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO messages (message_id,session_id,role,content_json,created_timestamp) VALUES (?1,?1,'user',?2,1750500000)",
-                [id, r#"[{"type":"text","text":"shared needle"}]"#],
-            )
-            .unwrap();
+            add_session(&conn, id, "", "user", cwd);
+            add_message(
+                &conn,
+                id,
+                id,
+                "user",
+                r#"[{"type":"text","text":"shared needle"}]"#,
+                VISIBLE,
+            );
         }
 
         let projects = scan_in_conn(&conn).unwrap();
@@ -716,30 +1107,21 @@ mod tests {
     /// DB row id), not divergent enumeration indices.
     #[test]
     fn null_message_id_uuid_is_stable_across_load_and_search() {
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(
-            "CREATE TABLE sessions (id TEXT PRIMARY KEY, name TEXT, description TEXT, \
-                 working_dir TEXT NOT NULL, created_at TEXT, updated_at TEXT);
-             CREATE TABLE messages (id INTEGER PRIMARY KEY AUTOINCREMENT, message_id TEXT, \
-                 session_id TEXT NOT NULL, role TEXT NOT NULL, content_json TEXT NOT NULL, \
-                 created_timestamp INTEGER NOT NULL);",
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO sessions VALUES ('s1',NULL,NULL,'/p','2026-06-20 09:00:00','2026-06-20 09:30:00')",
-            [],
-        )
-        .unwrap();
+        let conn = empty_db(SCHEMA);
+        add_session(&conn, "s1", "", "user", "/p");
         // A decoy message first so the search-filtered index differs from the
         // session index, then the NULL-message_id message we assert on.
+        add_message(
+            &conn,
+            "keep",
+            "s1",
+            "user",
+            r#"[{"type":"text","text":"decoy"}]"#,
+            VISIBLE,
+        );
         conn.execute(
-            "INSERT INTO messages (message_id,session_id,role,content_json,created_timestamp) VALUES ('keep','s1','user',?1,1750500000)",
-            [r#"[{"type":"text","text":"decoy"}]"#],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO messages (message_id,session_id,role,content_json,created_timestamp) VALUES (NULL,'s1','assistant',?1,1750500001)",
-            [r#"[{"type":"text","text":"NEEDLE here"}]"#],
+            "INSERT INTO messages (message_id,session_id,role,content_json,created_timestamp,metadata_json) VALUES (NULL,'s1','assistant',?1,1750500001,?2)",
+            [r#"[{"type":"text","text":"NEEDLE here"}]"#, VISIBLE],
         )
         .unwrap();
 
@@ -758,6 +1140,7 @@ mod outcome_preservation_tests {
     use super::*;
     #[test]
     fn producer_outcome_evidence_is_not_fabricated_or_dropped() {
+        // No `isError` and no `status:"error"`: nothing recorded, so derived.
         let block=map_content_item(&serde_json::json!({"type":"toolResponse","id":"c","toolResult":{"value":{"content":[]}}})).unwrap();
         assert_eq!(block["is_error_source"], "derived");
     }
