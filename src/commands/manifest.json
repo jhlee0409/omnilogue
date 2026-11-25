@@ -190,6 +190,15 @@
       "toggle": true
     },
     {
+      "id": "view.toggleExpandLongMessages",
+      "labelKey": "common.command.toggleExpandLongMessages",
+      "menuLabelKey": "common.menu.expandLongMessages",
+      "shortcut": null,
+      "source": "frontend",
+      "menu": "view",
+      "toggle": true
+    },
+    {
       "id": "view.toggleLiveRefresh",
       "labelKey": "common.command.toggleLiveRefresh",
       "menuLabelKey": "common.menu.liveRefresh",

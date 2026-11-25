@@ -171,6 +171,7 @@ export const STATE_SCOPE: Readonly<Record<string, StateScope>> = {
   sessionSortOrder: "app",
   sessionEntrypointFilter: "app",
   showInlineTokenUsage: "app",
+  expandLongMessages: "app",
   messageFilter: "app",
   userOnlyFilter: "app",
   showParallelTasksInNavigator: "app",

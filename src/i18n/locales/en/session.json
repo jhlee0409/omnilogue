@@ -299,6 +299,7 @@
   "sessionPicker.cancelled": "Startup session hint cancelled",
   "project.temporaryGroup": "Temporary locations",
   "project.switchProvider": "Open {{provider}} sessions ({{count}})",
+  "project.assistantsInFolder": "Assistants in this folder",
   "session.noProjects.title": "No projects found",
   "session.noProjects.description": "No conversation history was found in the assistants found on this computer. Claude Code history is read from:",
   "session.noProjects.hint": "Start a session in a supported assistant and search again, or add another folder in {{settings}} → {{section}}.",

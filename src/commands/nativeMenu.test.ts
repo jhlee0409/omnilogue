@@ -36,6 +36,7 @@ function makeContext(overrides: Partial<CommandContext> = {}): CommandContext {
     toggleInspector: vi.fn(),
     toggleMinimap: vi.fn(),
     toggleInlineTokenUsage: vi.fn(),
+    toggleExpandLongMessages: vi.fn(),
     toggleLiveRefresh: vi.fn(),
     openSettingsManager: vi.fn(),
     openArchive: vi.fn(),
@@ -588,6 +589,7 @@ describe("View → Zoom (§9b A1)", () => {
       "view.toggleInspector",
       "view.toggleMinimap",
       "view.toggleInlineTokens",
+      "view.toggleExpandLongMessages",
       "view.toggleLiveRefresh",
       ...ZOOM_IDS,
     ]);

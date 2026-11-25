@@ -374,6 +374,16 @@ export function countToolUseBlocks(message: ClaudeMessage): number {
 
 type UserBlockKind = "prompt" | "command" | "agent-update" | "context";
 
+/**
+ * True when the text is nothing but wrapper blocks the assistant's client
+ * injects into the user turn (`<environment_context>`, `<system-reminder>`,
+ * Codex internal context …): context, not something the user typed.
+ */
+export function isInjectedWrapperText(text: string): boolean {
+  const trimmed = text.trim();
+  return trimmed.startsWith("<") && trimmed.replace(INTERNAL_CONTEXT_BLOCK, "").replace(INJECTED_WRAPPER_BLOCK, "").trim() === "";
+}
+
 function classifyUserText(text: string): UserBlockKind {
   const trimmed = text.trim();
   if (isTaskNotification(trimmed)) return "agent-update";
@@ -381,9 +391,7 @@ function classifyUserText(text: string): UserBlockKind {
   if (COMMAND_OUTPUT_PREFIXES.some((prefix) => trimmed.startsWith(prefix))) return "command";
   if (/^<bash-(stdout|stderr)>/.test(trimmed) && trimmed.replace(BASH_OUTPUT_BLOCK, "").trim() === "") return "command";
   if (INJECTED_TEXT_PREFIXES.some((prefix) => trimmed.startsWith(prefix))) return "context";
-  if (trimmed.startsWith("<") && trimmed.replace(INTERNAL_CONTEXT_BLOCK, "").replace(INJECTED_WRAPPER_BLOCK, "").trim() === "") {
-    return "context";
-  }
+  if (isInjectedWrapperText(trimmed)) return "context";
   return "prompt";
 }
 

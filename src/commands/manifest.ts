@@ -26,6 +26,7 @@ export const COMMAND_IDS = [
   "view.toggleInspector",
   "view.toggleMinimap",
   "view.toggleInlineTokens",
+  "view.toggleExpandLongMessages",
   "view.toggleLiveRefresh",
   "view.zoomIn",
   "view.zoomOut",

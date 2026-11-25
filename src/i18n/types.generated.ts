@@ -5,8 +5,8 @@
  * 직접 수정하지 마세요.
  *
  * 생성 명령: pnpm run generate:i18n-types
- * 생성 시간: 2026-11-22T03:51:54.496Z
- * 총 키 개수: 2506
+ * 생성 시간: 2026-11-25T01:05:20.002Z
+ * 총 키 개수: 2511
  * Namespace 수: 13
  */
 
@@ -44,7 +44,7 @@ export type I18nNamespace =
   | 'webui';
 
 /**
- * common namespace의 번역 키 (324개)
+ * common namespace의 번역 키 (327개)
  * 파일: locales/{lang}/common.json
  */
 export type CommonKeys =
@@ -91,6 +91,7 @@ export type CommonKeys =
   | 'common.command.previousStep'
   | 'common.command.previousTab'
   | 'common.command.sendFeedback'
+  | 'common.command.toggleExpandLongMessages'
   | 'common.command.toggleInlineTokens'
   | 'common.command.toggleInspector'
   | 'common.command.toggleLiveRefresh'
@@ -171,6 +172,7 @@ export type CommonKeys =
   | 'common.menu.cut'
   | 'common.menu.edit'
   | 'common.menu.eventsFailed'
+  | 'common.menu.expandLongMessages'
   | 'common.menu.file'
   | 'common.menu.fullscreen'
   | 'common.menu.go'
@@ -291,6 +293,7 @@ export type CommonKeys =
   | 'common.settings.title'
   | 'common.settings.tools'
   | 'common.settings.updateSettings'
+  | 'common.settings.view.expandLongMessages'
   | 'common.settings.view.liveRefresh'
   | 'common.settings.view.liveRefreshHint'
   | 'common.settings.view.minimapShortcutHint'
@@ -587,7 +590,7 @@ export type AnalyticsKeys =
   | 'analytics.weeklyActivity';
 
 /**
- * session namespace의 번역 키 (356개)
+ * session namespace의 번역 키 (357개)
  * 파일: locales/{lang}/session.json
  */
 export type SessionKeys =
@@ -599,6 +602,7 @@ export type SessionKeys =
   | 'project.a11y.keyboardHelp'
   | 'project.a11y.selectedState'
   | 'project.addPattern'
+  | 'project.assistantsInFolder'
   | 'project.clearUnavailable.acknowledge'
   | 'project.clearUnavailable.clearing'
   | 'project.clearUnavailable.confirm'
@@ -1653,7 +1657,7 @@ export type ErrorKeys =
   | 'error.viewDetails';
 
 /**
- * message namespace의 번역 키 (178개)
+ * message namespace의 번역 키 (179개)
  * 파일: locales/{lang}/message.json
  */
 export type MessageKeys =
@@ -1689,6 +1693,7 @@ export type MessageKeys =
   | 'message.system'
   | 'message.user'
   | 'messageContentDisplay.copyMessage'
+  | 'messageContentDisplay.injectedContext'
   | 'messageContentDisplay.showLess'
   | 'messageContentDisplay.showMore'
   | 'messageContentDisplay.showMoreRows'
@@ -3127,6 +3132,7 @@ export type TranslationKey =
   | 'common.command.previousStep'
   | 'common.command.previousTab'
   | 'common.command.sendFeedback'
+  | 'common.command.toggleExpandLongMessages'
   | 'common.command.toggleInlineTokens'
   | 'common.command.toggleInspector'
   | 'common.command.toggleLiveRefresh'
@@ -3207,6 +3213,7 @@ export type TranslationKey =
   | 'common.menu.cut'
   | 'common.menu.edit'
   | 'common.menu.eventsFailed'
+  | 'common.menu.expandLongMessages'
   | 'common.menu.file'
   | 'common.menu.fullscreen'
   | 'common.menu.go'
@@ -3327,6 +3334,7 @@ export type TranslationKey =
   | 'common.settings.title'
   | 'common.settings.tools'
   | 'common.settings.updateSettings'
+  | 'common.settings.view.expandLongMessages'
   | 'common.settings.view.liveRefresh'
   | 'common.settings.view.liveRefreshHint'
   | 'common.settings.view.minimapShortcutHint'
@@ -3660,6 +3668,7 @@ export type TranslationKey =
   | 'message.system'
   | 'message.user'
   | 'messageContentDisplay.copyMessage'
+  | 'messageContentDisplay.injectedContext'
   | 'messageContentDisplay.showLess'
   | 'messageContentDisplay.showMore'
   | 'messageContentDisplay.showMoreRows'
@@ -3830,6 +3839,7 @@ export type TranslationKey =
   | 'project.a11y.keyboardHelp'
   | 'project.a11y.selectedState'
   | 'project.addPattern'
+  | 'project.assistantsInFolder'
   | 'project.clearUnavailable.acknowledge'
   | 'project.clearUnavailable.clearing'
   | 'project.clearUnavailable.confirm'

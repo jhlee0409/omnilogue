@@ -14,6 +14,24 @@ export function isAbsolutePath(path: string): boolean {
 }
 
 /**
+ * A key under which every spelling of one working directory compares equal
+ * (#833). Providers record Windows folders as `C:\Code\app`, `c:/Code/app`
+ * or `/c:/Code/app` (Copilot), and network shares as `\\host\share` or
+ * `//host/share`: separators, the leading slash and case are normalized, as
+ * Windows paths are case-insensitive. A trailing separator is ignored. POSIX
+ * paths (one leading slash) keep their case and backslashes.
+ */
+export function folderKey(path: string): string {
+  const windows = /^\/?[A-Za-z]:(?:[\\/]|$)/.test(path) || /^(?:\\\\|\/\/)[^\\/]/.test(path);
+  if (!windows) return path.length > 1 ? path.replace(/\/+$/, "") : path;
+  return path
+    .replace(/\\/g, "/")
+    .replace(/^\/([A-Za-z]:)/, "$1")
+    .replace(/\/+$/, "")
+    .toLowerCase();
+}
+
+/**
  * A project can remain browsable even when its last-known working directory
  * has been removed (for example, an ephemeral Git worktree).
  */

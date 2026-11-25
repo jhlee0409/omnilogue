@@ -36,6 +36,7 @@ import {
   SlidersHorizontal,
   SquareArrowRight,
   TextSearch,
+  UnfoldVertical,
   X,
   ZoomIn,
   ZoomOut,
@@ -88,6 +89,7 @@ export interface CommandActions {
   toggleInspector: () => void;
   toggleMinimap: () => void;
   toggleInlineTokenUsage: () => void;
+  toggleExpandLongMessages: () => void;
   toggleLiveRefresh: () => unknown;
   openSettingsManager: () => unknown;
   openArchive: () => unknown;
@@ -238,6 +240,12 @@ const HANDLERS: Record<CommandId, CommandHandler> = {
     // A saved display preference, app-wide like the minimap.
     target: APP_TARGET,
     run: (ctx) => ctx.actions.toggleInlineTokenUsage(),
+  },
+  "view.toggleExpandLongMessages": {
+    icon: UnfoldVertical,
+    // A saved display preference, app-wide like inline token usage (#574).
+    target: APP_TARGET,
+    run: (ctx) => ctx.actions.toggleExpandLongMessages(),
   },
   "view.toggleLiveRefresh": {
     icon: FolderSync,

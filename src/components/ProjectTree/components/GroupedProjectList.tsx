@@ -13,9 +13,11 @@ import type { GroupingStrategy, SessionSelectHandler } from "../types";
 import { cn } from "@/lib/utils";
 import { useAppStore } from "@/store/useAppStore";
 import { ProjectItem } from "./ProjectItem";
+import { ProviderDot } from "./ProviderDot";
+import { getProviderId, getProviderLabel } from "../../../utils/providers";
 import { ProjectSessions } from "./ProjectSessions";
 import { GroupHeader } from "./GroupHeader";
-import { isProjectPathUnavailable, isProjectTemporary } from "../../../utils/pathUtils";
+import { folderKey, isProjectPathUnavailable, isProjectTemporary } from "../../../utils/pathUtils";
 
 interface GroupedProjectListProps {
   groupingMode: GroupingStrategy;
@@ -143,7 +145,10 @@ export const GroupedProjectList: React.FC<GroupedProjectListProps> = ({
     project: ClaudeProject,
     variant: "default" | "main" | "worktree" = "default",
     ariaLevel = 1,
-    providerSiblings: ClaudeProject[] = []
+    providerSiblings: ClaudeProject[] = [],
+    // A merged row keeps its folder's key while its lead changes, so a
+    // focused assistant chip survives the switch it triggers.
+    rowKey: string = project.path
   ) => {
     const isExpanded = isProjectExpanded(project.path);
     const isOpen = selectedProject?.path === project.path;
@@ -159,7 +164,7 @@ export const GroupedProjectList: React.FC<GroupedProjectListProps> = ({
     // useDeferredValue, so the optimization is not worth the rendering bug.
 
     return (
-      <div key={project.path} role="none" className="relative">
+      <div key={rowKey} role="none" className="relative">
         <ProjectItem
           project={project}
           isExpanded={isExpanded}
@@ -190,6 +195,48 @@ export const GroupedProjectList: React.FC<GroupedProjectListProps> = ({
           >
             {t("project.select")}
           </button>
+        )}
+        {/* Several assistants share this folder (one merged row): choose
+            whose sessions the row lists. Outside the tree item, as the
+            Select button is, so no control nests inside it. */}
+        {showSessions && providerSiblings.length > 0 && (
+          <div
+            role="group"
+            aria-label={t("project.assistantsInFolder")}
+            className="flex flex-wrap gap-1 py-1 pl-8 pr-2"
+          >
+            {[project, ...providerSiblings]
+              .map((p) => ({
+                p,
+                label: getProviderLabel((key, fallback) => t(key, fallback), getProviderId(p.provider)),
+              }))
+              .sort((a, b) => a.label.localeCompare(b.label))
+              .map(({ p, label }) => {
+                const name = p.custom_directory_label ? `${label} (${p.custom_directory_label})` : label;
+                const active = isOpen && p.path === project.path;
+                return (
+                  <button
+                    key={p.path}
+                    type="button"
+                    aria-pressed={active}
+                    title={t("project.switchProvider", { provider: name, count: p.session_count })}
+                    onClick={() => {
+                      if (!active) clickProject(p, false);
+                    }}
+                    className={cn(
+                      "inline-flex h-5 items-center gap-1 rounded-full border px-2 text-caption",
+                      active
+                        ? "border-accent bg-accent/15 text-foreground"
+                        : "border-border text-muted-foreground hover:bg-muted hover:text-foreground"
+                    )}
+                  >
+                    <ProviderDot provider={p.provider} />
+                    <span>{name}</span>
+                    <span className="tabular-nums">{p.session_count}</span>
+                  </button>
+                );
+              })}
+          </div>
         )}
         {showSessions && (
           <ProjectSessions
@@ -412,8 +459,8 @@ export const GroupedProjectList: React.FC<GroupedProjectListProps> = ({
 
   return (
     <>
-      {mergeByFolder(availableProjects, selectedProject).map(({ lead, siblings }) =>
-        renderProjectWithSessions(lead, "default", 1, siblings)
+      {mergeByFolder(availableProjects, selectedProject).map(({ key, lead, siblings }) =>
+        renderProjectWithSessions(lead, "default", 1, siblings, `folder:${key}`)
       )}
       {renderBucketGroup("temporary", temporaryProjects)}
       {renderBucketGroup("unavailable", unavailableProjects)}
@@ -424,18 +471,19 @@ export const GroupedProjectList: React.FC<GroupedProjectListProps> = ({
 /**
  * One row per working directory. Several providers (Claude Code, Codex,
  * oh-my-pi…) record sessions for the same folder under different store
- * paths; showing them as five rows fragments the list. The selected
- * project leads its group so highlight and expansion follow the user;
- * otherwise the most recent one (input order) leads.
+ * paths, and on Windows in different spellings (`C:\a`, `c:/a`, `/c:/a`,
+ * see `folderKey`); showing them as five rows fragments the list. The
+ * selected project leads its group so highlight and expansion follow the
+ * user; otherwise the most recent one (input order) leads.
  */
 function mergeByFolder(
   list: ClaudeProject[],
   selectedProject: ClaudeProject | null
-): Array<{ lead: ClaudeProject; siblings: ClaudeProject[] }> {
+): Array<{ key: string; lead: ClaudeProject; siblings: ClaudeProject[] }> {
   const byFolder: Record<string, ClaudeProject[]> = {};
   const order: string[] = [];
   for (const project of list) {
-    const key = project.actual_path || project.path;
+    const key = folderKey(project.actual_path || project.path);
     if (!byFolder[key]) {
       byFolder[key] = [];
       order.push(key);
@@ -448,6 +496,6 @@ function mergeByFolder(
       ? group.findIndex((p) => p.path === selectedProject.path)
       : -1;
     const lead = group[leadIndex === -1 ? 0 : leadIndex]!;
-    return { lead, siblings: group.filter((p) => p !== lead) };
+    return { key, lead, siblings: group.filter((p) => p !== lead) };
   });
 }

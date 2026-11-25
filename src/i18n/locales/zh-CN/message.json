@@ -17,6 +17,7 @@
   "message.system": "系统",
   "message.user": "用户",
   "messageContentDisplay.copyMessage": "复制消息",
+  "messageContentDisplay.injectedContext": "自动插入的上下文",
   "messageContentDisplay.showLess": "收起",
   "messageContentDisplay.showMore": "展开更多...",
   "messageContentDisplay.showMoreRows": "再显示 {{count}} 行...",

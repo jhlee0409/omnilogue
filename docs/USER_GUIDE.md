@@ -64,3 +64,18 @@ The board automatically detects file modifications and documentation updates:
 -   **Virtual Edits**: The board highlights file modifications (e.g., `write_to_file`) based on the conversation history. These represent the AI's *actions*, which may usually correspond to file changes on disk.
 -   **Errors**: Red indicators highlight tool failures (stderr output) or API errors.
 -   **Tokens Activity**: The Pixel View uses vertical bar height to represent token density, allowing you to visually identify the "weight" of different parts of the conversation.
+
+## Reporting a session that looks wrong
+
+Assistants sometimes change how they store sessions, and a transcript can then miss tool output, show instructions as replies, or have no title. The app can check the latest sessions of every assistant on your computer and print what it finds as counts: message and block types, tool names, tool calls without a result, sessions without a title. It prints no conversation text, file paths or project names. Attach the output to your issue.
+
+```sh
+# macOS
+"/Applications/Claude Code History Viewer.app/Contents/MacOS/claude-code-history-viewer" --audit-providers
+# Linux (AppImage)
+./Claude.Code.History.Viewer_<version>_amd64.AppImage --audit-providers
+# WebUI server
+cchv-server --audit-providers
+```
+
+On Windows the desktop app has no console to print to; write the report to a file instead: `claude-code-history-viewer.exe --audit-providers --output audit.json` (run it from the folder the app is installed in). `--sessions N` reads N sessions per assistant (default 10).

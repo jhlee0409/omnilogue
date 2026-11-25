@@ -37,16 +37,20 @@ export const ProjectItem: React.FC<ProjectItemProps> = ({
 
   const isMain = variant === "main";
   const isWorktree = variant === "worktree";
-  const isExpandable = project.session_count > 0 && hasInlineChildren;
+  const providers = [project, ...providerSiblings];
+  // A row that merges several assistants' projects (same folder) counts all
+  // their sessions, and its tooltip says how many each holds.
+  const sessionCount = providers.reduce((sum, p) => sum + p.session_count, 0);
+  const isExpandable = sessionCount > 0 && hasInlineChildren;
   const isPathUnavailable = isProjectPathUnavailable(project);
   const actualPath = project.actual_path || project.path || project.name;
 
   const providerId = getProviderId(project.provider);
-  const providers = [project, ...providerSiblings];
   const providerNames = providers
     .map((p) => {
       const label = getProviderLabel((key, fallback) => t(key, fallback), getProviderId(p.provider));
-      return p.custom_directory_label ? `${label} (${p.custom_directory_label})` : label;
+      const name = p.custom_directory_label ? `${label} (${p.custom_directory_label})` : label;
+      return providerSiblings.length > 0 ? `${name} ${p.session_count}` : name;
     })
     .join(", ");
   const displayName = isMain
@@ -152,7 +156,7 @@ export const ProjectItem: React.FC<ProjectItemProps> = ({
         className="shrink-0 min-w-4 text-right text-caption tabular-nums text-muted-foreground"
         title={project.subagent_count ? `+${t("session.subagentRunCount", { count: project.subagent_count })}` : undefined}
       >
-        {project.session_count}
+        {sessionCount}
         {!!project.subagent_count && (
           <span className="sr-only"> +{t("session.subagentRunCount", { count: project.subagent_count })}</span>
         )}
