@@ -6,6 +6,7 @@ pub mod logging;
 pub mod menu;
 pub mod models;
 pub mod multi_window;
+pub mod provider_audit;
 pub mod providers;
 pub mod utils;
 pub mod window_state;
@@ -96,6 +97,11 @@ pub fn run() {
     // with no display.
     {
         let args: Vec<String> = std::env::args().collect();
+        // Session-format audit for bug reports: counts only, no conversation text.
+        if args.iter().any(|a| a == "--audit-providers") {
+            utils::init_global_thread_pool();
+            std::process::exit(provider_audit::run_audit(&args));
+        }
         if args
             .iter()
             .any(|a| a == "--export" || a.starts_with("--export="))
