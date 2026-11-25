@@ -108,7 +108,9 @@ fn read_manifest(session_dir: &Path, id: &str, report: &ScanReport) -> Option<Ma
         cwd: text(value.get("cwd"))
             .or_else(|| text(value.get("workspace_root")))
             .unwrap_or_else(|| "unknown".to_string()),
-        title: text(value.pointer("/metadata/title")),
+        title: text(value.pointer("/metadata/title"))
+            .map(|title| display_user_text(&title).to_string())
+            .filter(|title| !title.is_empty()),
         started_at: text(value.get("started_at")),
         ended_at: text(value.get("ended_at")),
     })
@@ -131,6 +133,46 @@ fn read_manifests(root: &Path, report: &ScanReport) -> Vec<Manifest> {
         .collect()
 }
 
+/// A `[SYSTEM]` reminder the runtime appends as a user-role message, such as
+/// "This run is not complete until you call … `submit_and_exit`". The runtime
+/// stamps these with `metadata.userRunSpan: 0` (they are not user turns), and
+/// upstream's own chat view hides exactly the `userRunSpan == 0` messages whose
+/// text starts with `[SYSTEM]` (`isSystemSteeringMessage`, cline/cline
+/// `apps/examples/desktop-app/webview/components/views/chat/messages/group-messages.ts`
+/// at `34c104e6fc49781cda4adcd73ffdccd8f029fef9`, lines 44-59). A person's own
+/// prompt has no `metadata`, so one that merely begins with `[SYSTEM]` stays.
+fn is_run_nudge(message: &Value) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("user")
+        && message
+            .pointer("/metadata/userRunSpan")
+            .and_then(Value::as_u64)
+            == Some(0)
+        && content_blocks(message).iter().any(|block| {
+            block
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.trim_start().starts_with("[SYSTEM]"))
+        })
+}
+
+/// The prompt inside the `<user_input mode="act|plan|yolo">…</user_input>`
+/// wrapper the runtime puts around every persisted user turn (`@cline/shared`
+/// 0.2.1 `formatModePrompt`: `` `<user_input mode="${mode}">${text}</user_input>` ``);
+/// `None` for text that is not wrapped.
+fn unwrap_user_input(text: &str) -> Option<&str> {
+    text.trim()
+        .strip_prefix("<user_input")
+        .filter(|rest| rest.starts_with(|c: char| c.is_whitespace() || c == '>'))
+        .and_then(|rest| rest.split_once('>'))
+        .and_then(|(_, body)| body.strip_suffix("</user_input>"))
+        .map(str::trim)
+}
+
+/// `text` as the user typed it: trimmed, without the runtime's wrapper.
+fn display_user_text(text: &str) -> &str {
+    unwrap_user_input(text).unwrap_or_else(|| text.trim())
+}
+
 /// The lead transcript of a session; subagent and team-task transcripts in the
 /// same directory are other files and are never opened here.
 fn read_transcript(root: &Path, id: &str) -> Result<Vec<Value>, String> {
@@ -149,7 +191,13 @@ fn read_transcript(root: &Path, id: &str) -> Result<Vec<Value>, String> {
     Ok(value
         .get("messages")
         .and_then(Value::as_array)
-        .cloned()
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| !is_run_nudge(message))
+                .cloned()
+                .collect()
+        })
         .unwrap_or_default())
 }
 
@@ -193,7 +241,7 @@ fn first_user_text(messages: &[Value]) -> Option<String> {
             (block.get("type").and_then(Value::as_str) == Some("text"))
                 .then(|| block.get("text").and_then(Value::as_str))
                 .flatten()
-                .map(str::trim)
+                .map(display_user_text)
                 .filter(|text| !text.is_empty())
                 .map(String::from)
         })
@@ -256,7 +304,7 @@ fn convert_message(
         timestamp,
         role,
         Some(role),
-        Some(Value::Array(content_blocks(message))),
+        Some(Value::Array(display_blocks(message, role))),
         model,
     );
     if let Some(metrics) = message.get("metrics") {
@@ -264,6 +312,26 @@ fn convert_message(
         converted.cost_usd = metrics.get("cost").and_then(Value::as_f64);
     }
     Some(converted)
+}
+
+/// The blocks of a message as shown: the text of a user turn loses the
+/// runtime's `<user_input>` wrapper.
+fn display_blocks(message: &Value, role: &str) -> Vec<Value> {
+    let mut blocks = content_blocks(message);
+    if role != "user" {
+        return blocks;
+    }
+    for block in &mut blocks {
+        let inner = (block.get("type").and_then(Value::as_str) == Some("text"))
+            .then(|| block.get("text").and_then(Value::as_str))
+            .flatten()
+            .and_then(unwrap_user_input)
+            .map(String::from);
+        if let Some(inner) = inner {
+            block["text"] = Value::String(inner);
+        }
+    }
+    blocks
 }
 
 fn convert_transcript(
@@ -746,5 +814,153 @@ mod tests {
         let _session_guard = EnvVarGuard::set("CLINE_SESSION_DATA_DIR", &explicit);
         assert_eq!(sessions_dir(), Some(explicit.clone()), "most specific wins");
         drop(data_guard);
+    }
+
+    const CLI_ID: &str = "1795578707814_v5qte";
+    const CLI_CWD: &str = "/home/user/demo";
+    const NUDGE: &str = "[SYSTEM] This run is not complete until you call one of these terminal completion tools: submit_and_exit. Continue working if requirements are not met. If the task is complete, call the appropriate terminal completion tool now.";
+
+    /// Records of a Cline CLI 3.0.75 headless session (`cline --json "Please
+    /// do two things: …"`), trimmed: the real prompt arrives wrapped in
+    /// `<user_input mode="yolo">` and the runtime appends `[SYSTEM]` nudges
+    /// stamped `metadata.userRunSpan: 0` whenever the model ends a turn
+    /// without calling `submit_and_exit`.
+    fn cli_transcript() -> Value {
+        serde_json::json!({
+            "version": 1,
+            "agent": "lead",
+            "sessionId": CLI_ID,
+            "messages": [
+                {"id": "4e5be8be-78c2-4490-b348-a74be491e200", "role": "user", "ts": 1_795_578_708_016_u64,
+                 "content": [{"type": "text", "text": "<user_input mode=\"yolo\">Please do two things:\n- list the files in src\n- summarize what test.js checks</user_input>"}]},
+                {"id": "msg_joSr0Wq0", "role": "user", "ts": 1_795_578_708_018_u64,
+                 "metadata": {"userRunSpan": 0},
+                 "content": [{"type": "text", "text": NUDGE}]},
+                {"id": "msg_yg71LkO_", "role": "assistant", "ts": 1_795_578_709_757_u64,
+                 "modelInfo": {"id": "qwen2.5-coder:7b", "provider": "openai-compatible"},
+                 "metrics": {"inputTokens": 2681, "outputTokens": 61, "cacheReadTokens": 0, "cacheWriteTokens": 0},
+                 "content": [{"type": "text", "text": "I will list src."}]},
+                {"id": "msg_Iji4OKkg", "role": "user", "ts": 1_795_578_709_759_u64,
+                 "metadata": {"userRunSpan": 0},
+                 "content": [{"type": "text", "text": NUDGE}]},
+                {"id": "msg_x9zR0y-i", "role": "assistant", "ts": 1_795_578_710_913_u64,
+                 "modelInfo": {"id": "qwen2.5-coder:7b", "provider": "openai-compatible"},
+                 "content": [{"type": "tool_use", "id": "call_mxjlu9r6", "name": "submit_and_exit",
+                              "input": {"summary": "Files in src directory listed.", "verified": false}}]},
+                {"id": "msg_p1CJF5cw", "role": "user", "ts": 1_795_578_710_918_u64,
+                 "content": [{"type": "tool_result", "tool_use_id": "call_mxjlu9r6", "name": "submit_and_exit",
+                              "content": "Submission recorded (unverified): Files in src directory listed."}]}
+            ]
+        })
+    }
+
+    fn cli_store(title: Option<&str>, messages: &Value) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(CLI_ID);
+        fs::create_dir_all(&dir).unwrap();
+        let mut metadata =
+            serde_json::json!({"sessionHistoryOrigin": {"mode": "user", "version": "3.0.75"}});
+        if let Some(title) = title {
+            metadata["title"] = Value::String(title.to_string());
+        }
+        let manifest = serde_json::json!({
+            "version": 1,
+            "session_id": CLI_ID,
+            "source": "cli",
+            "started_at": "2026-11-25T03:51:47.816Z",
+            "ended_at": "2026-11-25T03:51:51.086Z",
+            "cwd": CLI_CWD,
+            "prompt": "Please do two things:\n- list the files in src\n- summarize what test.js checks",
+            "metadata": metadata,
+        });
+        fs::write(dir.join(format!("{CLI_ID}.json")), manifest.to_string()).unwrap();
+        fs::write(
+            dir.join(format!("{CLI_ID}.messages.json")),
+            messages.to_string(),
+        )
+        .unwrap();
+        tmp
+    }
+
+    #[test]
+    fn run_nudges_are_not_user_messages() {
+        let tmp = cli_store(Some("Please do two things:"), &cli_transcript());
+        let messages = load_messages_in(tmp.path(), CLI_ID).unwrap();
+        let roles: Vec<_> = messages.iter().map(|m| m.message_type.as_str()).collect();
+        assert_eq!(roles, ["user", "assistant", "assistant", "user"]);
+        assert!(messages.iter().all(|m| !serde_json::to_string(&m.content)
+            .unwrap()
+            .contains("[SYSTEM]")));
+
+        let sessions = load_sessions_in(tmp.path(), CLI_CWD, &ScanReport::default());
+        assert_eq!(sessions[0].message_count, 4);
+        let projects = scan_projects_in(tmp.path(), &ScanReport::default());
+        assert_eq!(projects[0].message_count, 4);
+
+        let filters = SearchFilters::parse(&Value::Null);
+        let mut results = Vec::new();
+        search_in(
+            tmp.path(),
+            "terminal completion",
+            10,
+            &filters,
+            &mut results,
+        );
+        assert!(results.is_empty(), "the nudge is not searchable");
+    }
+
+    #[test]
+    fn a_prompt_that_starts_with_system_is_kept() {
+        let transcript = serde_json::json!({"messages": [
+            {"id": "u1", "role": "user", "content": [{"type": "text", "text": "<user_input mode=\"act\">[SYSTEM] is a prefix I typed, explain it</user_input>"}]},
+            {"id": "u2", "role": "user", "metadata": {"userRunSpan": 1}, "content": [{"type": "text", "text": "[SYSTEM] second turn"}]}
+        ]});
+        let tmp = cli_store(None, &transcript);
+        let messages = load_messages_in(tmp.path(), CLI_ID).unwrap();
+        assert_eq!(messages.len(), 2, "only userRunSpan 0 marks a nudge");
+    }
+
+    #[test]
+    fn user_input_wrapper_is_stripped_from_messages_and_summary() {
+        let tmp = cli_store(None, &cli_transcript());
+        let messages = load_messages_in(tmp.path(), CLI_ID).unwrap();
+        assert_eq!(
+            messages[0].content,
+            Some(serde_json::json!([{
+                "type": "text",
+                "text": "Please do two things:\n- list the files in src\n- summarize what test.js checks"
+            }]))
+        );
+
+        let sessions = load_sessions_in(tmp.path(), CLI_CWD, &ScanReport::default());
+        assert_eq!(
+            sessions[0].summary.as_deref(),
+            Some("Please do two things:\n- list the files in src\n- summarize what test.js checks")
+        );
+    }
+
+    #[test]
+    fn manifest_title_wins_and_loses_the_wrapper() {
+        let tmp = cli_store(Some("Demo mul task"), &cli_transcript());
+        let sessions = load_sessions_in(tmp.path(), CLI_CWD, &ScanReport::default());
+        assert_eq!(sessions[0].summary.as_deref(), Some("Demo mul task"));
+
+        let wrapped = cli_store(
+            Some("<user_input mode=\"act\">Fix it</user_input>"),
+            &cli_transcript(),
+        );
+        let sessions = load_sessions_in(wrapped.path(), CLI_CWD, &ScanReport::default());
+        assert_eq!(sessions[0].summary.as_deref(), Some("Fix it"));
+    }
+
+    #[test]
+    fn unwrap_user_input_only_touches_the_whole_wrapper() {
+        assert_eq!(
+            unwrap_user_input("<user_input mode=\"plan\">\n hi \n</user_input>"),
+            Some("hi")
+        );
+        assert_eq!(unwrap_user_input("plain"), None);
+        assert_eq!(unwrap_user_input("<user_inputs>x</user_inputs>"), None);
+        assert_eq!(unwrap_user_input("<user_input mode=\"act\">unclosed"), None);
     }
 }
