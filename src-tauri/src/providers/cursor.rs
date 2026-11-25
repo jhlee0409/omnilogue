@@ -1489,7 +1489,13 @@ fn convert_assistant_bubble(
             })
             .unwrap_or(Value::Object(serde_json::Map::default()));
 
-        let mapped_name = map_cursor_tool_name(tool_name);
+        let mut mapped_name = map_cursor_tool_name(tool_name);
+        // A `merge` update lists only the changed items, some without their
+        // text: the to-do card needs every item's `content`, so such a call
+        // keeps its own name and the generic row.
+        if mapped_name == "TodoWrite" && !cursor_todos_complete(&args) {
+            mapped_name = tool_name;
+        }
         let args = normalize_cursor_tool_input(mapped_name, args);
 
         content_blocks.push(serde_json::json!({
@@ -1607,6 +1613,18 @@ fn map_cursor_tool_name(name: &str) -> &str {
         "web_fetch" | "fetch_url" => "WebFetch",
         _ => name,
     }
+}
+
+/// Whether a `todo_write` call lists every item with its text, so the to-do
+/// card can show it (a `merge` update may send only ids and statuses).
+fn cursor_todos_complete(args: &Value) -> bool {
+    args.get("todos")
+        .and_then(Value::as_array)
+        .is_some_and(|todos| {
+            todos
+                .iter()
+                .all(|todo| todo.get("content").and_then(Value::as_str).is_some())
+        })
 }
 
 /// Give a mapped Cursor tool's input the keys its card reads: Cursor names
@@ -1995,7 +2013,22 @@ mod tests {
         );
         assert_eq!(tool("run_terminal_command_v2", "null").0, "Bash");
         assert_eq!(tool("grep", r#"{"pattern":"x","path":"."}"#).0, "Grep");
-        assert_eq!(tool("todo_write", r#"{"todos":[]}"#).0, "TodoWrite");
+        assert_eq!(
+            tool(
+                "todo_write",
+                r#"{"todos":[{"id":"1","content":"a","status":"pending"}]}"#
+            )
+            .0,
+            "TodoWrite"
+        );
+        assert_eq!(
+            tool(
+                "todo_write",
+                r#"{"merge":true,"todos":[{"id":"1","status":"completed"}]}"#
+            )
+            .0,
+            "todo_write"
+        );
     }
 
     #[test]
