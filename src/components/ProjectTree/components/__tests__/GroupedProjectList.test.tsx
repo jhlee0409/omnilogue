@@ -67,6 +67,8 @@ describe("GroupedProjectList", () => {
     timeGroups?: TimeGroup[];
     worktreeGroups?: WorktreeGroup[];
     expandedProjects?: Set<string>;
+    selectedProject?: ClaudeProject;
+    expanded?: boolean;
   }) {
     const setExpandedProjects = vi.fn();
     render(
@@ -77,12 +79,12 @@ describe("GroupedProjectList", () => {
         timeGroups={options.timeGroups ?? []}
         worktreeGroups={options.worktreeGroups ?? []}
         sessions={[]}
-        selectedProject={null}
+        selectedProject={options.selectedProject ?? null}
         selectedSession={null}
         isLoading={false}
         expandedProjects={options.expandedProjects ?? new Set<string>()}
         setExpandedProjects={setExpandedProjects}
-        isProjectExpanded={() => false}
+        isProjectExpanded={() => options.expanded ?? false}
         handleProjectClick={options.handleProjectClick}
         handleContextMenu={vi.fn()}
         onSessionSelect={vi.fn()}
@@ -139,6 +141,27 @@ describe("GroupedProjectList", () => {
     }));
     renderList({ groupingMode: "none", project: projects[0]!, projects, handleProjectClick: vi.fn() });
     expect(screen.getAllByTestId(/^project-item-/)).toHaveLength(1);
+  });
+
+  // #5: an expanded merged row offers every assistant that shares the folder;
+  // choosing one opens that assistant's project.
+  it("lets an expanded merged row switch to another assistant's sessions", () => {
+    const claude = { ...createProject("/store/claude", "app"), actual_path: "/work/app" };
+    const codex = { ...createProject("/store/codex", "app"), actual_path: "/work/app", provider: "codex", session_count: 5 };
+    const handleProjectClick = vi.fn();
+    renderList({
+      groupingMode: "none",
+      project: claude,
+      projects: [claude, codex],
+      selectedProject: claude,
+      expanded: true,
+      handleProjectClick,
+    });
+
+    const chips = screen.getByRole("group", { name: "project.assistantsInFolder" }).querySelectorAll("button");
+    expect([...chips].map((chip) => chip.getAttribute("aria-pressed"))).toEqual(["true", "false"]);
+    fireEvent.click(chips[1]!);
+    expect(handleProjectClick).toHaveBeenCalledWith(codex);
   });
 
   it("chevron expands without opening; the row opens (directory mode)", () => {

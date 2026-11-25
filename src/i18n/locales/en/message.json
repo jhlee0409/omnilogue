@@ -17,6 +17,7 @@
   "message.system": "System",
   "message.user": "User",
   "messageContentDisplay.copyMessage": "Copy Message",
+  "messageContentDisplay.injectedContext": "Injected context",
   "messageContentDisplay.showLess": "Show less",
   "messageContentDisplay.showMore": "Show more...",
   "messageContentDisplay.showMoreRows": "Show {{count}} more rows...",

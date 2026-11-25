@@ -13,6 +13,8 @@ import type { GroupingStrategy, SessionSelectHandler } from "../types";
 import { cn } from "@/lib/utils";
 import { useAppStore } from "@/store/useAppStore";
 import { ProjectItem } from "./ProjectItem";
+import { ProviderDot } from "./ProviderDot";
+import { getProviderId, getProviderLabel } from "../../../utils/providers";
 import { ProjectSessions } from "./ProjectSessions";
 import { GroupHeader } from "./GroupHeader";
 import { folderKey, isProjectPathUnavailable, isProjectTemporary } from "../../../utils/pathUtils";
@@ -190,6 +192,48 @@ export const GroupedProjectList: React.FC<GroupedProjectListProps> = ({
           >
             {t("project.select")}
           </button>
+        )}
+        {/* Several assistants share this folder (one merged row): choose
+            whose sessions the row lists. Outside the tree item, as the
+            Select button is, so no control nests inside it. */}
+        {showSessions && providerSiblings.length > 0 && (
+          <div
+            role="group"
+            aria-label={t("project.assistantsInFolder")}
+            className="flex flex-wrap gap-1 py-1 pl-8 pr-2"
+          >
+            {[project, ...providerSiblings]
+              .map((p) => ({
+                p,
+                label: getProviderLabel((key, fallback) => t(key, fallback), getProviderId(p.provider)),
+              }))
+              .sort((a, b) => a.label.localeCompare(b.label))
+              .map(({ p, label }) => {
+                const name = p.custom_directory_label ? `${label} (${p.custom_directory_label})` : label;
+                const active = isOpen && p.path === project.path;
+                return (
+                  <button
+                    key={p.path}
+                    type="button"
+                    aria-pressed={active}
+                    title={t("project.switchProvider", { provider: name, count: p.session_count })}
+                    onClick={() => {
+                      if (!active) clickProject(p, false);
+                    }}
+                    className={cn(
+                      "inline-flex h-5 items-center gap-1 rounded-full border px-2 text-caption",
+                      active
+                        ? "border-accent bg-accent/15 text-foreground"
+                        : "border-border text-muted-foreground hover:bg-muted hover:text-foreground"
+                    )}
+                  >
+                    <ProviderDot provider={p.provider} />
+                    <span>{name}</span>
+                    <span className="tabular-nums">{p.session_count}</span>
+                  </button>
+                );
+              })}
+          </div>
         )}
         {showSessions && (
           <ProjectSessions
