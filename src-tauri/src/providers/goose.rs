@@ -595,11 +595,21 @@ fn map_content_item(item: &Value) -> Option<Value> {
 }
 
 /// The tool name inside a decode-failure message. Goose's OpenAI/Databricks
-/// formats word it `Tool arguments for <name> (id <id>) ...` (the error is
-/// stored as `<code>: <message>`); other failures never name the tool.
+/// formats word it `Tool arguments for <name> (id <id>) ...`; the error is
+/// stored as `<code>: <message>` (the code may repeat). Only a message that
+/// *starts* with that wording names the tool: truncation errors end in the
+/// model's raw arguments (`cut off at: <arguments>`), which may hold any text.
 fn errored_call_name<'a>(error: &'a str, id: &str) -> Option<&'a str> {
     const PREFIX: &str = "Tool arguments for ";
-    let rest = &error[error.find(PREFIX)? + PREFIX.len()..];
+    let mut message = error;
+    while let Some((code, tail)) = message.split_once(": ") {
+        let digits = code.strip_prefix('-').unwrap_or(code);
+        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            break;
+        }
+        message = tail;
+    }
+    let rest = message.strip_prefix(PREFIX)?;
     let (name, tail) = rest.split_once(" (id ")?;
     let tail = tail.strip_prefix(id)?;
     (tail.starts_with(')') && !name.is_empty() && !name.contains(char::is_whitespace))
@@ -970,6 +980,14 @@ mod tests {
             "toolCall": {"status": "error", "error": "Tool arguments for shell (id call_1) must be a JSON object"}
         });
         assert_eq!(map_content_item(&other).unwrap()["name"], "unknown");
+        // Truncated arguments quoting the wording do not name the tool
+        // (`cut off at: <arguments>`, goose-provider-types `json.rs:211`).
+        let quoted = json!({
+            "type": "toolRequest",
+            "id": "call_1",
+            "toolCall": {"status": "error", "error": "-32603: -32602: The model's response was truncated. Try again.\nReceived 40 characters; cut off at: {\"content\":\"Tool arguments for shell (id call_1)"}
+        });
+        assert_eq!(map_content_item(&quoted).unwrap()["name"], "unknown");
     }
 
     #[test]
