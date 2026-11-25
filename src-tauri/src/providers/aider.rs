@@ -49,7 +49,10 @@ pub fn scan_projects() -> Result<Vec<ClaudeProject>, String> {
             Ok(c) => c,
             Err(_) => continue,
         };
-        let sessions = split_sessions(&content);
+        let sessions: Vec<_> = split_sessions(&content)
+            .into_iter()
+            .filter(|s| !s.is_blank_preamble())
+            .collect();
         if sessions.is_empty() {
             continue;
         }
@@ -108,13 +111,16 @@ pub fn load_sessions(
     let mut sessions = Vec::with_capacity(sessions_data.len());
 
     for (index, session) in sessions_data.iter().enumerate().rev() {
+        if session.is_blank_preamble() {
+            continue;
+        }
         let blocks = parse_blocks(&session.content);
         let message_count = blocks.len();
         let summary = blocks
             .iter()
             .find(|b| b.role == BlockRole::User)
-            .and_then(|b| b.text.lines().next())
-            .map(str::to_string);
+            .and_then(|b| b.text.lines().find(|l| !l.trim().is_empty()))
+            .map(|l| l.trim().to_string());
         let timestamp = session.timestamp.clone().unwrap_or_default();
         let session_path = session_id_for(&history_file, index);
 
@@ -370,11 +376,24 @@ struct SessionData {
     content: String,
 }
 
+impl SessionData {
+    /// The blank line Aider writes before the first header. It is never
+    /// listed, but it keeps its slot so every real session keeps the index
+    /// (`aider://<file>#<index>`) that favorites, names and other saved
+    /// references to it are keyed by.
+    fn is_blank_preamble(&self) -> bool {
+        self.timestamp.is_none() && self.content.trim().is_empty()
+    }
+}
+
 /// Split the history into sessions on `# aider chat started at` headers.
 ///
 /// Aider writes the header with `datetime.now().strftime("%Y-%m-%d %H:%M:%S")`
 /// (`aider/io.py`, `InputOutput.__init__`), i.e. the machine's local wall
 /// clock with no zone information, so it is read in the local zone.
+///
+/// The text before the first header is the entry at index 0, which is
+/// [`SessionData::is_blank_preamble`] in a file Aider wrote; callers skip it.
 fn split_sessions(content: &str) -> Vec<SessionData> {
     split_sessions_in(content, &Local)
 }
@@ -386,9 +405,8 @@ fn split_sessions_in<Tz: TimeZone>(content: &str, tz: &Tz) -> Vec<SessionData> {
 
     for line in content.lines() {
         if let Some(ts_str) = line.strip_prefix(SESSION_HEADER_PREFIX) {
-            // Save previous session. A header always starts one, even when
-            // nothing follows it.
-            if current_timestamp.is_some() || !current_lines.is_empty() {
+            // Save previous session
+            if !current_lines.is_empty() {
                 sessions.push(SessionData {
                     timestamp: current_timestamp.take(),
                     content: current_lines.join("\n"),
@@ -396,15 +414,13 @@ fn split_sessions_in<Tz: TimeZone>(content: &str, tz: &Tz) -> Vec<SessionData> {
                 current_lines.clear();
             }
             current_timestamp = Some(header_timestamp(ts_str, tz));
-        } else if !current_lines.is_empty() || !line.trim().is_empty() {
-            // Aider writes `\n# aider chat started at ...`, so the file opens
-            // with a blank line that belongs to no session.
+        } else {
             current_lines.push(line);
         }
     }
 
     // Last session
-    if current_timestamp.is_some() || !current_lines.is_empty() {
+    if !current_lines.is_empty() {
         sessions.push(SessionData {
             timestamp: current_timestamp,
             content: current_lines.join("\n"),
@@ -451,28 +467,46 @@ fn strip_hard_break(text: &str) -> &str {
     text.strip_suffix("  ").unwrap_or(text)
 }
 
+/// A prompt keeps its first line's indentation; only leading blank lines
+/// (which render nothing) and trailing whitespace are dropped.
+fn user_body(text: &str) -> &str {
+    let body = text.trim_end();
+    let start = body
+        .find(|c: char| !c.is_whitespace())
+        .map_or(0, |first| body[..first].rfind('\n').map_or(0, |nl| nl + 1));
+    &body[start..]
+}
+
 /// Group a session's lines into messages.
 ///
 /// Producer format (`aider/io.py`):
 /// - `user_input` writes one `#### ` line per input line (a blank input line
 ///   is `####` plus spaces), so adjacent `#### ` lines are one prompt.
 /// - `ai_output` writes `"\n" + reply + "\n\n"`: a reply is always set off by
-///   blank lines.
-/// - `tool_output` writes `"> " + text` once, so a multi-line message only has
-///   its first line prefixed (`append_chat_history`); the following lines
-///   have no marker but also no blank line before them.
+///   blank lines, so a `> ` line glued to reply text is a markdown quote inside
+///   the reply, not a tool message.
+/// - `tool_output` writes `"> " + text + "  \n"` once, so a multi-line message
+///   only has its first line prefixed and only its last line ends in the
+///   two-space hard break (`append_chat_history`); the lines in between have
+///   no marker and no blank line before them.
 fn parse_blocks(content: &str) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut role: Option<BlockRole> = None;
     let mut text = String::new();
+    // The last tool line lacked the hard break, so the message continues.
+    let mut tool_open = false;
 
     fn flush(blocks: &mut Vec<Block>, role: &mut Option<BlockRole>, text: &mut String) {
         if let Some(role) = role.take() {
-            let trimmed = text.trim();
-            if !trimmed.is_empty() {
+            let body = if role == BlockRole::User {
+                user_body(text)
+            } else {
+                text.trim()
+            };
+            if !body.trim().is_empty() {
                 blocks.push(Block {
                     role,
-                    text: trimmed.to_string(),
+                    text: body.to_string(),
                 });
             }
         }
@@ -491,15 +525,20 @@ fn parse_blocks(content: &str) -> Vec<Block> {
                 text.push_str(user_text);
             }
         } else if let Some(tool_text) = line.strip_prefix("> ") {
-            let tool_text = strip_hard_break(tool_text);
+            if role == Some(BlockRole::Assistant) && !text.ends_with('\n') {
+                // Markdown quote glued to reply text.
+                text.push('\n');
+                text.push_str(line);
+                continue;
+            }
             if role == Some(BlockRole::Tool) {
                 text.push('\n');
-                text.push_str(tool_text);
             } else {
                 flush(&mut blocks, &mut role, &mut text);
                 role = Some(BlockRole::Tool);
-                text.push_str(tool_text);
             }
+            text.push_str(strip_hard_break(tool_text));
+            tool_open = !line.ends_with("  ");
         } else if line.trim().is_empty() {
             if role == Some(BlockRole::Assistant) {
                 text.push('\n');
@@ -507,10 +546,11 @@ fn parse_blocks(content: &str) -> Vec<Block> {
                 // A blank line ends a prompt or a tool message.
                 flush(&mut blocks, &mut role, &mut text);
             }
-        } else if role == Some(BlockRole::Tool) {
+        } else if role == Some(BlockRole::Tool) && tool_open {
             // Unprefixed continuation of a multi-line tool message.
             text.push('\n');
             text.push_str(strip_hard_break(line));
+            tool_open = !line.ends_with("  ");
         } else if role == Some(BlockRole::Assistant) {
             text.push('\n');
             text.push_str(line);
@@ -666,16 +706,26 @@ mod tests {
         chrono::FixedOffset::east_opt(9 * 3600).unwrap()
     }
 
+    /// The sessions the app lists: everything but the blank preamble.
+    fn listed_sessions() -> Vec<SessionData> {
+        split_sessions_in(&real_history(), &kst())
+            .into_iter()
+            .filter(|s| !s.is_blank_preamble())
+            .collect()
+    }
+
     #[test]
-    fn leading_blank_line_is_not_a_session() {
-        let sessions = split_sessions_in(&real_history(), &kst());
-        assert_eq!(sessions.len(), 4, "one session per header");
-        assert!(sessions.iter().all(|s| s.timestamp.is_some()));
+    fn leading_blank_line_is_not_a_listed_session_but_keeps_its_slot() {
+        let all = split_sessions_in(&real_history(), &kst());
+        assert_eq!(all.len(), 5, "preamble + one session per header");
+        assert!(all[0].is_blank_preamble());
+        assert!(all[1..].iter().all(|s| s.timestamp.is_some()));
+        assert_eq!(listed_sessions().len(), 4);
     }
 
     #[test]
     fn header_time_is_local_wall_clock_converted_to_utc() {
-        let sessions = split_sessions_in(&real_history(), &kst());
+        let sessions = listed_sessions();
         assert_eq!(
             sessions[0].timestamp.as_deref(),
             Some("2026-11-25T03:35:26Z")
@@ -700,13 +750,16 @@ mod tests {
             .unwrap()
             .with_timezone(&Utc)
             .to_rfc3339_opts(SecondsFormat::Secs, true);
-        let sessions = split_sessions(&real_history());
+        let sessions: Vec<_> = split_sessions(&real_history())
+            .into_iter()
+            .filter(|s| !s.is_blank_preamble())
+            .collect();
         assert_eq!(sessions[0].timestamp.as_deref(), Some(expected.as_str()));
     }
 
     #[test]
     fn adjacent_prompt_lines_are_one_user_message() {
-        let sessions = split_sessions_in(&real_history(), &kst());
+        let sessions = listed_sessions();
         let messages = parse_messages(&sessions[2].content, "s", "t");
         let users: Vec<_> = texts(&messages)
             .into_iter()
@@ -721,7 +774,7 @@ mod tests {
 
     #[test]
     fn blank_prompt_line_is_a_paragraph_break() {
-        let sessions = split_sessions_in(&real_history(), &kst());
+        let sessions = listed_sessions();
         let messages = parse_messages(&sessions[3].content, "s", "t");
         let users: Vec<_> = texts(&messages)
             .into_iter()
@@ -736,7 +789,7 @@ mod tests {
 
     #[test]
     fn multi_line_banner_is_not_assistant_text() {
-        let sessions = split_sessions_in(&real_history(), &kst());
+        let sessions = listed_sessions();
         let messages = texts(&parse_messages(&sessions[2].content, "s", "t"));
         let kinds: Vec<_> = messages.iter().map(|(t, _)| t.as_str()).collect();
         // banner, prompt, reply, footer
@@ -751,7 +804,7 @@ mod tests {
 
     #[test]
     fn run_command_without_output_has_no_assistant_message() {
-        let sessions = split_sessions_in(&real_history(), &kst());
+        let sessions = listed_sessions();
         let kinds: Vec<_> = texts(&parse_messages(&sessions[1].content, "s", "t"))
             .into_iter()
             .map(|(t, _)| t)
@@ -768,6 +821,13 @@ mod tests {
 
         let sessions = load_sessions(&format!("aider://{}", project.display()), false).unwrap();
         assert_eq!(sessions.len(), 4);
+        // Index 0 is the blank line before the first header; real sessions
+        // keep the ids (indices) they always had.
+        let indices: Vec<_> = sessions
+            .iter()
+            .map(|s| s.session_id.rsplit('#').next().unwrap().to_string())
+            .collect();
+        assert_eq!(indices, ["4", "3", "2", "1"]);
         // load_sessions lists newest first.
         let counts: Vec<_> = sessions.iter().map(|s| s.message_count).collect();
         assert_eq!(counts, [4, 4, 3, 4]);
@@ -791,7 +851,7 @@ mod tests {
 
     #[test]
     fn test_parse_messages() {
-        let sessions = split_sessions_in(&real_history(), &kst());
+        let sessions = listed_sessions();
         let messages = parse_messages(&sessions[0].content, "test-session", "t");
 
         // banner, user, assistant, footer
@@ -802,6 +862,43 @@ mod tests {
         assert_eq!(messages[3].message_type, "system");
         assert_eq!(messages[0].subtype.as_deref(), Some("tool_output"));
         assert_eq!(messages[0].provider, Some("aider".to_string()));
+    }
+
+    #[test]
+    fn user_prompt_keeps_first_line_indentation_but_not_leading_blank_lines() {
+        let content = "####   \n####     print(1)  \n####   \n\nok";
+        let messages = texts(&parse_messages(content, "s", "t"));
+        assert_eq!(
+            messages[0],
+            ("user".to_string(), "    print(1)".to_string())
+        );
+        let blank = parse_messages("####   \n####   \n\nok", "s", "t");
+        assert_eq!(blank.len(), 1, "a blank prompt is not a message");
+    }
+
+    #[test]
+    fn markdown_quote_glued_to_a_reply_stays_in_the_reply() {
+        let content =
+            "#### why\n\nExplain:\n> quoted\ncontinued answer\n\n> Tokens: 1 sent, 2 received.  ";
+        let messages = texts(&parse_messages(content, "s", "t"));
+        let kinds: Vec<_> = messages.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(kinds, ["user", "assistant", "system"]);
+        assert_eq!(messages[1].1, "Explain:\n> quoted\ncontinued answer");
+    }
+
+    #[test]
+    fn tool_message_ends_at_its_hard_break() {
+        // The first line lacks the two spaces, so the next line continues it;
+        // once a line carries them the message is complete.
+        let content = "> first\nsecond  \nreply text";
+        let messages = texts(&parse_messages(content, "s", "t"));
+        assert_eq!(
+            messages,
+            [
+                ("system".to_string(), "first\nsecond".to_string()),
+                ("assistant".to_string(), "reply text".to_string()),
+            ]
+        );
     }
     #[test]
     fn test_parse_user_message() {
@@ -882,7 +979,7 @@ mod tests {
         let project = home.path().join("client").join("proj");
         let file = write_history(&project);
 
-        let messages = load_messages(&format!("aider://{}#0", file.display())).unwrap();
+        let messages = load_messages(&format!("aider://{}#1", file.display())).unwrap();
         assert!(!messages.is_empty());
         let sessions = load_sessions(&format!("aider://{}", project.display()), false).unwrap();
         assert!(!sessions.is_empty());
