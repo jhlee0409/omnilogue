@@ -452,7 +452,9 @@ fn resolve_manifest_chunks(session_dir: &Path) -> Option<ManifestChunks> {
         projection,
         projection_intact,
     };
-    if chunks.checkpoint.is_empty() && chunks.projection.is_empty() {
+    // A manifest whose projection list holds an invalid name is still a
+    // manifest: do not fall back to scanning unreferenced chunks.
+    if chunks.checkpoint.is_empty() && chunks.projection.is_empty() && chunks.projection_intact {
         None
     } else {
         Some(chunks)
@@ -2856,6 +2858,36 @@ mod tests {
         let kinds: Vec<&str> = messages.iter().map(|m| m.message_type.as_str()).collect();
         assert_eq!(kinds, ["user", "system", "assistant"]);
         assert!(block_text(&messages[2]).starts_with("The last line of"));
+    }
+
+    #[test]
+    /// A manifest that lists only invalid projection names (and no
+    /// checkpoint chunks) does not send the loader scanning unreferenced
+    /// chunks: the stale projection chunk on disk is not shown.
+    fn invalid_only_projection_names_do_not_scan_unreferenced_chunks() {
+        let temp = TempDir::new().expect("temp dir");
+        let (_cwd, session_dir) = write_store(
+            temp.path(),
+            &post_compaction_checkpoint(),
+            &full_projection(),
+        );
+        fs::write(
+            Path::new(&session_dir)
+                .join(GENERATIONS_DIR)
+                .join("0000000000000248")
+                .join(MANIFEST_FILE),
+            json!({
+                "manifest_version": 1,
+                "checkpoint": { "chunks": [] },
+                "projection_state": { "chunks": ["../p0"] },
+            })
+            .to_string(),
+        )
+        .expect("rewrite manifest");
+
+        let messages = load_messages_from_base_path(temp.path().to_str().unwrap(), &session_dir)
+            .expect("load messages");
+        assert!(messages.is_empty(), "unreferenced chunks are not scanned");
     }
 
     #[test]
