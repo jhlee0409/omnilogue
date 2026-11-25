@@ -170,7 +170,7 @@ lines below refer to that immutable baseline (unless labelled new).
 | Goose `goose.rs:421–447` | Missing/non-error status produces false, even opaque MCP results; mark derived. No new MCP success convention asserted. |
 | Z Code `zcode.rs:465–471` | Every non-failed/error status, including absent, produces false; mark derived. |
 | OpenHands `openhands.rs:331–334` | Observation comparison false is not recorded no-error; mark derived, retaining positive error mapping and legacy frontend guard. |
-| ForgeCode `forgecode.rs:890,1472–1479` | `extract_bool` uses `any()`, silently false for absent/unrecognized aliases; mark derived unless a boolean alias is present. Existing positive mappings retained. |
+| ForgeCode `forgecode.rs` `map_tool_message` | Reads `output.is_error` (`ToolOutputRecord`, `forge_repo` `conversation_record.rs`); a boolean is producer evidence, absent is derived false. A shell result's `exit_code="N"` attribute (`forge_app` `operation.rs:597–598` writes it, `forge_template` `element.rs:77–92` renders it; read only from the opening tag, where the record keeps `is_error:false` for a nonzero exit) with `N` not 0 gives derived true. Pinned `antinomyhq/forge@a22b4928`. |
 | Antigravity `antigravity.rs:354–359` | Hardcoded false on a **tool_use**, not a result; removed needless synthesized flag. No verdict change. |
 | Copilot CLI `copilot_cli.rs:1079,1092–1095` | Missing success default true was not emitted as false, but explicit true was dropped; now map only explicit booleans. |
 | Kimi Code `kimi_code.rs:863,946,1200–1202` | Parsing preserves optional booleans, serialization dropped false; now emit both. `:1009` interruption recovery is an existing synthetic **true**, not a fabricated success; unchanged. |

@@ -674,17 +674,17 @@ fn load_conversation_row(
 }
 
 /// Parse `ForgeCode` context JSON into a list of entry values.
+///
+/// `ForgeCode` stores the context as an object with a `messages` array
+/// (`ContextRecord`, `forge_repo` `conversation_record.rs`); it never writes a
+/// bare array.
 fn parse_context_entries(context_json: &str) -> Vec<Value> {
-    let Ok(value) = serde_json::from_str::<Value>(context_json) else {
+    let Ok(Value::Object(mut context)) = serde_json::from_str::<Value>(context_json) else {
         return Vec::new();
     };
 
-    match value {
-        Value::Array(entries) => entries,
-        Value::Object(mut object) => object
-            .remove("messages")
-            .and_then(|messages| messages.as_array().cloned())
-            .unwrap_or_default(),
+    match context.remove("messages") {
+        Some(Value::Array(entries)) => entries,
         _ => Vec::new(),
     }
 }
@@ -792,7 +792,8 @@ fn map_text_message(
 ) -> ClaudeMessage {
     let role = normalize_role(extract_role(payload).as_deref(), "user");
     let message_type = message_type_for_role(&role).to_string();
-    let content = build_text_message_content(payload);
+    let content =
+        user_prompt_content(&role, payload).or_else(|| build_text_message_content(payload));
 
     let mut message = build_provider_message(
         PROVIDER_ID,
@@ -814,6 +815,25 @@ fn map_text_message(
     }
 
     message
+}
+
+/// Return the prompt the user typed for a `ForgeCode` user message.
+///
+/// `content` is the prompt wrapped for the model (`<task>…</task>` or
+/// `<feedback>…</feedback>` plus `<system_date>`); the text as typed is
+/// `raw_content: {"Text": "…"}` (`EventValue::Text(UserPrompt)`, `forge_domain`
+/// `event.rs`). A `Command` raw content has no typed text, so the wrapped
+/// content is kept.
+fn user_prompt_content(role: &str, payload: &Value) -> Option<Value> {
+    if role != "user" {
+        return None;
+    }
+    payload
+        .get("raw_content")?
+        .get("Text")?
+        .as_str()
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| Value::String(text.to_string()))
 }
 
 /// Map an image-style `ForgeCode` context entry into a message.
@@ -852,7 +872,13 @@ fn map_image_message(
     message
 }
 
-/// Map a tool-style `ForgeCode` context entry into a message.
+/// Map a tool-result `ForgeCode` context entry into a user message holding one
+/// `tool_result` block.
+///
+/// `ForgeCode` records `{name, call_id, output:{is_error, values:[...]}}`
+/// (`ToolResultRecord`, `ToolOutputRecord`, `ToolValueRecord`) and never writes
+/// a tool call in a tool entry: calls live in the assistant text entry's
+/// `tool_calls`. The result is paired with its call through `call_id`.
 fn map_tool_message(
     workspace_id: &str,
     conversation_id: &str,
@@ -861,116 +887,146 @@ fn map_tool_message(
     timestamp: String,
     model: Option<String>,
 ) -> ClaudeMessage {
-    let role_hint = extract_role(payload);
-    let tool_name = extract_string(payload, &["name", "tool_name", "toolName"])
-        .unwrap_or_else(|| "tool".to_string());
-    let tool_use_id = extract_string(payload, &["tool_use_id", "toolUseId", "id"])
+    let tool_name = extract_string(payload, &["name"]).unwrap_or_else(|| "tool".to_string());
+    let tool_use_id = extract_string(payload, &["call_id"])
         .unwrap_or_else(|| message_uuid(workspace_id, conversation_id, index));
-    let tool_input = extract_json(payload, &["input", "arguments", "args", "params"])
-        .or_else(|| extract_json(payload, &["payload"]))
-        .unwrap_or(Value::Null);
-    let tool_result_content =
-        extract_json(payload, &["tool_result", "toolResult", "result", "output"])
-            .or_else(|| extract_json(payload, &["content"]));
-    let is_tool_result = matches!(role_hint.as_deref(), Some("tool"))
-        || matches!(role_hint.as_deref(), Some("user"))
-        || (tool_result_content.is_some() && tool_input.is_null());
-
-    if is_tool_result {
-        let mut message = build_provider_message(
-            PROVIDER_ID,
-            message_uuid(workspace_id, conversation_id, index),
-            conversation_id,
-            timestamp,
-            "user",
-            Some("user"),
-            Some(Value::Array(vec![json!({
-                "type": "tool_result",
-                "tool_use_id": tool_use_id,
-                "content": tool_result_content.clone().unwrap_or_else(|| payload.clone()),
-                "name": tool_name,
-                "is_error": extract_bool(payload, &["is_error", "isError", "error"]),
-                // Missing/non-boolean aliases must not turn an any() default into no-error.
-                "is_error_source": if ["is_error", "isError", "error"].iter().any(|key| payload.get(key).and_then(Value::as_bool).is_some()) { "producer" } else { "derived" },
-            })])),
-            model,
-        );
-
-        message.tool_use_result = tool_result_content.or_else(|| Some(payload.clone()));
-        message.usage = extract_usage(payload);
-        message.cost_usd = extract_cost_usd(payload);
-        if let Some(metadata) = extract_safe_message_metadata(payload) {
-            attach_message_metadata(&mut message, "forgecodeMessageMetadata", metadata);
-        }
-        return message;
-    }
-
-    let mut blocks = Vec::new();
-    if let Some(text) = extract_text(payload) {
-        blocks.push(json!({
-            "type": "text",
-            "text": text,
-        }));
-    }
-
-    let tool_use_block = json!({
-        "type": "tool_use",
-        "id": tool_use_id,
-        "name": tool_name,
-        "input": tool_input,
-    });
-    blocks.push(tool_use_block.clone());
+    let output = payload.get("output").unwrap_or(&Value::Null);
+    let content = tool_output_content(output);
+    let producer_flag = output.get("is_error").and_then(Value::as_bool);
+    let failed_shell_exit = shell_failure_exit_code(&content).is_some();
+    let is_error_source =
+        if producer_flag == Some(true) || (producer_flag.is_some() && !failed_shell_exit) {
+            "producer"
+        } else {
+            "derived"
+        };
 
     let mut message = build_provider_message(
         PROVIDER_ID,
         message_uuid(workspace_id, conversation_id, index),
         conversation_id,
         timestamp,
-        "assistant",
-        Some("assistant"),
-        Some(Value::Array(blocks)),
+        "user",
+        Some("user"),
+        Some(Value::Array(vec![json!({
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": content,
+            "name": tool_name,
+            // A nonzero shell exit is still `is_error:false` in the record (the tool
+            // call itself succeeded); only the recorded exit marker reveals it.
+            "is_error": producer_flag.unwrap_or(false) || failed_shell_exit,
+            "is_error_source": is_error_source,
+        })])),
         model,
     );
 
-    message.tool_use = Some(tool_use_block);
-    message.usage = extract_usage(payload);
-    message.cost_usd = extract_cost_usd(payload);
     if let Some(metadata) = extract_safe_message_metadata(payload) {
         attach_message_metadata(&mut message, "forgecodeMessageMetadata", metadata);
     }
-
     message
 }
 
-/// Extract the `ForgeCode` context entry variant name.
-fn extract_context_variant(entry: &Value) -> (&'static str, &Value) {
-    if let Some(message) = entry.get("message") {
-        if let Some(text) = message.get("text") {
-            return ("text", text);
-        }
-        if let Some(tool) = message.get("tool") {
-            return ("tool", tool);
-        }
-        if let Some(image) = message.get("image") {
-            return ("image", image);
-        }
-    }
+/// Join the `values` of a `ForgeCode` tool output into `tool_result` content.
+///
+/// Text-only output becomes one string (an error result carries two text
+/// values); an output holding an image becomes a block array.
+fn tool_output_content(output: &Value) -> Value {
+    let blocks: Vec<Value> = output
+        .get("values")
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(tool_value_block).collect())
+        .unwrap_or_default();
 
-    if let Some(text) = entry.get("Text") {
+    let texts: Option<Vec<&str>> = blocks
+        .iter()
+        .map(|block| block.get("text").and_then(Value::as_str))
+        .collect();
+    match texts {
+        Some(texts) => Value::String(texts.join("\n")),
+        None => Value::Array(blocks),
+    }
+}
+
+/// Convert one `ToolValueRecord` into a content block; `Empty` yields none.
+///
+/// The record enum is externally tagged with `camelCase` variant names, so
+/// `AI` serializes as `aI`; `Markdown`, `FileDiff` and `Pair` are legacy
+/// variants the producer still reads from old rows and folds into text.
+fn tool_value_block(value: &Value) -> Option<Value> {
+    let text_block = |text: &str| Some(json!({ "type": "text", "text": text }));
+    let object = value.as_object()?;
+
+    if let Some(text) = object.get("text").and_then(Value::as_str) {
+        return text_block(text);
+    }
+    if let Some(text) = object.get("markdown").and_then(Value::as_str) {
+        return text_block(text);
+    }
+    if let Some(text) = object
+        .get("aI")
+        .or_else(|| object.get("ai"))
+        .and_then(|ai| ai.get("value"))
+        .and_then(Value::as_str)
+    {
+        return text_block(text);
+    }
+    if let Some(image) = object.get("image") {
+        return Some(json!({ "type": "image", "source": image.clone() }));
+    }
+    if let Some(path) = object
+        .get("fileDiff")
+        .and_then(|diff| diff.get("path"))
+        .and_then(Value::as_str)
+    {
+        return text_block(&format!("[File diff: {path}]"));
+    }
+    object
+        .get("pair")
+        .and_then(Value::as_array)
+        .and_then(|pair| pair.first())
+        .and_then(tool_value_block)
+}
+
+/// Return the nonzero exit code a `ForgeCode` shell result records.
+///
+/// The shell tool renders `<shell_output command=".." shell=".." exit_code="N">`
+/// with every attribute on its own line (`forge_app` `operation.rs` 597-598 writes
+/// `exit_code`; `forge_template` `element.rs` 77-92 renders the attributes) while
+/// the record's `is_error` stays false for a nonzero exit. The attribute is the
+/// last one before the `<stdout>` child, so it is read from the final line of
+/// the opening tag only, never from the command text or the captured output.
+fn shell_failure_exit_code(content: &Value) -> Option<i32> {
+    let text = content.as_str()?;
+    if !text.starts_with("<shell_output\n") {
+        return None;
+    }
+    let opening_tag = &text[..text.find("\n>\n<stdout")?];
+    let code = opening_tag
+        .lines()
+        .next_back()?
+        .strip_prefix("  exit_code=\"")?
+        .strip_suffix('"')?
+        .parse::<i32>()
+        .ok()?;
+    (code != 0).then_some(code)
+}
+
+/// Extract the `ForgeCode` context entry variant name.
+///
+/// Entries are `{"message":{"text"|"tool"|"image":{..}},"usage":{..}}`; the
+/// producer also reads its older unwrapped `{"text"|"tool"|"image":{..}}` form
+/// (`ContextMessageRecord` deserializer in `forge_repo` `conversation_record.rs`).
+fn extract_context_variant(entry: &Value) -> (&'static str, &Value) {
+    let message = entry.get("message").unwrap_or(entry);
+    if let Some(text) = message.get("text") {
         return ("text", text);
     }
-    if let Some(tool) = entry.get("Tool") {
+    if let Some(tool) = message.get("tool") {
         return ("tool", tool);
     }
-    if let Some(image) = entry.get("Image") {
+    if let Some(image) = message.get("image") {
         return ("image", image);
-    }
-    if let Some(kind) = entry.get("type").and_then(Value::as_str) {
-        return match kind.to_ascii_lowercase().as_str() {
-            "tool" => ("tool", entry),
-            "image" => ("image", entry),
-            _ => ("text", entry),
-        };
     }
 
     ("text", entry)
@@ -1472,31 +1528,6 @@ fn value_to_f64(value: &Value) -> Option<f64> {
     }
 }
 
-#[cfg(test)]
-#[test]
-fn outcome_preservation_missing_forgecode_flags_are_derived() {
-    let message = map_tool_message(
-        "w",
-        "c",
-        0,
-        &json!({"role":"tool","content":"synthetic"}),
-        String::new(),
-        None,
-    );
-    assert_eq!(message.content.unwrap()[0]["is_error_source"], "derived");
-}
-
-/// Extract a bool value from a JSON object key.
-fn extract_bool(value: &Value, keys: &[&str]) -> bool {
-    keys.iter().any(|key| {
-        value.get(key).is_some_and(|inner| match inner {
-            Value::Bool(boolean) => *boolean,
-            Value::String(text) => matches!(text.as_str(), "true" | "error" | "failed"),
-            _ => false,
-        })
-    })
-}
-
 /// Resolve the preferred `ForgeCode` workspace display name from aggregated rows.
 fn resolve_workspace_display_name_from_rows(
     workspace_id: &str,
@@ -1901,174 +1932,173 @@ mod tests {
         }
     }
 
-    /// Create a temporary `ForgeCode` test database.
+    /// Workspace id as `ForgeCode` stores it: a 64-bit hash in a `BIGINT` column.
+    const WORKSPACE: &str = "8945904052846126217";
+    /// Second workspace for grouping tests.
+    const OTHER_WORKSPACE: &str = "1844674407370955161";
+    /// Conversation id of the tool session captured from `@antinomyhq/forge` 2.13.21.
+    const TOOL_SESSION: &str = "22703e47-7aae-42e9-8b45-30626ad9e2f6";
+    /// Conversation id of the second captured session (text only).
+    const TEXT_SESSION: &str = "315d1b00-062b-46fc-beb4-e64a7164e0cd";
+
+    /// Context entries copied from a session written by `@antinomyhq/forge`
+    /// 2.13.21 (one record per line): system information, a `<task>` prompt, a
+    /// `read` call and result, a `<feedback>` prompt, a `shell` call whose result
+    /// exits 1 with `is_error:false`, a final reply, and a `read` of a missing
+    /// file whose result has `is_error:true` and two values. Paths are rewritten
+    /// to `/home/user/demo`, long system text and stderr are trimmed.
+    const TOOL_SESSION_ENTRIES: &str = r#"{"message":{"text":{"role":"System","content":"<system_information>\n<operating_system>macos</operating_system>\n<current_working_directory>/home/user/demo</current_working_directory>\n<default_shell>/bin/sh</default_shell>\n<home_directory>/home/user</home_directory>\n<file_list>\n - src/\n - package.json\n - test.js\n</file_list>\n<workspace_extensions command=\"git ls-files\" files=\"3\" extensions=\"2\">\n - .js: 2 files (67%)\n - .json: 1 files (33%)\n</workspace_extensions>\n</system_information>","model":"qwen2.5-coder:7b"}}}
+{"message":{"text":{"role":"User","content":"<task>Read src/math.js and add a function mul(a, b) that returns a*b, exported like add.</task>\n<system_date>2026-11-25</system_date>\n","raw_content":{"Text":"Read src/math.js and add a function mul(a, b) that returns a*b, exported like add."},"model":"qwen2.5-coder:7b"}}}
+{"message":{"text":{"role":"Assistant","content":"","tool_calls":[{"name":"read","call_id":"call_168106ba","arguments":{"file_path":"/home/user/demo/src/math.js"}}],"model":"qwen2.5-coder:7b"}},"usage":{"prompt_tokens":{"actual":100},"completion_tokens":{"actual":20},"total_tokens":{"actual":120},"cached_tokens":{"actual":0}}}
+{"message":{"tool":{"name":"read","call_id":"call_168106ba","output":{"is_error":false,"values":[{"text":"<file\n  path=\"/home/user/demo/src/math.js\"\n  display_lines=\"1-2000\"\n  total_lines=\"4\"\n><![CDATA[1:function add(a, b) {\n2:  return a + b;\n3:}\n4:module.exports = { add };]]>\n</file>"}]}}}}
+{"message":{"text":{"role":"User","content":"<feedback>Run npm test and tell me why it fails.</feedback>\n<system_date>2026-11-25</system_date>\n","raw_content":{"Text":"Run npm test and tell me why it fails."},"model":"qwen2.5-coder:7b"}}}
+{"message":{"text":{"role":"Assistant","content":"","tool_calls":[{"name":"shell","call_id":"call_d338cce3","arguments":{"command":"npm test","cwd":"/home/user/demo"}}],"model":"qwen2.5-coder:7b"}},"usage":{"prompt_tokens":{"actual":100},"completion_tokens":{"actual":20},"total_tokens":{"actual":120},"cached_tokens":{"actual":0}}}
+{"message":{"tool":{"name":"shell","call_id":"call_d338cce3","output":{"is_error":false,"values":[{"text":"<shell_output\n  command=\"npm test\"\n  shell=\"/bin/sh\"\n  exit_code=\"1\"\n>\n<stdout\n  total_lines=\"4\"\n><![CDATA[\n> demo@1.0.0 test\n> node test.js\n]]>\n</stdout>\n<stderr\n  total_lines=\"25\"\n><![CDATA[node:assert:95\n  throw new AssertionError(obj);\n  ^\n\nAssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n\n4 !== 5\n]]>\n</stderr>\n</shell_output>"}]}}}}
+{"message":{"text":{"role":"Assistant","content":"`npm test` fails because test.js asserts add(2, 2) === 5, but add(2, 2) returns 4.","model":"qwen2.5-coder:7b"}},"usage":{"prompt_tokens":{"actual":110},"completion_tokens":{"actual":20},"total_tokens":{"actual":130},"cached_tokens":{"actual":0}}}
+{"message":{"text":{"role":"User","content":"<feedback>Read the file missing.txt</feedback>\n<system_date>2026-11-25</system_date>\n","raw_content":{"Text":"Read the file missing.txt"},"model":"qwen2.5-coder:7b"}}}
+{"message":{"text":{"role":"Assistant","content":"","tool_calls":[{"name":"read","call_id":"call_46263e5d","arguments":{"file_path":"/home/user/demo/missing.txt"}}],"model":"qwen2.5-coder:7b"}},"usage":{"prompt_tokens":{"actual":100},"completion_tokens":{"actual":20},"total_tokens":{"actual":120},"cached_tokens":{"actual":0}}}
+{"message":{"tool":{"name":"read","call_id":"call_46263e5d","output":{"is_error":true,"values":[{"text":"<tool_call_error>\n<cause><![CDATA[Failed to get metadata for file /home/user/demo/missing.txt\n\nCaused by:\n    0: No such file or directory (os error 2)]]></cause>\n<reflection>You must now deeply reflect on the error above:\n1. Pinpoint exactly what was wrong with the tool call — was it the wrong tool, incorrect or missing parameters, or malformed structure?\n2. Explain why that mistake happened. Did you misunderstand the tool's schema? Miss a required field? Misread the context?\n3. Make the correct tool call as it should have been made.\n\nDo NOT skip this reflection.</reflection>\n</tool_call_error>"},{"text":"<retry>Tool call failed\n- **Attempts remaining:** 2\n- **Next steps:** Analyze the error, identify the root cause, and adjust your approach before retrying.</retry>"}]}}}}
+{"message":{"text":{"role":"Assistant","content":"The file missing.txt does not exist.","model":"qwen2.5-coder:7b"}},"usage":{"prompt_tokens":{"actual":110},"completion_tokens":{"actual":20},"total_tokens":{"actual":130},"cached_tokens":{"actual":0}}}"#;
+
+    /// The `metrics` column of the captured tool session.
+    const TOOL_SESSION_METRICS: &str = r#"{"started_at":"2026-11-25T03:41:14.757220Z","files_changed":{"/home/user/demo/src/math.js":{"lines_added":4,"lines_removed":1,"content_hash":"07a88a323565db77cfb6b5cf7035565aef7451b5fe9209f9666d3e22b714c766","tool":"patch"},"/home/user/demo/test.js":{"lines_added":0,"lines_removed":0,"content_hash":"e2fe857781414a1d0b3dd9d86383499df001b05c3feb3fca3ec31388c17d683e","tool":"read"}},"files_accessed":["/home/user/demo/test.js","/home/user/demo/src/math.js"]}"#;
+
+    /// Parse the captured tool-session entries.
+    fn tool_session_entries() -> Vec<Value> {
+        TOOL_SESSION_ENTRIES
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("fixture record is JSON"))
+            .collect()
+    }
+
+    /// Wrap entries in the context object `ForgeCode` stores.
+    fn context_json(conversation_id: &str, entries: &[Value]) -> String {
+        json!({ "conversation_id": conversation_id, "messages": entries }).to_string()
+    }
+
+    /// Entries of a minimal session: one prompt, one `shell` call run in `cwd`.
+    fn shell_session_entries(prompt: &str, cwd: &str) -> Vec<Value> {
+        vec![
+            json!({"message": {"text": {
+                "role": "User",
+                "content": format!("<task>{prompt}</task>\n<system_date>2026-11-25</system_date>\n"),
+                "raw_content": {"Text": prompt},
+            }}}),
+            json!({"message": {"text": {
+                "role": "Assistant",
+                "content": "",
+                "tool_calls": [{
+                    "name": "shell",
+                    "call_id": "call_0001",
+                    "arguments": {"command": "ls", "cwd": cwd},
+                }],
+            }}}),
+        ]
+    }
+
+    /// Create a temporary `ForgeCode` test database with the real schema
+    /// (`conversations` table from the 2.13.21 migrations).
     fn create_test_db(tmp: &TempDir) -> Connection {
         let db_path = tmp.path().join(".forge.db");
         let conn = Connection::open(db_path).expect("create forgecode test db");
         conn.execute_batch(
             "CREATE TABLE conversations (
-                id TEXT PRIMARY KEY,
-                workspace_id TEXT NOT NULL,
+                conversation_id TEXT PRIMARY KEY NOT NULL,
                 title TEXT,
+                workspace_id BIGINT NOT NULL,
                 context TEXT,
-                metrics TEXT,
-                created_at TEXT,
-                updated_at TEXT
+                created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP,
+                metrics TEXT
             );",
         )
         .expect("create conversations table");
         conn
     }
 
+    /// Insert one conversation row.
+    #[allow(clippy::too_many_arguments)]
+    fn insert_conversation(
+        conn: &Connection,
+        id: &str,
+        workspace_id: &str,
+        title: Option<&str>,
+        context: Option<&str>,
+        metrics: Option<&str>,
+        created_at: &str,
+        updated_at: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO conversations (conversation_id, workspace_id, title, context, metrics, created_at, updated_at)
+             VALUES (?1, CAST(?2 AS BIGINT), ?3, ?4, ?5, ?6, ?7)",
+            params![id, workspace_id, title, context, metrics, created_at, updated_at],
+        )
+        .unwrap();
+    }
+
     /// Seed the temporary `ForgeCode` test database with fixture rows.
     fn seed_test_data(conn: &Connection) {
-        conn.execute(
-            "INSERT INTO conversations (id, workspace_id, title, context, metrics, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                "conv-001",
-                "workspace-alpha",
-                "Text and tool session",
-                serde_json::to_string(&json!({
-                    "conversation_id": "conv-001",
-                    "cwd": "/Users/christian/projects/banana-prompting-service",
-                    "messages": [
-                        {
-                            "Text": {
-                                "role": "user",
-                                "content": "Inspect src/main.rs",
-                                "timestamp": "2026-01-10T08:00:00Z"
-                            }
-                        },
-                        {
-                            "message": {
-                                "text": {
-                                    "role": "User",
-                                    "content": "Check the current parser output"
-                                }
-                            },
-                            "timestamp": "2026-01-10T08:00:03Z"
-                        },
-                        {
-                            "message": {
-                                "text": {
-                                    "role": "Assistant",
-                                    "content": "",
-                                    "tool_calls": [
-                                        {
-                                            "name": "Read",
-                                            "call_id": "tool-123",
-                                            "arguments": { "file_path": "/tmp/src/main.rs" }
-                                        }
-                                    ],
-                                    "model": "forge-model-v1"
-                                }
-                            },
-                            "usage": {
-                                "prompt_tokens": { "actual": 120 },
-                                "completion_tokens": { "actual": 45 },
-                                "cached_tokens": { "actual": 30 },
-                                "cost": 0.125
-                            }
-                        },
-                        {
-                            "message": {
-                                "tool": {
-                                    "name": "Read",
-                                    "call_id": "tool-123",
-                                    "output": { "content": "fn main() {}", "is_error": false }
-                                }
-                            },
-                            "timestamp": "2026-01-10T08:00:06Z"
-                        },
-                        {
-                            "Text": {
-                                "role": "assistant",
-                                "content": [
-                                    { "type": "text", "text": "Done" },
-                                    { "type": "tool_use", "id": "tool-456", "name": "Write", "input": { "file_path": "/tmp/out.rs" } }
-                                ],
-                                "model": "forge-model-v1",
-                                "usage": {
-                                    "prompt_tokens": 120,
-                                    "completion_tokens": 45,
-                                    "cached_tokens": 30,
-                                    "cost": 0.125
-                                },
-                                "related_conversation_ids": ["conv-009"],
-                                "timestamp": "2026-01-10T08:00:10Z"
-                            }
-                        }
-                    ]
-                }))
-                .unwrap(),
-                serde_json::to_string(&json!({
-                    "session_start_time": "2026-01-10T08:00:00Z",
-                    "file_operations": 2,
-                    "files_accessed": ["/tmp/src/main.rs", "/tmp/out.rs"],
-                    "relatedConversationIds": ["conv-002", "conv-003"]
-                }))
-                .unwrap(),
-                "2026-01-10T08:00:00Z",
-                "2026-01-10T08:00:10Z"
-            ],
-        )
-        .unwrap();
+        let entries = tool_session_entries();
+        insert_conversation(
+            conn,
+            TOOL_SESSION,
+            WORKSPACE,
+            Some("Mock tool session"),
+            Some(&context_json(TOOL_SESSION, &entries)),
+            Some(TOOL_SESSION_METRICS),
+            "2026-11-25 03:38:50.911065",
+            "2026-11-25 03:41:14.905489",
+        );
 
-        conn.execute(
-            "INSERT INTO conversations (id, workspace_id, title, context, metrics, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                "conv-002",
-                "workspace-beta",
-                "Image session",
-                serde_json::to_string(&json!([
-                    {
-                        "cwd": "/Users/christian/projects/forge-image-lab",
-                        "Image": {
-                            "role": "user",
-                            "source": { "mime_type": "image/png", "path": "/tmp/screenshot.png" },
-                            "timestamp": "2026-01-11T09:15:00Z"
-                        }
-                    }
-                ]))
-                .unwrap(),
-                Value::Null.to_string(),
-                "2026-01-11T09:15:00Z",
-                "2026-01-11T09:15:00Z"
-            ],
-        )
-        .unwrap();
+        // Text-only session: system information, the prompt, a plain reply.
+        let text_entries = [entries[0].clone(), entries[1].clone(), entries[7].clone()];
+        insert_conversation(
+            conn,
+            TEXT_SESSION,
+            WORKSPACE,
+            Some("Math Library: Implement a multiply function"),
+            Some(&context_json(TEXT_SESSION, &text_entries)),
+            Some(r#"{"started_at":"2026-11-25T03:37:13.405476Z","files_changed":{}}"#),
+            "2026-11-25 03:33:13.465471",
+            "2026-11-25 03:37:37.174669",
+        );
 
-        conn.execute(
-            "INSERT INTO conversations (id, workspace_id, title, context, metrics, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                "conv-null",
-                "workspace-alpha",
-                "Ignored null context",
-                Option::<String>::None,
-                Option::<String>::None,
-                "2026-01-09T08:00:00Z",
-                "2026-01-09T08:00:00Z"
-            ],
-        )
-        .unwrap();
+        // A second workspace.
+        insert_conversation(
+            conn,
+            "0b3f6c1e-6f43-4c5e-9d57-0d4a8f5b2c11",
+            OTHER_WORKSPACE,
+            Some("Lab session"),
+            Some(&context_json(
+                "0b3f6c1e-6f43-4c5e-9d57-0d4a8f5b2c11",
+                &shell_session_entries("list the files", "/home/user/lab"),
+            )),
+            None,
+            "2026-11-24 09:15:00.000000",
+            "2026-11-24 09:15:00.000000",
+        );
 
-        conn.execute(
-            "INSERT INTO conversations (id, workspace_id, title, context, metrics, created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                "conv-bad",
-                "workspace-alpha",
-                "Malformed context",
-                "{not-json}",
-                Option::<String>::None,
-                "2026-01-12T10:00:00Z",
-                "2026-01-12T10:05:00Z"
-            ],
-        )
-        .unwrap();
+        insert_conversation(
+            conn,
+            "conv-null",
+            WORKSPACE,
+            Some("Ignored null context"),
+            None,
+            None,
+            "2026-11-23 08:00:00.000000",
+            "2026-11-23 08:00:00.000000",
+        );
+
+        insert_conversation(
+            conn,
+            "conv-bad",
+            WORKSPACE,
+            Some("Malformed context"),
+            Some("{not-json}"),
+            None,
+            "2026-11-25 10:00:00.000000",
+            "2026-11-25 10:05:00.000000",
+        );
     }
 
     #[test]
@@ -2109,6 +2139,31 @@ mod tests {
         assert_eq!(usage.cache_creation_input_tokens, Some(10));
     }
 
+    /// Load the messages of the captured tool session from a seeded database.
+    fn tool_session_messages() -> Vec<ClaudeMessage> {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = create_test_db(&tmp);
+        seed_test_data(&conn);
+        drop(conn);
+
+        load_messages_from_db(&tmp.path().to_string_lossy(), WORKSPACE, TOOL_SESSION).unwrap()
+    }
+
+    /// The first content block of `kind` in a message.
+    fn first_block<'a>(message: &'a ClaudeMessage, kind: &str) -> &'a Value {
+        message
+            .content
+            .as_ref()
+            .and_then(Value::as_array)
+            .and_then(|blocks| blocks.iter().find(|block| block["type"] == kind))
+            .unwrap_or_else(|| panic!("message has no {kind} block"))
+    }
+
+    /// Map one context entry the way a session load does.
+    fn map_entry(entry: &Value) -> ClaudeMessage {
+        map_context_message("w", "c", 0, entry, "", "")
+    }
+
     #[test]
     /// Verify `SQLite` scan projects groups rows by workspace.
     #[serial]
@@ -2122,23 +2177,23 @@ mod tests {
         let projects =
             scan_projects_from_db(&tmp.path().to_string_lossy(), &ScanReport::default()).unwrap();
         assert_eq!(projects.len(), 2);
-        assert_eq!(projects[0].name, "banana-prompting-service");
-        assert_eq!(projects[0].path, "forgecode://workspace/workspace-alpha");
+        assert_eq!(projects[0].name, "demo");
         assert_eq!(
-            projects[0].actual_path,
-            "/Users/christian/projects/banana-prompting-service"
+            projects[0].path,
+            format!("forgecode://workspace/{WORKSPACE}")
         );
-        assert_eq!(projects[0].session_count, 2);
-        assert_eq!(projects[0].message_count, 5);
+        assert_eq!(projects[0].actual_path, "/home/user/demo");
+        assert_eq!(projects[0].session_count, 3);
+        assert_eq!(projects[0].message_count, 15);
         assert_eq!(projects[0].storage_type, Some("sqlite".to_string()));
-        assert_eq!(projects[1].name, "forge-image-lab");
-        assert_eq!(projects[1].path, "forgecode://workspace/workspace-beta");
+        assert_eq!(projects[1].name, "lab");
         assert_eq!(
-            projects[1].actual_path,
-            "/Users/christian/projects/forge-image-lab"
+            projects[1].path,
+            format!("forgecode://workspace/{OTHER_WORKSPACE}")
         );
+        assert_eq!(projects[1].actual_path, "/home/user/lab");
         assert_eq!(projects[1].session_count, 1);
-        assert_eq!(projects[1].message_count, 1);
+        assert_eq!(projects[1].message_count, 2);
     }
 
     #[test]
@@ -2153,126 +2208,301 @@ mod tests {
 
         let sessions = load_sessions_from_db(
             &tmp.path().to_string_lossy(),
-            "workspace-alpha",
+            WORKSPACE,
             &ScanReport::default(),
         )
         .unwrap();
-        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions.len(), 3);
         assert_eq!(
             sessions[0].session_id,
-            "forgecode://workspace/workspace-alpha/conversation/conv-bad"
+            format!("forgecode://workspace/{WORKSPACE}/conversation/conv-bad")
         );
         assert_eq!(
             sessions[0].file_path,
-            "forgecode-db://workspace/workspace-alpha/conversation/conv-bad"
+            format!("forgecode-db://workspace/{WORKSPACE}/conversation/conv-bad")
         );
         assert_eq!(sessions[0].message_count, 0);
-        assert_eq!(sessions[0].project_name, "banana-prompting-service");
+        assert_eq!(sessions[0].project_name, "demo");
         assert!(!sessions[0].has_tool_use);
 
-        assert_eq!(sessions[1].actual_session_id, "conv-001");
-        assert_eq!(sessions[1].project_name, "banana-prompting-service");
-        assert_eq!(sessions[1].message_count, 5);
+        assert_eq!(sessions[1].actual_session_id, TOOL_SESSION);
+        assert_eq!(sessions[1].project_name, "demo");
+        assert_eq!(sessions[1].message_count, 12);
         assert!(sessions[1].has_tool_use);
-        assert_eq!(
-            sessions[1].summary,
-            Some("Text and tool session".to_string())
-        );
+        assert_eq!(sessions[1].summary, Some("Mock tool session".to_string()));
         assert_eq!(sessions[1].storage_type, Some("sqlite".to_string()));
+
+        assert_eq!(sessions[2].actual_session_id, TEXT_SESSION);
+        assert_eq!(sessions[2].message_count, 3);
+        assert!(!sessions[2].has_tool_use);
     }
 
     #[test]
-    /// Verify `SQLite` load messages maps text tool usage cost and metrics.
-    fn sqlite_load_messages_maps_text_tool_usage_cost_and_metrics() {
-        let tmp = tempfile::tempdir().unwrap();
-        let conn = create_test_db(&tmp);
-        seed_test_data(&conn);
-        drop(conn);
+    /// A tool result carries only `call_id`; it must pair with the assistant
+    /// `tool_calls[].call_id` it answers (issue #863 F2).
+    fn tool_results_pair_with_their_calls_by_call_id() {
+        let messages = tool_session_messages();
 
-        let messages =
-            load_messages_from_db(&tmp.path().to_string_lossy(), "workspace-alpha", "conv-001")
-                .unwrap();
+        for (call_index, result_index, call_id, name) in [
+            (2, 3, "call_168106ba", "read"),
+            (5, 6, "call_d338cce3", "shell"),
+            (9, 10, "call_46263e5d", "read"),
+        ] {
+            let call = first_block(&messages[call_index], "tool_use");
+            assert_eq!(call["id"], call_id);
+            assert_eq!(call["name"], name);
+            let result = first_block(&messages[result_index], "tool_result");
+            assert_eq!(result["tool_use_id"], call_id);
+            assert_eq!(result["name"], name);
+        }
+        assert_eq!(
+            messages[2].tool_use.as_ref().unwrap()["id"],
+            "call_168106ba"
+        );
+    }
 
-        assert_eq!(messages.len(), 5);
-        assert_eq!(messages[0].message_type, "user");
-        assert_eq!(
-            messages[0].content,
-            Some(Value::String("Inspect src/main.rs".to_string()))
-        );
+    #[test]
+    /// Result text is `output.values[].text`, not the whole `output` object, and
+    /// `output.is_error` is the producer flag (issue #863 F3).
+    fn tool_result_content_is_the_output_values_text() {
+        let messages = tool_session_messages();
+        let entries = tool_session_entries();
 
-        assert_eq!(messages[1].message_type, "user");
+        let read = first_block(&messages[3], "tool_result");
         assert_eq!(
-            messages[1].content,
-            Some(Value::String("Check the current parser output".to_string()))
+            read["content"],
+            entries[3]["message"]["tool"]["output"]["values"][0]["text"]
         );
+        assert!(read["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("<file\n  path="));
+        assert_eq!(read["is_error"], false);
+        assert_eq!(read["is_error_source"], "producer");
 
-        assert_eq!(messages[2].message_type, "assistant");
-        assert!(messages[2].tool_use.is_some());
-        assert_eq!(
-            messages[2]
-                .tool_use
-                .as_ref()
-                .and_then(|tool| tool.get("name"))
-                .and_then(Value::as_str),
-            Some("Read")
-        );
+        // An error result carries two text values, joined in order.
+        let error = first_block(&messages[10], "tool_result");
+        let text = error["content"].as_str().unwrap();
+        assert!(text.starts_with("<tool_call_error>\n<cause>"));
+        assert!(text.ends_with("</retry>"));
+        assert!(text.contains("</tool_call_error>\n<retry>Tool call failed"));
+        assert_eq!(error["is_error"], true);
+        assert_eq!(error["is_error_source"], "producer");
+    }
 
-        assert_eq!(messages[3].message_type, "user");
-        assert!(messages[3].tool_use_result.is_some());
+    #[test]
+    /// A failing `npm test` is `is_error:false` in the record; the shell result's
+    /// `exit_code="1"` attribute (`forge_app` `operation.rs` 597-598) marks it.
+    fn shell_result_with_nonzero_exit_is_an_error() {
+        let messages = tool_session_messages();
 
-        assert_eq!(messages[4].message_type, "assistant");
-        assert_eq!(messages[4].model, Some("forge-model-v1".to_string()));
-        assert_eq!(messages[4].cost_usd, Some(0.125));
+        let shell = first_block(&messages[6], "tool_result");
         assert_eq!(
-            messages[2].usage.as_ref().and_then(|u| u.input_tokens),
-            Some(90)
+            tool_session_entries()[6]["message"]["tool"]["output"]["is_error"],
+            false
         );
+        assert_eq!(shell["is_error"], true);
+        assert_eq!(shell["is_error_source"], "derived");
+        assert!(shell["content"]
+            .as_str()
+            .unwrap()
+            .contains("exit_code=\"1\""));
+    }
+
+    #[test]
+    /// Only the exit attribute in the opening `<shell_output>` tag counts, and a
+    /// zero exit stays a success.
+    fn shell_exit_marker_is_read_from_the_opening_tag_only() {
+        let entries = tool_session_entries();
+        let failing = entries[6]["message"]["tool"]["output"]["values"][0]["text"]
+            .as_str()
+            .unwrap();
         assert_eq!(
-            messages[2].usage.as_ref().and_then(|u| u.output_tokens),
-            Some(45)
-        );
-        assert_eq!(
-            messages[2]
-                .usage
-                .as_ref()
-                .and_then(|u| u.cache_read_input_tokens),
-            Some(30)
-        );
-        assert_eq!(
-            messages[4].usage.as_ref().and_then(|u| u.input_tokens),
-            Some(90)
-        );
-        assert_eq!(
-            messages[4].usage.as_ref().and_then(|u| u.output_tokens),
-            Some(45)
-        );
-        assert_eq!(
-            messages[4]
-                .usage
-                .as_ref()
-                .and_then(|u| u.cache_read_input_tokens),
-            Some(30)
-        );
-        assert!(messages[4].tool_use.is_some());
-        assert_eq!(
-            messages[4]
-                .data
-                .as_ref()
-                .and_then(|data| data.get("forgecodeMetrics"))
-                .and_then(|metrics| metrics.get("fileOperations"))
-                .and_then(Value::as_i64),
-            Some(2)
-        );
-        assert_eq!(
-            messages[4]
-                .data
-                .as_ref()
-                .and_then(|data| data.get("forgecodeMessageMetadata"))
-                .and_then(|metadata| metadata.get("relatedConversationIds"))
-                .and_then(Value::as_array)
-                .map(Vec::len),
+            shell_failure_exit_code(&Value::String(failing.to_string())),
             Some(1)
         );
+
+        let passing = failing.replace("exit_code=\"1\"", "exit_code=\"0\"");
+        assert_eq!(
+            shell_failure_exit_code(&Value::String(passing.clone())),
+            None
+        );
+
+        // Captured output that prints the marker does not turn a success into a failure.
+        let echoed = passing.replace("> node test.js", "> node test.js\n  exit_code=\"1\"");
+        assert_eq!(
+            shell_failure_exit_code(&Value::String(echoed.clone())),
+            None
+        );
+        let message = map_entry(&json!({"message": {"tool": {
+            "name": "shell",
+            "call_id": "call_echo",
+            "output": {"is_error": false, "values": [{"text": echoed}]},
+        }}}));
+        let block = first_block(&message, "tool_result");
+        assert_eq!(block["is_error"], false);
+        assert_eq!(block["is_error_source"], "producer");
+
+        // Other tools are never read for an exit code.
+        assert_eq!(
+            shell_failure_exit_code(&Value::String(
+                "<file>\n  exit_code=\"1\"\n>\n<stdout".into()
+            )),
+            None
+        );
+    }
+
+    #[test]
+    /// The prompt is the typed text from `raw_content.Text`, not the
+    /// `<task>`/`<feedback>` + `<system_date>` wrapper (issue #863 New).
+    fn user_prompt_is_the_typed_text_not_the_wrapped_content() {
+        let messages = tool_session_messages();
+
+        assert_eq!(messages[0].message_type, "system");
+        for (index, prompt) in [
+            (
+                1,
+                "Read src/math.js and add a function mul(a, b) that returns a*b, exported like add.",
+            ),
+            (4, "Run npm test and tell me why it fails."),
+            (8, "Read the file missing.txt"),
+        ] {
+            assert_eq!(messages[index].message_type, "user");
+            assert_eq!(messages[index].content, Some(Value::String(prompt.to_string())));
+        }
+    }
+
+    #[test]
+    /// Roles, model, usage and metrics of the captured entries.
+    fn sqlite_load_messages_maps_roles_usage_and_metrics() {
+        let messages = tool_session_messages();
+
+        assert_eq!(messages.len(), 12);
+        let types: Vec<&str> = messages.iter().map(|m| m.message_type.as_str()).collect();
+        assert_eq!(
+            types,
+            [
+                "system",
+                "user",
+                "assistant",
+                "user",
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+                "user",
+                "assistant",
+                "user",
+                "assistant"
+            ]
+        );
+        assert_eq!(messages[2].model, Some("qwen2.5-coder:7b".to_string()));
+        let usage = messages[2].usage.as_ref().unwrap();
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(20));
+        assert_eq!(
+            messages[7].content,
+            Some(Value::String(
+                "`npm test` fails because test.js asserts add(2, 2) === 5, but add(2, 2) returns 4."
+                    .to_string()
+            ))
+        );
+
+        let metrics = messages[11]
+            .data
+            .as_ref()
+            .and_then(|data| data.get("forgecodeMetrics"))
+            .unwrap();
+        assert_eq!(metrics["fileOperations"], 2);
+        assert_eq!(
+            metrics["sessionStartTime"],
+            "2026-11-25T03:41:14.757220+00:00"
+        );
+        assert_eq!(metrics["filesAccessed"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    /// Tool output values the producer can write besides `text`
+    /// (`ToolValueRecord` in `forge_repo` `conversation_record.rs`): `Empty` is
+    /// dropped, `AI` (serialized `aI`) contributes its value, an image keeps its
+    /// record in a block array.
+    fn tool_output_values_cover_the_producer_variants() {
+        let message = map_entry(&json!({"message": {"tool": {
+            "name": "task",
+            "call_id": "call_task",
+            "output": {"is_error": false, "values": [
+                {"text": "first"},
+                "empty",
+                {"aI": {"value": "sub-agent reply", "conversation_id": "0b3f6c1e-6f43-4c5e-9d57-0d4a8f5b2c11"}},
+            ]},
+        }}}));
+        assert_eq!(
+            first_block(&message, "tool_result")["content"],
+            "first\nsub-agent reply"
+        );
+
+        let image = json!({"url": "data:image/png;base64,iVBORw0KGgo=", "mime_type": "image/png"});
+        let message = map_entry(&json!({"message": {"tool": {
+            "name": "read",
+            "call_id": "call_img",
+            "output": {"is_error": false, "values": [{"text": "screenshot"}, {"image": image}]},
+        }}}));
+        assert_eq!(
+            first_block(&message, "tool_result")["content"],
+            json!([
+                {"type": "text", "text": "screenshot"},
+                {"type": "image", "source": image},
+            ])
+        );
+    }
+
+    #[test]
+    /// A context image entry is a user message holding the image record.
+    fn image_entry_maps_to_an_image_block() {
+        let image = json!({"url": "data:image/png;base64,iVBORw0KGgo=", "mime_type": "image/png"});
+        let message = map_entry(&json!({"message": {"image": image}}));
+
+        assert_eq!(message.message_type, "user");
+        assert_eq!(first_block(&message, "image")["source"], image);
+    }
+
+    #[test]
+    /// The producer also reads its older unwrapped `{"text"|"tool": ..}` entries
+    /// (`ContextMessageRecord` deserializer in `forge_repo` `conversation_record.rs`).
+    fn unwrapped_entries_map_like_wrapped_ones() {
+        let entries = tool_session_entries();
+        for index in [1, 2, 3] {
+            let wrapped = map_entry(&entries[index]);
+            let unwrapped = map_entry(&entries[index]["message"]);
+            assert_eq!(unwrapped.message_type, wrapped.message_type);
+            assert_eq!(unwrapped.content, wrapped.content);
+        }
+    }
+
+    #[test]
+    /// A command prompt has no typed text, so its wrapped content is kept.
+    fn command_prompt_keeps_its_content() {
+        let message = map_entry(&json!({"message": {"text": {
+            "role": "User",
+            "content": "<command>fixme</command>",
+            "raw_content": {"Command": {"name": "fixme", "template": "fix it", "parameters": []}},
+        }}}));
+
+        assert_eq!(
+            message.content,
+            Some(Value::String("<command>fixme</command>".to_string()))
+        );
+    }
+
+    #[test]
+    /// The context is an object with a `messages` array, never a bare array.
+    fn parse_context_entries_reads_only_the_messages_array() {
+        assert_eq!(
+            parse_context_entries(r#"{"messages":[{"message":{}}]}"#).len(),
+            1
+        );
+        assert_eq!(parse_context_entries(r#"[{"message":{}}]"#).len(), 0);
+        assert_eq!(parse_context_entries(r#"{"conversation_id":"c"}"#).len(), 0);
     }
 
     #[test]
@@ -2284,10 +2514,61 @@ mod tests {
         drop(conn);
 
         let messages =
-            load_messages_from_db(&tmp.path().to_string_lossy(), "workspace-alpha", "conv-bad")
-                .unwrap();
+            load_messages_from_db(&tmp.path().to_string_lossy(), WORKSPACE, "conv-bad").unwrap();
 
         assert!(messages.is_empty());
+    }
+
+    #[test]
+    /// `FORGE_CONFIG=<dir>` makes `<dir>/.forge.db` the transcript store
+    /// (`forge_config` `reader.rs` `resolve_base_path`, `forge_domain` `env.rs`
+    /// `database_path`).
+    #[serial]
+    fn forge_config_directory_holds_the_database() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conn = create_test_db(&tmp);
+        seed_test_data(&conn);
+        drop(conn);
+        let _guard = EnvGuard::set("FORGE_CONFIG", tmp.path());
+
+        assert_eq!(
+            get_base_path(),
+            Some(tmp.path().to_string_lossy().to_string())
+        );
+        let messages = load_messages(&format!(
+            "forgecode-db://workspace/{WORKSPACE}/conversation/{TOOL_SESSION}"
+        ))
+        .unwrap();
+        assert_eq!(messages.len(), 12);
+    }
+
+    #[test]
+    /// Extract workspace display name prefers cwd basename and ignores home dir.
+    #[serial]
+    fn extract_workspace_display_name_prefers_cwd_basename_and_ignores_home_dir() {
+        // The "home" entry has to be the home the code under test resolves, so
+        // it comes from the guard. `dirs::home_dir()` was the real one on
+        // Windows, which is not the home being ignored (#551).
+        let home = crate::test_utils::SandboxHome::new();
+        let context = json!({
+            "messages": [
+                {"message": {"text": {"role": "Assistant", "content": "", "tool_calls": [{
+                    "name": "shell",
+                    "call_id": "call_home",
+                    "arguments": {"command": "ls", "cwd": home.path().to_string_lossy().to_string()},
+                }]}}},
+                {"message": {"text": {"role": "Assistant", "content": "", "tool_calls": [{
+                    "name": "shell",
+                    "call_id": "call_demo",
+                    "arguments": {"command": "ls", "cwd": crate::test_utils::abs("home/user/demo")},
+                }]}}},
+            ]
+        });
+
+        assert_eq!(
+            extract_workspace_display_name_from_value(&context),
+            Some("demo".to_string())
+        );
     }
 
     #[test]
@@ -2306,43 +2587,6 @@ mod tests {
     }
 
     #[test]
-    /// Extract workspace display name prefers cwd basename and ignores home dir.
-    #[serial]
-    fn extract_workspace_display_name_prefers_cwd_basename_and_ignores_home_dir() {
-        // The "home" entry has to be the home the code under test resolves, so
-        // it comes from the guard. `dirs::home_dir()` was the real one on
-        // Windows, which is not the home being ignored (#551).
-        let home = crate::test_utils::SandboxHome::new();
-        let context = json!({
-            "messages": [
-                {
-                    "message": {
-                        "tool": {
-                            "arguments": {
-                                "cwd": home.path().to_string_lossy().to_string()
-                            }
-                        }
-                    }
-                },
-                {
-                    "message": {
-                        "tool": {
-                            "arguments": {
-                                "cwd": crate::test_utils::abs("Users/christian/projects/banana-prompting-service")
-                            }
-                        }
-                    }
-                }
-            ]
-        });
-
-        assert_eq!(
-            extract_workspace_display_name_from_value(&context),
-            Some("banana-prompting-service".to_string())
-        );
-    }
-
-    #[test]
     /// Verify `SQLite` search matches message content.
     fn sqlite_search_matches_message_content() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2350,25 +2594,31 @@ mod tests {
         seed_test_data(&conn);
         drop(conn);
 
-        let results = search_from_path(&tmp.path().to_string_lossy(), "parser", 10);
+        let base = tmp.path().to_string_lossy().to_string();
+        let results = search_from_path(&base, "tell me why", 10);
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].provider.as_deref(), Some("forgecode"));
-        assert_eq!(results[0].session_id, "conv-001");
+        assert_eq!(results[0].session_id, TOOL_SESSION);
         assert_eq!(
             results[0].uuid,
-            "forgecode://workspace/workspace-alpha/conversation/conv-001/message/1"
+            format!("forgecode://workspace/{WORKSPACE}/conversation/{TOOL_SESSION}/message/4")
         );
         assert_eq!(
             results[0].content,
-            Some(Value::String("Check the current parser output".to_string()))
+            Some(Value::String(
+                "Run npm test and tell me why it fails.".to_string()
+            ))
         );
         assert!(results.iter().all(|message| {
             message
                 .content
                 .as_ref()
-                .is_some_and(|content| search_json_value_case_insensitive(content, "parser"))
+                .is_some_and(|content| search_json_value_case_insensitive(content, "tell me why"))
         }));
+
+        // The model-facing wrapper is not part of what the user typed.
+        assert!(search_from_path(&base, "system_date", 10).is_empty());
     }
 
     #[test]
@@ -2379,24 +2629,31 @@ mod tests {
         let _home = crate::test_utils::SandboxHome::new();
         let tmp = tempfile::tempdir().unwrap();
         let conn = create_test_db(&tmp);
-        for (workspace, cwd) in [
-            ("ws-a", "/work/client-a/app"),
-            ("ws-b", "/work/client-b/app"),
+        for (workspace, conversation, cwd) in [
+            (
+                "1001",
+                "a1b2c3d4-0000-4000-8000-000000000001",
+                "/work/client-a/app",
+            ),
+            (
+                "1002",
+                "a1b2c3d4-0000-4000-8000-000000000002",
+                "/work/client-b/app",
+            ),
         ] {
-            conn.execute(
-                "INSERT INTO conversations (id, workspace_id, title, context, created_at, updated_at)
-                 VALUES (?1, ?2, 't', ?3, '2026-01-10T08:00:00Z', '2026-01-10T08:00:00Z')",
-                params![
-                    format!("conv-{workspace}"),
-                    workspace,
-                    serde_json::to_string(&json!({
-                        "cwd": cwd,
-                        "messages": [{"Text": {"role": "user", "content": "needle"}}]
-                    }))
-                    .unwrap(),
-                ],
-            )
-            .unwrap();
+            insert_conversation(
+                &conn,
+                conversation,
+                workspace,
+                Some("t"),
+                Some(&context_json(
+                    conversation,
+                    &shell_session_entries("needle", cwd),
+                )),
+                None,
+                "2026-11-25 08:00:00.000000",
+                "2026-11-25 08:00:00.000000",
+            );
         }
         drop(conn);
         let base = tmp.path().to_string_lossy().to_string();
@@ -2404,15 +2661,15 @@ mod tests {
         let projects = scan_projects_from_db(&base, &ScanReport::default()).unwrap();
         let results = search_from_path(&base, "needle", 10);
         assert_eq!(results.len(), 2);
-        for (workspace, cwd) in [
-            ("ws-a", "/work/client-a/app"),
-            ("ws-b", "/work/client-b/app"),
+        for (conversation, cwd) in [
+            ("a1b2c3d4-0000-4000-8000-000000000001", "/work/client-a/app"),
+            ("a1b2c3d4-0000-4000-8000-000000000002", "/work/client-b/app"),
         ] {
             let project = projects.iter().find(|p| p.actual_path == cwd).unwrap();
             assert_eq!(project.name, "app");
             let hit = results
                 .iter()
-                .find(|m| m.session_id == format!("conv-{workspace}"))
+                .find(|m| m.session_id == conversation)
                 .unwrap();
             assert_eq!(hit.project_path.as_deref(), Some(project.path.as_str()));
         }
@@ -2429,19 +2686,19 @@ mod tests {
 
         let result = rename_session_title_from_path(
             &tmp.path().to_string_lossy(),
-            "forgecode://workspace/workspace-alpha/conversation/conv-001",
+            &format!("forgecode://workspace/{WORKSPACE}/conversation/{TOOL_SESSION}"),
             "Updated Forge Title",
         )
         .unwrap();
 
-        assert_eq!(result.previous_title, "Text and tool session");
+        assert_eq!(result.previous_title, "Mock tool session");
         assert_eq!(result.new_title, "Updated Forge Title");
 
         let conn = open_db_read_write(&tmp.path().to_string_lossy()).unwrap();
         let title: String = conn
             .query_row(
-                "SELECT title FROM conversations WHERE id = 'conv-001'",
-                [],
+                "SELECT title FROM conversations WHERE conversation_id = ?1",
+                [TOOL_SESSION],
                 |row| row.get(0),
             )
             .unwrap();
@@ -2458,21 +2715,20 @@ mod tests {
 
         delete_conversation_from_path(
             &tmp.path().to_string_lossy(),
-            "forgecode-db://workspace/workspace-alpha/conversation/conv-001",
+            &format!("forgecode-db://workspace/{WORKSPACE}/conversation/{TOOL_SESSION}"),
         )
         .unwrap();
 
         let conn = open_db_read_write(&tmp.path().to_string_lossy()).unwrap();
         let count: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM conversations WHERE id = 'conv-001'",
-                [],
+                "SELECT COUNT(*) FROM conversations WHERE conversation_id = ?1",
+                [TOOL_SESSION],
                 |row| row.get(0),
             )
             .unwrap();
         assert_eq!(count, 0);
     }
-
     #[test]
     /// Parse conversation path accepts virtual session and file paths.
     fn parse_conversation_path_accepts_virtual_session_and_file_paths() {
