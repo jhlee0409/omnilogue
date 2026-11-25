@@ -1477,12 +1477,17 @@ fn convert_assistant_bubble(
             .get("status")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let raw_args = tool_data
-            .get("rawArgs")
-            .and_then(Value::as_str)
-            .unwrap_or("{}");
-        let args: Value =
-            serde_json::from_str(raw_args).unwrap_or(Value::Object(serde_json::Map::default()));
+        // `rawArgs` holds the call's arguments for most tools; newer tools
+        // (`edit_file_v2`) leave it null and record them in `params`.
+        let args = ["rawArgs", "params"]
+            .iter()
+            .filter_map(|key| tool_data.get(*key).and_then(Value::as_str))
+            .find_map(|raw| {
+                serde_json::from_str::<Value>(raw)
+                    .ok()
+                    .filter(Value::is_object)
+            })
+            .unwrap_or(Value::Object(serde_json::Map::default()));
 
         let mapped_name = map_cursor_tool_name(tool_name);
 
@@ -1493,13 +1498,22 @@ fn convert_assistant_bubble(
             "input": args
         }));
 
-        // Add text as result if present
-        if !text.is_empty() {
+        // Cursor records the tool's output in `toolFormerData.result`; older
+        // bubbles carried it as the bubble text.
+        let result = tool_data.get("result").and_then(Value::as_str);
+        let rejected = result
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .and_then(|parsed| parsed.get("rejected").and_then(Value::as_bool))
+            .unwrap_or(false);
+        let output = result
+            .map(cursor_tool_output)
+            .or_else(|| (!text.is_empty()).then(|| text.to_string()));
+        if let Some(output) = output {
             content_blocks.push(serde_json::json!({
                 "type": "tool_result",
                 "tool_use_id": tool_call_id,
-                "content": text,
-                "is_error": status == "error" || status == "rejected",
+                "content": output,
+                "is_error": rejected || status == "error" || status == "rejected",
                 "is_error_source": "derived"
             }));
         }
@@ -1533,6 +1547,20 @@ fn convert_assistant_bubble(
         Some(Value::Array(content_blocks)),
         Some("cursor".to_string()),
     ))
+}
+
+/// The readable output in a Cursor tool `result` (a JSON string): a file's
+/// `contents`, a command's `output`, or an edit's `resultForModel`; any other
+/// result is shown as recorded.
+fn cursor_tool_output(raw: &str) -> String {
+    serde_json::from_str::<Value>(raw)
+        .ok()
+        .and_then(|parsed| {
+            ["contents", "output", "resultForModel"]
+                .iter()
+                .find_map(|key| parsed.get(*key).and_then(Value::as_str).map(str::to_string))
+        })
+        .unwrap_or_else(|| raw.to_string())
 }
 
 fn extract_bubble_timestamp(bubble: &Value) -> String {
@@ -1825,6 +1853,55 @@ mod tests {
         assert_eq!(arr[0]["type"], "tool_use");
         assert_eq!(arr[0]["name"], "Read");
         assert_eq!(arr[1]["type"], "tool_result");
+    }
+
+    /// Current Cursor keeps a tool's output in `toolFormerData.result` (the
+    /// bubble text is empty) and, for some tools, its arguments only in
+    /// `params`.
+    #[test]
+    fn test_convert_tool_bubble_reads_result_and_params() {
+        let bubble = |tool: Value| json!({ "type": 2, "bubbleId": "asst-9", "text": "", "toolFormerData": tool });
+        let read = convert_cursor_bubble(
+            &bubble(json!({
+                "toolCallId": "call-1", "status": "completed", "name": "read_file",
+                "rawArgs": "{\"path\":\"src/a.ts\"}",
+                "result": "{\"contents\":\"export const a = 1;\",\"totalLinesInFile\":1}"
+            })),
+            2,
+            "session-1",
+        )
+        .unwrap();
+        let blocks = read.content.unwrap();
+        assert_eq!(blocks[1]["type"], "tool_result");
+        assert_eq!(blocks[1]["content"], "export const a = 1;");
+        assert_eq!(blocks[1]["is_error"], false);
+
+        let edit = convert_cursor_bubble(
+            &bubble(json!({
+                "toolCallId": "call-2", "status": "completed", "name": "edit_file_v2",
+                "rawArgs": null,
+                "params": "{\"relativeWorkspacePath\":\"src/a.ts\"}",
+                "result": "{\"beforeContentId\":\"x\",\"afterContentId\":\"y\"}"
+            })),
+            2,
+            "session-1",
+        )
+        .unwrap();
+        let blocks = edit.content.unwrap();
+        assert_eq!(blocks[0]["input"]["relativeWorkspacePath"], "src/a.ts");
+        assert_eq!(blocks[1]["type"], "tool_result");
+
+        let rejected = convert_cursor_bubble(
+            &bubble(json!({
+                "toolCallId": "call-3", "status": "completed", "name": "run_terminal_cmd",
+                "rawArgs": "{\"command\":\"rm -rf /\"}",
+                "result": "{\"rejected\":true}"
+            })),
+            2,
+            "session-1",
+        )
+        .unwrap();
+        assert_eq!(rejected.content.unwrap()[1]["is_error"], true);
     }
 
     #[test]
