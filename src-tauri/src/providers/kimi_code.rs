@@ -3,14 +3,17 @@
 //! `~/.kimi-code`, a sibling of the old CLI's `~/.kimi` root, and both
 //! layouts may coexist on one machine (antigravity/antigravity-cli pattern).
 //!
-//! Layout (from `packages/agent-core-v2` sources of the kimi-code repo):
+//! Layout (from `packages/agent-core-v2` sources of the kimi-code repo, checked
+//! against a real 2.7.3 store):
 //!
 //! ```text
 //! ~/.kimi-code/                       # KIMI_CODE_HOME overrides this root
-//! ├── workspaces.json                 # { "workspaces": { "wd_<hash>": { root, name, … } } }
+//! ├── projects.json                   # { "schema_version": 2, "projects": {
+//! │                                   #   "<workspace id>": { root, name, kind, … } } }
 //! └── sessions/
-//!     └── wd_<hash>/                  # one workspace directory
-//!         └── session_<uuid>/
+//!     ├── wd_<slug>_<hash12>/         # implicit workspace (`kimi` run in a directory)
+//!     └── wm_<uuid>/                  # managed workspace (desktop app / `kimi web`)
+//!         └── session_<uuid>/         # same layout under both prefixes
 //!             ├── state.json          # { id, version: 2, cwd, title, lastPrompt,
 //!             │                       #   createdAt, updatedAt, … }
 //!             └── agents/
@@ -69,7 +72,10 @@ const AGENTS_DIR: &str = "agents";
 const MAIN_AGENT: &str = "main";
 const WIRE_FILE: &str = "wire.jsonl";
 const STATE_FILE: &str = "state.json";
-const WORKSPACES_FILE: &str = "workspaces.json";
+const PROJECTS_FILE: &str = "projects.json";
+/// Directory prefixes of workspace ids: `wd_<slug>_<hash12>` (implicit) and
+/// `wm_<uuid>` (managed).
+const WORKSPACE_PREFIXES: [&str; 2] = ["wd_", "wm_"];
 /// Content-addressed store for pasted images, beside each agent's wire.
 const BLOBS_DIR: &str = "blobs";
 /// Largest blob inlined as base64 into a message (8 MiB). Bigger images are
@@ -117,7 +123,8 @@ pub(crate) fn is_available() -> bool {
         .is_some_and(|root| has_any_session_dir(&root))
 }
 
-/// At least one `wd_*/session_*` directory exists under the sessions root.
+/// At least one `wd_*/session_*` or `wm_*/session_*` directory exists under
+/// the sessions root.
 fn has_any_session_dir(sessions_root: &Path) -> bool {
     let unreported = ScanReport::default();
     list_workspace_dirs(sessions_root, &unreported)
@@ -129,7 +136,7 @@ fn has_any_session_dir(sessions_root: &Path) -> bool {
 // Provider interface (default-root wrappers)
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Kimi-code projects, one per `wd_<hash>` workspace directory. Tolerant: a
+/// Kimi-code projects, one per `wd_<hash>` / `wm_<uuid>` workspace directory. Tolerant: a
 /// missing or unreadable store yields an empty list, never an error.
 pub fn scan_projects() -> Vec<ClaudeProject> {
     scan_projects_reporting(&ScanReport::default())
@@ -193,9 +200,9 @@ pub(crate) fn scan_projects_from_root(
     sessions_root: &Path,
     report: &ScanReport,
 ) -> Vec<ClaudeProject> {
-    // Workspace roots come from workspaces.json (`root`/`name`); per-session
+    // Workspace roots and names come from projects.json; per-session
     // state.json cwd values are the fallback for unindexed workspaces.
-    let workspace_map = read_workspace_roots(sessions_root.parent().unwrap_or(sessions_root));
+    let workspace_index = read_workspace_index(sessions_root.parent().unwrap_or(sessions_root));
 
     let mut projects = Vec::new();
     for workspace_dir in list_workspace_dirs(sessions_root, report) {
@@ -208,8 +215,7 @@ pub(crate) fn scan_projects_from_root(
             continue;
         }
 
-        let (workspace_id, actual_path) = workspace_root(&workspace_dir, &workspace_map);
-        let name = project_name_for_root(&actual_path, &workspace_id);
+        let (name, actual_path) = workspace_root(&workspace_dir, &workspace_index);
         let message_count = sessions.iter().map(|s| s.message_count).sum();
         let last_modified = sessions
             .iter()
@@ -293,13 +299,12 @@ pub(crate) fn search_from_root(
     limit: usize,
 ) -> Vec<ClaudeMessage> {
     let query_lower = query.to_lowercase();
-    let workspace_map = read_workspace_roots(sessions_root.parent().unwrap_or(sessions_root));
+    let workspace_index = read_workspace_index(sessions_root.parent().unwrap_or(sessions_root));
 
     let mut results = Vec::new();
     let unreported = ScanReport::default();
     for workspace_dir in list_workspace_dirs(sessions_root, &unreported) {
-        let (workspace_id, actual_path) = workspace_root(&workspace_dir, &workspace_map);
-        let project_name = project_name_for_root(&actual_path, &workspace_id);
+        let (project_name, _) = workspace_root(&workspace_dir, &workspace_index);
         let project_path = project_path_for(&workspace_dir);
         for session_dir in list_session_dirs(&workspace_dir, &unreported) {
             let Some(session) = build_session(&session_dir, &unreported) else {
@@ -461,8 +466,8 @@ fn build_session(session_dir: &Path, report: &ScanReport) -> Option<CodeSession>
     })
 }
 
-/// `wd_*` directories under the sessions root, sorted for stable output;
-/// what the listing cannot read is recorded in `report`.
+/// `wd_*` and `wm_*` directories under the sessions root, sorted for stable
+/// output; what the listing cannot read is recorded in `report`.
 fn list_workspace_dirs(sessions_root: &Path, report: &ScanReport) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = report
         .read_dir(sessions_root)
@@ -476,7 +481,11 @@ fn list_workspace_dirs(sessions_root: &Path, report: &ScanReport) -> Vec<PathBuf
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with("wd_"))
+                .is_some_and(|name| {
+                    WORKSPACE_PREFIXES
+                        .iter()
+                        .any(|prefix| name.starts_with(prefix))
+                })
         })
         .collect();
     dirs.sort();
@@ -540,7 +549,7 @@ fn read_state_json(session_dir: &Path) -> Option<Value> {
 }
 
 /// First non-empty `state.json` `cwd` among a workspace's sessions — the
-/// fallback project root when `workspaces.json` has no entry.
+/// fallback project root when `projects.json` has no entry.
 fn read_state_cwd(workspace_dir: &Path) -> Option<String> {
     list_session_dirs(workspace_dir, &ScanReport::default())
         .into_iter()
@@ -552,9 +561,16 @@ fn read_state_cwd(workspace_dir: &Path) -> Option<String> {
         })
 }
 
-/// `workspaces.json` → `wd_<id>` → workspace root path.
-fn read_workspace_roots(root: &Path) -> HashMap<String, String> {
-    let path = root.join(WORKSPACES_FILE);
+/// One `projects.json` entry: the workspace root and its display name.
+struct WorkspaceEntry {
+    root: String,
+    name: Option<String>,
+}
+
+/// `projects.json` (`schema_version` 2) → workspace id (`wd_…` / `wm_…`) →
+/// entry.
+fn read_workspace_index(root: &Path) -> HashMap<String, WorkspaceEntry> {
+    let path = root.join(PROJECTS_FILE);
     if is_symlink(&path) || !path.is_file() {
         return HashMap::new();
     }
@@ -566,16 +582,29 @@ fn read_workspace_roots(root: &Path) -> HashMap<String, String> {
     };
 
     value
-        .get("workspaces")
+        .get("projects")
         .and_then(Value::as_object)
-        .map(|workspaces| {
-            workspaces
+        .map(|projects| {
+            projects
                 .iter()
                 .filter_map(|(id, info)| {
-                    info.get("root")
+                    let root = info
+                        .get("root")
                         .and_then(Value::as_str)
-                        .filter(|root| !root.is_empty())
-                        .map(|root| (id.clone(), root.to_string()))
+                        .filter(|root| !root.is_empty())?;
+                    let name = info
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|name| !name.is_empty())
+                        .map(ToOwned::to_owned);
+                    Some((
+                        id.clone(),
+                        WorkspaceEntry {
+                            root: root.to_string(),
+                            name,
+                        },
+                    ))
                 })
                 .collect()
         })
@@ -590,22 +619,26 @@ fn project_name_for_root(root: &str, workspace_id: &str) -> String {
         .unwrap_or_else(|| workspace_id.to_string())
 }
 
-/// A workspace directory's id and project root: the workspaces.json `root`,
-/// else a session's state.json cwd, else the id itself.
+/// A workspace directory's project name and root: the projects.json entry
+/// (`name`, `root`), else a session's state.json cwd as the root with its
+/// directory name as the name, else the id itself.
 fn workspace_root(
     workspace_dir: &Path,
-    workspace_map: &HashMap<String, String>,
+    workspace_index: &HashMap<String, WorkspaceEntry>,
 ) -> (String, String) {
     let id = workspace_dir
         .file_name()
         .map(|name| name.to_string_lossy().to_string())
         .unwrap_or_default();
-    let root = workspace_map
-        .get(&id)
-        .cloned()
+    let entry = workspace_index.get(&id);
+    let root = entry
+        .map(|entry| entry.root.clone())
         .or_else(|| read_state_cwd(workspace_dir))
         .unwrap_or_else(|| id.clone());
-    (id, root)
+    let name = entry
+        .and_then(|entry| entry.name.clone())
+        .unwrap_or_else(|| project_name_for_root(&root, &id));
+    (name, root)
 }
 
 /// The opaque project identity (`ClaudeProject.path`) of a workspace dir,
@@ -636,6 +669,9 @@ struct FoldedMessage {
     partial: bool,
     timestamp: String,
     model: Option<String>,
+    /// `true` while `model` is still the config alias from `profile.bind`;
+    /// the turn's `turn.ended.replyModel.model` replaces it with the real id.
+    model_is_alias: bool,
     /// Token counts from the `usage.record` events emitted inside this
     /// assistant step. Always `None` on non-assistant messages.
     usage: Option<TokenUsage>,
@@ -740,6 +776,25 @@ fn fold_wire_messages(
                     .or_else(|| record.get("model").and_then(Value::as_str));
                 if let Some(alias) = alias {
                     state.model = Some(alias.to_string());
+                }
+            }
+            // The wire records the config alias (`profile.bind.modelAlias`,
+            // `usage.record.model`); the real model id is only written once
+            // the turn ends.
+            "turn.ended" => {
+                let reply_model = record
+                    .get("replyModel")
+                    .and_then(|reply| reply.get("model"))
+                    .and_then(Value::as_str)
+                    .filter(|model| !model.is_empty());
+                if let Some(reply_model) = reply_model {
+                    for message in history
+                        .iter_mut()
+                        .filter(|message| message.model_is_alias && message.model == state.model)
+                    {
+                        message.model = Some(reply_model.to_string());
+                        message.model_is_alias = false;
+                    }
                 }
             }
             "context.append_message" => {
@@ -871,6 +926,7 @@ fn fold_append_message(
         partial: false,
         timestamp: timestamp.to_string(),
         model: state.model.clone(),
+        model_is_alias: state.model.is_some(),
         usage: None,
     };
 
@@ -903,6 +959,7 @@ fn fold_loop_event(
                 partial: true,
                 timestamp: timestamp.to_string(),
                 model: state.model.clone(),
+                model_is_alias: state.model.is_some(),
                 usage: None,
             });
         }
@@ -954,6 +1011,7 @@ fn fold_loop_event(
                 partial: false,
                 timestamp: timestamp.to_string(),
                 model: None,
+                model_is_alias: false,
                 usage: None,
             });
             flush_deferred(history, state);
@@ -1017,6 +1075,7 @@ fn close_pending(history: &mut Vec<FoldedMessage>, state: &mut FoldState, timest
             partial: false,
             timestamp: timestamp.to_string(),
             model: None,
+            model_is_alias: false,
             usage: None,
         });
     }
@@ -1135,6 +1194,7 @@ fn fold_apply_compaction(
             partial: false,
             timestamp: timestamp.to_string(),
             model: None,
+            model_is_alias: false,
             usage: None,
         });
     }
@@ -1143,6 +1203,49 @@ fn fold_apply_compaction(
 // ─────────────────────────────────────────────────────────────────────────────
 // Folded message → viewer message
 // ─────────────────────────────────────────────────────────────────────────────
+
+/// `true` when `text` is nothing but `<system-reminder>…</system-reminder>`
+/// blocks — the wrapper the viewer already collapses as injected context
+/// (`isInjectedWrapperText` in `messageKinds.ts`).
+fn is_system_reminder_only(text: &str) -> bool {
+    const OPEN: &str = "<system-reminder>";
+    const CLOSE: &str = "</system-reminder>";
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return false;
+    }
+    while !rest.is_empty() {
+        let Some(body) = rest.strip_prefix(OPEN) else {
+            return false;
+        };
+        let Some(end) = body.find(CLOSE) else {
+            return false;
+        };
+        rest = body[end + CLOSE.len()..].trim_start();
+    }
+    true
+}
+
+/// A message the producer marks as injected (`origin.kind:"injection"`) was
+/// added by the agent, not typed by the user. `<system-reminder>` injections
+/// stay: the viewer shows them as a collapsed "Injected context" card. Any
+/// other injected text (tower-inbox steering, backgrounded-shell notices,
+/// repeat-breaker reminders, empty tool-schema carriers) is dropped, like
+/// the other providers' injected-only context.
+fn is_uncollapsible_injection(message: &FoldedMessage) -> bool {
+    if message.origin_kind() != Some("injection") {
+        return false;
+    }
+    let collapsible = !message.content.is_empty()
+        && message.content.iter().all(|part| {
+            part.get("type").and_then(Value::as_str) == Some("text")
+                && part
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(is_system_reminder_only)
+        });
+    !collapsible
+}
 
 fn convert_folded_message(
     message: FoldedMessage,
@@ -1154,8 +1257,12 @@ fn convert_folded_message(
 
     match message.role.as_str() {
         "user" | "system" => {
-            // System-side appends (injections, notices) render as user
-            // turns, the same mapping the old CLI reader uses.
+            if is_uncollapsible_injection(&message) {
+                return None;
+            }
+            // Remaining system-side appends (system-reminder injections)
+            // render as user turns, the same mapping the old CLI reader
+            // uses.
             let mut blocks = message.content;
             for call in &message.tool_calls {
                 blocks.push(call.clone());
@@ -1440,21 +1547,24 @@ mod tests {
         // `C:\tmp\demo-project` and those backslashes have to be JSON-escaped,
         // which a raw string cannot do (#541).
         fs::write(
-            root.join(WORKSPACES_FILE),
+            root.join(PROJECTS_FILE),
             serde_json::json!({
-                "version": 1,
-                "workspaces": {
+                "schema_version": 2,
+                "projects": {
                     "wd_demo_abc123": {
                         "root": crate::test_utils::abs("tmp/demo-project"),
                         "name": "demo-project",
+                        "kind": "implicit",
                         "created_at": "2026-08-01T00:00:00.000Z",
                         "last_opened_at": "2026-08-02T00:00:00.000Z",
                     }
-                }
+                },
+                "deleted_project_ids": [],
+                "idempotency_keys": {},
             })
             .to_string(),
         )
-        .expect("write workspaces.json");
+        .expect("write projects.json");
     }
 
     fn write_session(
@@ -1519,7 +1629,7 @@ mod tests {
             &default_state(),
             &full_turn_wire(),
         );
-        // Not in workspaces.json → falls back to state.json cwd.
+        // Not in projects.json → falls back to state.json cwd.
         let other_state = serde_json::json!({
             "id": "session_y",
             "version": 2,
@@ -1543,7 +1653,7 @@ mod tests {
 
         assert_eq!(projects.len(), 2);
         // Path order: `wd_demo_abc123` < `wd_other_zzz`.
-        // Named workspace root (workspaces.json) wins for the indexed one…
+        // Named workspace root (projects.json) wins for the indexed one…
         assert_eq!(projects[0].name, "demo-project");
         assert_eq!(
             projects[0].path,
@@ -1875,7 +1985,7 @@ mod tests {
         let wire = vec![
             r#"{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"keep"}],"toolCalls":[],"origin":{"kind":"user"},"id":"m1"},"time":1786959458516}"#,
             // Owned by m2 → must be cut together with m2.
-            r#"{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"owned injection"}],"toolCalls":[],"origin":{"kind":"injection","ownerPromptId":"m2"},"id":"i1"},"time":1786959458517}"#,
+            r#"{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>\nowned injection\n</system-reminder>"}],"toolCalls":[],"origin":{"kind":"injection","ownerPromptId":"m2"},"id":"i1"},"time":1786959458517}"#,
             r#"{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"drop"}],"toolCalls":[],"origin":{"kind":"user"},"id":"m2"},"time":1786959458518}"#,
             r#"{"type":"context.undo","count":1,"time":1786959458519}"#,
         ];
@@ -1899,7 +2009,7 @@ mod tests {
         let wire = vec![
             r#"{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"keep"}],"toolCalls":[],"origin":{"kind":"user"},"id":"m1"},"time":1786959458516}"#,
             // Owned by m1 → NOT cut by undoing m2.
-            r#"{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"foreign injection"}],"toolCalls":[],"origin":{"kind":"injection","ownerPromptId":"m1"},"id":"i1"},"time":1786959458517}"#,
+            r#"{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>\nforeign injection\n</system-reminder>"}],"toolCalls":[],"origin":{"kind":"injection","ownerPromptId":"m1"},"id":"i1"},"time":1786959458517}"#,
             r#"{"type":"context.append_message","message":{"role":"user","content":[{"type":"text","text":"drop"}],"toolCalls":[],"origin":{"kind":"user"},"id":"m2"},"time":1786959458518}"#,
             r#"{"type":"context.undo","count":1,"time":1786959458519}"#,
         ];
@@ -1911,7 +2021,7 @@ mod tests {
         assert_eq!(messages.len(), 2, "the foreign injection survives");
         assert_eq!(
             messages[1].content.as_ref().unwrap()[0]["text"],
-            "foreign injection"
+            "<system-reminder>\nforeign injection\n</system-reminder>"
         );
     }
 
@@ -2447,5 +2557,212 @@ mod tests {
 
         let projects = scan_projects_from_root(&sessions_root(&root), &ScanReport::default());
         assert!(projects.is_empty());
+    }
+
+    /// Records copied from a real Kimi Code 2.7.3 managed-workspace session
+    /// (`sessions/wm_<uuid>/session_<uuid>`, created through `kimi web`),
+    /// trimmed to one turn; paths neutralised.
+    fn managed_turn_wire() -> Vec<&'static str> {
+        vec![
+            r#"{"type":"profile.bind","agentId":"main","modelAlias":"shim","profileName":"agent","thinkingEffort":"off","time":1795578480271}"#,
+            r#"{"type":"turn.prompt","agentId":"main","input":[{"type":"text","text":"Read src/math.js and add a function mul(a, b) that returns a*b, exported like add."}],"origin":{"kind":"user"},"promptId":"round-1","turnId":0,"trigger":"normal","time":1795578515464}"#,
+            r#"{"type":"context.append_message","agentId":"main","message":{"role":"user","content":[{"type":"text","text":"Read src/math.js and add a function mul(a, b) that returns a*b, exported like add."}],"toolCalls":[],"id":"round-1","origin":{"kind":"user"}},"time":1795578515466}"#,
+            r#"{"type":"context.append_message","agentId":"main","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>\nToday's date is 2026-11-25, in the local client machine's timezone (Asia/Seoul). The current date is restated in a reminder whenever it changes; rely on the latest such reminder for the current date. DO NOT mention this to the user explicitly.\n</system-reminder>"}],"toolCalls":[],"origin":{"kind":"injection","variant":"date_change","disclosure":{"kind":"date","renderGeneration":1,"localDate":"2026-11-25","timeZone":"Asia/Seoul"}}},"time":1795578515480}"#,
+            r#"{"type":"context.append_loop_event","agentId":"main","event":{"type":"step.begin","uuid":"fdd49a3a-7be9-4d76-a427-342d90934d48","turnId":"0","step":1},"time":1795578515491}"#,
+            r#"{"type":"context.append_loop_event","agentId":"main","event":{"type":"content.part","uuid":"efd3a988-79dc-43a0-b283-6b9195610bc8","turnId":"0","step":1,"stepUuid":"fdd49a3a-7be9-4d76-a427-342d90934d48","block":0,"part":{"type":"text","text":"Read src/math.js"},"startedAt":1795578516167,"durationMs":0},"time":1795578516187}"#,
+            r#"{"type":"usage.record","agentId":"main","model":"shim","usage":{"inputOther":11418,"output":5,"inputCacheCreation":0},"usageScope":"turn","time":1795578516187}"#,
+            r#"{"type":"context.append_loop_event","agentId":"main","event":{"type":"step.end","uuid":"fdd49a3a-7be9-4d76-a427-342d90934d48","turnId":"0","step":1,"finishReason":"end_turn","usage":{"inputOther":11418,"output":5,"inputCacheCreation":0},"messageId":"chatcmpl-5","providerFinishReason":"completed","rawFinishReason":"stop"},"time":1795578516188}"#,
+            r#"{"type":"turn.ended","agentId":"main","turnId":0,"reason":"completed","durationMs":721,"replyModel":{"provider":"openai","model":"qwen2.5-coder:7b"},"time":1795578516189}"#,
+        ]
+    }
+
+    /// `projects.json` as the real 2.7.3 store writes it: an implicit and a
+    /// managed workspace sharing one root.
+    fn write_real_projects_json(root: &Path) {
+        let demo = crate::test_utils::abs("home/user/demo");
+        fs::write(
+            root.join(PROJECTS_FILE),
+            serde_json::json!({
+                "schema_version": 2,
+                "projects": {
+                    "wd_demo_79f6aa9afebf": {
+                        "root": demo,
+                        "name": "demo",
+                        "kind": "implicit",
+                        "created_at": "2026-11-25T03:33:58.759Z",
+                        "last_opened_at": "2026-11-25T03:47:18.752Z",
+                    },
+                    "wm_e33ad42e-c16b-48a4-b952-0a7ef17faf39": {
+                        "root": demo,
+                        "name": "demo-managed",
+                        "kind": "managed",
+                        "created_at": "2026-11-25T03:47:56.570Z",
+                        "last_opened_at": "2026-11-25T03:48:00.191Z",
+                    }
+                },
+                "deleted_project_ids": [],
+                "idempotency_keys": {},
+            })
+            .to_string(),
+        )
+        .expect("write projects.json");
+    }
+
+    #[test]
+    fn managed_workspaces_are_listed_with_their_projects_json_identity() {
+        let temp = TempDir::new().expect("temp dir");
+        let root = code_root(&temp);
+        write_real_projects_json(&root);
+        // The managed session's own cwd differs from the indexed root, so the
+        // assertions below can only pass by reading projects.json.
+        let state = serde_json::json!({
+            "id": "session_9af8508b-cba9-438d-a8e9-7cd641e42534",
+            "version": 2,
+            "cwd": crate::test_utils::abs("home/user/elsewhere"),
+            "archived": false,
+            "agents": { "main": { "type": "main" } },
+            "custom": {},
+            "title": "Managed workspace sample",
+            "titleKind": "custom",
+            "isCustomTitle": true,
+            "createdAt": 1795578480211u64,
+            "updatedAt": 1795578526779u64,
+        })
+        .to_string();
+        write_session(
+            &root,
+            "wm_e33ad42e-c16b-48a4-b952-0a7ef17faf39",
+            "session_9af8508b-cba9-438d-a8e9-7cd641e42534",
+            &state,
+            &managed_turn_wire(),
+        );
+        assert!(
+            has_any_session_dir(&sessions_root(&root)),
+            "a store holding only a managed workspace is available"
+        );
+
+        let projects = scan_projects_from_root(&sessions_root(&root), &ScanReport::default());
+
+        assert_eq!(projects.len(), 1, "the wm_ workspace is a project");
+        assert_eq!(projects[0].name, "demo-managed");
+        assert_eq!(
+            projects[0].actual_path,
+            crate::test_utils::abs("home/user/demo")
+        );
+        assert_eq!(projects[0].session_count, 1);
+
+        let workspace_dir = root
+            .join(SESSIONS_DIR)
+            .join("wm_e33ad42e-c16b-48a4-b952-0a7ef17faf39");
+        let sessions = load_sessions_from_dir(&workspace_dir, &ScanReport::default());
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].summary.as_deref(),
+            Some("Managed workspace sample")
+        );
+
+        let hits = search_from_root(&sessions_root(&root), "math.js", 10);
+        assert!(!hits.is_empty(), "search reads wm_ workspaces too");
+        assert!(hits
+            .iter()
+            .all(|hit| hit.project_name.as_deref() == Some("demo-managed")));
+    }
+
+    #[test]
+    fn implicit_and_managed_workspaces_sharing_a_root_stay_distinct_projects() {
+        let temp = TempDir::new().expect("temp dir");
+        let root = code_root(&temp);
+        write_real_projects_json(&root);
+        let state = serde_json::json!({
+            "id": "session_x",
+            "version": 2,
+            "cwd": crate::test_utils::abs("home/user/demo"),
+            "createdAt": 1795578480211u64,
+        })
+        .to_string();
+        write_session(
+            &root,
+            "wd_demo_79f6aa9afebf",
+            "session_a",
+            &state,
+            &managed_turn_wire(),
+        );
+        write_session(
+            &root,
+            "wm_e33ad42e-c16b-48a4-b952-0a7ef17faf39",
+            "session_b",
+            &state,
+            &managed_turn_wire(),
+        );
+
+        let mut projects = scan_projects_from_root(&sessions_root(&root), &ScanReport::default());
+        projects.sort_by(|a, b| a.name.cmp(&b.name));
+
+        assert_eq!(projects.len(), 2);
+        assert_eq!(projects[0].name, "demo");
+        assert_eq!(projects[1].name, "demo-managed");
+        assert_ne!(projects[0].path, projects[1].path);
+    }
+
+    #[test]
+    fn assistant_model_is_the_turn_reply_model_not_the_config_alias() {
+        let temp = TempDir::new().expect("temp dir");
+        let root = code_root(&temp);
+        let mut wire = managed_turn_wire();
+        // A second turn the journal was cut in (no `turn.ended`) keeps the
+        // alias — the real id is not written yet.
+        wire.extend([
+            r#"{"type":"context.append_message","agentId":"main","message":{"role":"user","content":[{"type":"text","text":"Run npm test and tell me why it fails."}],"toolCalls":[],"id":"round-2","origin":{"kind":"user"}},"time":1795578524222}"#,
+            r#"{"type":"context.append_loop_event","agentId":"main","event":{"type":"step.begin","uuid":"s2","turnId":"1","step":1},"time":1795578524230}"#,
+            r#"{"type":"context.append_loop_event","agentId":"main","event":{"type":"content.part","uuid":"p2","turnId":"1","step":1,"stepUuid":"s2","block":0,"part":{"type":"text","text":"Run npm test"}},"time":1795578524540}"#,
+        ]);
+        let session_dir = write_session(&root, "wd_a", "session_x", &default_state(), &wire);
+
+        let messages =
+            load_messages_from_root(&root, &session_dir.to_string_lossy()).expect("load messages");
+
+        let assistants: Vec<_> = messages
+            .iter()
+            .filter(|message| message.message_type == "assistant")
+            .collect();
+        assert_eq!(assistants.len(), 2);
+        assert_eq!(assistants[0].model.as_deref(), Some("qwen2.5-coder:7b"));
+        assert_eq!(assistants[1].model.as_deref(), Some("shim"));
+    }
+
+    #[test]
+    fn only_system_reminder_injections_are_kept() {
+        let temp = TempDir::new().expect("temp dir");
+        let root = code_root(&temp);
+        let mut wire = managed_turn_wire();
+        wire.extend([
+            // Real: the permission-mode notice, written once per prompt.
+            r#"{"type":"context.append_message","agentId":"main","message":{"role":"user","content":[{"type":"text","text":"<system-reminder>\nAuto permission mode is active. Tool approvals will be handled automatically while this mode remains enabled.\n  - Continue normally without pausing for approval prompts.\n</system-reminder>"}],"toolCalls":[],"origin":{"kind":"injection","variant":"permission_mode"}},"time":1795578515481}"#,
+            // Producer shapes with no `<system-reminder>` wrapper
+            // (kimi-code 2.7.3 `dist/main.mjs`: `shell_command_backgrounded`,
+            // `tower_inbox_steer`, and the empty-content tool-schema carrier).
+            r#"{"type":"context.append_message","agentId":"main","message":{"role":"user","content":[{"type":"text","text":"Command moved to the background."}],"toolCalls":[],"origin":{"kind":"injection","variant":"shell_command_backgrounded"}},"time":1795578515482}"#,
+            r#"{"type":"context.append_message","agentId":"main","message":{"role":"user","content":[{"type":"text","text":"[tower inbox] new message from planner"}],"toolCalls":[],"origin":{"kind":"injection","variant":"tower_inbox_steer"}},"time":1795578515483}"#,
+            r#"{"type":"context.append_message","agentId":"main","message":{"role":"system","content":[],"toolCalls":[],"origin":{"kind":"injection","variant":"dynamic_tool_schema"}},"time":1795578515484}"#,
+        ]);
+        let session_dir = write_session(&root, "wd_a", "session_x", &default_state(), &wire);
+
+        let messages =
+            load_messages_from_root(&root, &session_dir.to_string_lossy()).expect("load messages");
+
+        let user_texts: Vec<String> = messages
+            .iter()
+            .filter(|message| message.message_type == "user")
+            .map(|message| {
+                message.content.as_ref().unwrap()[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(user_texts.len(), 3, "prompt + two system-reminder notices");
+        assert!(user_texts[0].starts_with("Read src/math.js"));
+        assert!(user_texts[1].starts_with("<system-reminder>\nToday's date"));
+        assert!(user_texts[2].starts_with("<system-reminder>\nAuto permission mode"));
     }
 }
