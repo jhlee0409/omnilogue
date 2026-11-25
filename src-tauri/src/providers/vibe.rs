@@ -351,14 +351,19 @@ fn load_store_entries(session_dir: &Path) -> StoreEntries {
             .flat_map(|hash| read_chunk_file(&chunk_path(hash)))
             .collect();
         // A projection prefix is not the conversation: if any listed chunk is
-        // unreadable (for example a torn write), drop the projection so the
-        // checkpoint is used instead of showing a truncated history as complete.
-        let projection = chunks
-            .projection
-            .iter()
-            .map(|hash| read_chunk_file_checked(&chunk_path(hash)))
-            .collect::<Option<Vec<_>>>()
-            .map_or_else(Vec::new, |parts| parts.into_iter().flatten().collect());
+        // unusable (an invalid name, or unreadable, for example a torn write),
+        // drop the projection so the checkpoint is used instead of showing a
+        // truncated history as complete.
+        let projection = if chunks.projection_intact {
+            chunks
+                .projection
+                .iter()
+                .map(|hash| read_chunk_file_checked(&chunk_path(hash)))
+                .collect::<Option<Vec<_>>>()
+                .map_or_else(Vec::new, |parts| parts.into_iter().flatten().collect())
+        } else {
+            Vec::new()
+        };
         return StoreEntries {
             checkpoint,
             projection,
@@ -420,6 +425,9 @@ fn is_safe_store_name(name: &str) -> bool {
 struct ManifestChunks {
     checkpoint: Vec<String>,
     projection: Vec<String>,
+    /// `false` when the manifest lists a projection chunk that is not a safe
+    /// chunk name, so `projection` is only part of the history.
+    projection_intact: bool,
 }
 
 /// Resolve the ordered chunk hashes of the latest generation. `None` when no
@@ -437,9 +445,12 @@ fn resolve_manifest_chunks(session_dir: &Path) -> Option<ManifestChunks> {
         })
         .or_else(|| latest_generation(&generations))?;
     let manifest = read_json_file(&generations.join(&generation).join(MANIFEST_FILE)).ok()?;
+    let (checkpoint, _) = manifest_chunk_hashes(&manifest, "checkpoint");
+    let (projection, projection_intact) = manifest_chunk_hashes(&manifest, PROJECTION_SECTION);
     let chunks = ManifestChunks {
-        checkpoint: manifest_chunk_hashes(&manifest, "checkpoint"),
-        projection: manifest_chunk_hashes(&manifest, PROJECTION_SECTION),
+        checkpoint,
+        projection,
+        projection_intact,
     };
     if chunks.checkpoint.is_empty() && chunks.projection.is_empty() {
         None
@@ -449,24 +460,27 @@ fn resolve_manifest_chunks(session_dir: &Path) -> Option<ManifestChunks> {
 }
 
 /// The safe chunk hashes a manifest section (`checkpoint` or
-/// `projection_state`) lists, in order.
-fn manifest_chunk_hashes(manifest: &Value, section: &str) -> Vec<String> {
-    manifest
+/// `projection_state`) lists, in order, and whether every listed entry was a
+/// safe hash (`false` when an entry was skipped).
+fn manifest_chunk_hashes(manifest: &Value, section: &str) -> (Vec<String>, bool) {
+    let Some(chunks) = manifest
         .get(section)
         .and_then(|section| section.get("chunks"))
         .and_then(Value::as_array)
-        .map(|chunks| {
-            chunks
-                .iter()
-                .filter_map(|chunk| {
-                    chunk
-                        .as_str()
-                        .filter(|hash| is_safe_store_name(hash))
-                        .map(str::to_owned)
-                })
-                .collect()
+    else {
+        return (Vec::new(), true);
+    };
+    let hashes: Vec<String> = chunks
+        .iter()
+        .filter_map(|chunk| {
+            chunk
+                .as_str()
+                .filter(|hash| is_safe_store_name(hash))
+                .map(str::to_owned)
         })
-        .unwrap_or_default()
+        .collect();
+    let intact = hashes.len() == chunks.len();
+    (hashes, intact)
 }
 
 /// The `CURRENT` file points at the newest generation of a session.
@@ -2842,6 +2856,36 @@ mod tests {
         let kinds: Vec<&str> = messages.iter().map(|m| m.message_type.as_str()).collect();
         assert_eq!(kinds, ["user", "system", "assistant"]);
         assert!(block_text(&messages[2]).starts_with("The last line of"));
+    }
+
+    #[test]
+    /// A projection chunk name the loader refuses (path traversal) makes the
+    /// projection incomplete too, so the readable prefix is not used.
+    fn invalid_projection_chunk_name_falls_back_to_checkpoint() {
+        let temp = TempDir::new().expect("temp dir");
+        let (_cwd, session_dir) = write_store(
+            temp.path(),
+            &post_compaction_checkpoint(),
+            &full_projection(),
+        );
+        fs::write(
+            Path::new(&session_dir)
+                .join(GENERATIONS_DIR)
+                .join("0000000000000248")
+                .join(MANIFEST_FILE),
+            json!({
+                "manifest_version": 1,
+                "checkpoint": { "chunks": ["ck"] },
+                "projection_state": { "chunks": ["p0", "../p1"] },
+            })
+            .to_string(),
+        )
+        .expect("rewrite manifest");
+
+        let messages = load_messages_from_base_path(temp.path().to_str().unwrap(), &session_dir)
+            .expect("load messages");
+        let kinds: Vec<&str> = messages.iter().map(|m| m.message_type.as_str()).collect();
+        assert_eq!(kinds, ["user", "system", "assistant"]);
     }
 
     #[test]
