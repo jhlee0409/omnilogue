@@ -26,6 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ||||||| f2b1ed96
 - **Goose shows only the conversation you had** (desktop and WebUI). Goose stores its own per-turn `<turn-context>` notes, sub-agent delivery notices and `final_output` reminders as user messages marked not user-visible, and keeps sub-agent runs and `--no-session` runs in the same session table; all of them were listed as prompts or sessions. They are now hidden, as in Goose. Tool calls that Goose records as `success` with `isError: true` (a failing `npm test`, an unavailable tool) now show as failed, a failed assistant turn (provider error, action limit reached) shows its error text instead of vanishing, and an image a tool returned (`read_image`) is shown. (#847)
 ||||||| f2b1ed96
+- **Qwen Code sessions show their `/rename` title, hide the CLI's own messages and show failed commands as errors** (desktop and WebUI). A session renamed with `/rename` (or titled by Qwen Code) was still named by its first prompt; it now shows that title, read from the transcript or the session's `.title.json` file. Cron prompts and other messages Qwen Code writes on its own behalf were listed as messages you typed and could become the session title; they are now hidden (background-task completions still appear as agent updates). A failed shell command showed its result as raw `{"error": …}` JSON; it now shows the command output and is marked as failed. (#857)
+||||||| f2b1ed96
 
 ## [2.1.1] - 2026-11-23
 

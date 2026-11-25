@@ -16,6 +16,19 @@
 //! `{functionCall:{name,args,id}}` / `{functionResponse:{name,response,id}}`.
 //! We map these to the viewer's Claude-style content blocks. Projects group by
 //! the real `cwd` carried on each record.
+//!
+//! Session titles: `/rename` appends `{"type":"system","subtype":"custom_title",
+//! "systemPayload":{"customTitle","titleSource"?}}` to the transcript (last one
+//! wins; no `titleSource` means manual) and every session also has a
+//! `<sessionId>.title.json` sidecar `{version:1,displayName,source}` with
+//! `source` `manual`|`auto`|`prompt`. A `prompt` sidecar only mirrors the first
+//! prompt and is not a title. Transcript title first, then a manual/auto
+//! sidecar, then the first real prompt (`sessionService.ts` of Qwen Code).
+//!
+//! User-role records the CLI writes on its own behalf (`provenance:"system"`
+//! notifications and cron prompts, `external_agent`, `mod_prompt`) are not
+//! typed by the user and are dropped, except `<task-notification>` text which
+//! the viewer already renders as an agent update.
 
 use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession, TokenUsage};
 use crate::providers::scan_report::ScanReport;
@@ -216,6 +229,8 @@ pub(crate) fn load_sessions_reporting(
         if meta.cwd.as_deref().unwrap_or("unknown") != target_cwd {
             continue;
         }
+        let (summary, is_renamed) =
+            resolve_summary(meta.custom_title, read_sidecar(&file, report), meta.summary);
         let mtime = file_mtime_rfc3339(&file);
         let first = meta.first_ts.clone().unwrap_or_else(|| mtime.clone());
         let last = meta.last_ts.clone().unwrap_or(mtime);
@@ -233,8 +248,8 @@ pub(crate) fn load_sessions_reporting(
             last_modified: last,
             has_tool_use: meta.has_tool_use,
             has_errors: false,
-            summary: meta.summary,
-            is_renamed: false,
+            summary,
+            is_renamed,
             provider: Some(PROVIDER.to_string()),
             storage_type: None,
             entrypoint: None,
@@ -307,6 +322,119 @@ struct SessionMeta {
     first_ts: Option<String>,
     last_ts: Option<String>,
     has_tool_use: bool,
+    /// Last `system/custom_title` record of the transcript.
+    custom_title: Option<NativeTitle>,
+}
+
+/// A title the producer persisted for a session.
+#[derive(Debug, PartialEq, Eq)]
+struct NativeTitle {
+    text: String,
+    /// `true` for a name the user chose (`/rename`), `false` for a generated one.
+    manual: bool,
+}
+
+/// `systemPayload` of a `custom_title` record. A missing `titleSource` is a
+/// legacy manual title (`chatRecordingService.ts` `currentTitleSource`).
+fn custom_title_of(rec: &Value) -> Option<NativeTitle> {
+    let payload = rec.get("systemPayload")?;
+    let text = payload.get("customTitle")?.as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    let source = payload.get("titleSource").and_then(Value::as_str);
+    Some(NativeTitle {
+        text: text.to_string(),
+        manual: source != Some("auto"),
+    })
+}
+
+/// Longest `displayName` the producer's sidecar reader accepts, in chars.
+const SIDECAR_NAME_MAX_CHARS: usize = 256;
+
+/// What a `<sessionId>.title.json` sidecar holds, validated like the producer's
+/// `readSessionTitleSidecar`.
+#[derive(Debug, PartialEq, Eq)]
+enum Sidecar {
+    /// A title (`source` `manual` or `auto`).
+    Title(NativeTitle),
+    /// The first prompt's label (`source` `prompt`); not a title.
+    Prompt(String),
+}
+
+fn parse_sidecar(data: &str) -> Option<Sidecar> {
+    let value: Value = serde_json::from_str(data).ok()?;
+    if value.get("version").and_then(Value::as_u64) != Some(1) {
+        return None;
+    }
+    let name = value.get("displayName")?.as_str()?.trim();
+    if name.is_empty() || name.chars().count() > SIDECAR_NAME_MAX_CHARS {
+        return None;
+    }
+    let title = |manual| {
+        Some(Sidecar::Title(NativeTitle {
+            text: name.to_string(),
+            manual,
+        }))
+    };
+    match value.get("source").and_then(Value::as_str)? {
+        "manual" => title(true),
+        "auto" => title(false),
+        "prompt" => Some(Sidecar::Prompt(name.to_string())),
+        _ => None,
+    }
+}
+
+/// The session's list title and whether the user named it. The producer's
+/// order: transcript `custom_title`, then a non-prompt sidecar; otherwise the
+/// first real prompt (or, for a transcript that lost its head, the sidecar's
+/// prompt label).
+fn resolve_summary(
+    transcript_title: Option<NativeTitle>,
+    sidecar: Option<Sidecar>,
+    first_prompt: Option<String>,
+) -> (Option<String>, bool) {
+    let (title, prompt_label) = match sidecar {
+        Some(Sidecar::Title(t)) => (transcript_title.or(Some(t)), None),
+        Some(Sidecar::Prompt(p)) => (transcript_title, Some(p)),
+        None => (transcript_title, None),
+    };
+    if let Some(t) = title {
+        return (Some(t.text), t.manual);
+    }
+    (
+        first_prompt.or_else(|| prompt_label.map(|p| summarize(&p))),
+        false,
+    )
+}
+
+/// A user-role record the CLI wrote on its own behalf rather than the person
+/// typing it (not a prompt, so never a session summary).
+fn is_cli_written_user_record(rec: &Value) -> bool {
+    let provenance = rec.get("provenance").and_then(Value::as_str);
+    let subtype = rec.get("subtype").and_then(Value::as_str);
+    matches!(provenance, Some("system" | "external_agent" | "mod_prompt"))
+        || matches!(subtype, Some("notification" | "cron" | "agent_message"))
+}
+
+/// A CLI-written user record the viewer must not show as a message.
+/// `<task-notification>` text is kept: the frontend renders it as an agent
+/// update.
+fn is_injected_user_record(rec: &Value) -> bool {
+    is_cli_written_user_record(rec) && !carries_task_notification(rec)
+}
+
+fn carries_task_notification(rec: &Value) -> bool {
+    rec.get("message")
+        .and_then(|m| m.get("parts"))
+        .and_then(Value::as_array)
+        .is_some_and(|parts| {
+            parts.iter().any(|p| {
+                p.get("text")
+                    .and_then(Value::as_str)
+                    .is_some_and(|t| t.trim_start().starts_with("<task-notification>"))
+            })
+        })
 }
 
 /// Lightweight per-session metadata from a chat JSONL (one parse).
@@ -318,6 +446,7 @@ fn session_meta(data: &str) -> Option<SessionMeta> {
     let mut first_ts = None;
     let mut last_ts = None;
     let mut has_tool_use = false;
+    let mut custom_title = None;
 
     for line in data.lines() {
         let line = line.trim();
@@ -336,7 +465,19 @@ fn session_meta(data: &str) -> Option<SessionMeta> {
             cwd = rec.get("cwd").and_then(Value::as_str).map(str::to_string);
         }
         let rec_type = rec.get("type").and_then(Value::as_str).unwrap_or("");
+        if rec_type == "system"
+            && rec.get("subtype").and_then(Value::as_str) == Some("custom_title")
+        {
+            // Re-appended at EOF on exit/re-anchor: the last record is current.
+            if let Some(title) = custom_title_of(&rec) {
+                custom_title = Some(title);
+            }
+            continue;
+        }
         if !matches!(rec_type, "user" | "assistant" | "tool_result") {
+            continue;
+        }
+        if rec_type == "user" && is_injected_user_record(&rec) {
             continue;
         }
         message_count += 1;
@@ -346,7 +487,7 @@ fn session_meta(data: &str) -> Option<SessionMeta> {
             }
             last_ts = Some(ts.to_string());
         }
-        if summary.is_none() && rec_type == "user" {
+        if summary.is_none() && rec_type == "user" && !is_cli_written_user_record(&rec) {
             summary = first_text(&rec).map(|t| summarize(&t));
         }
         if rec_type == "tool_result" || record_has_function_call(&rec) {
@@ -365,6 +506,7 @@ fn session_meta(data: &str) -> Option<SessionMeta> {
         first_ts,
         last_ts,
         has_tool_use,
+        custom_title,
     })
 }
 
@@ -391,6 +533,7 @@ fn convert_record(rec: &Value) -> Option<ClaudeMessage> {
     // tool_result records carry role 'user' in genai but are their own record
     // type; surface them in the user lane like Claude tool results.
     let (message_type, role) = match rec_type {
+        "user" if is_injected_user_record(rec) => return None,
         "user" | "tool_result" => ("user", "user"),
         "assistant" => ("assistant", "assistant"),
         _ => return None, // skip system / UI records
@@ -400,9 +543,12 @@ fn convert_record(rec: &Value) -> Option<ClaudeMessage> {
         .get("message")
         .and_then(|m| m.get("parts"))
         .and_then(Value::as_array);
-    let blocks: Vec<Value> = parts
+    let mut blocks: Vec<Value> = parts
         .map(|ps| ps.iter().filter_map(convert_part).collect())
         .unwrap_or_default();
+    if rec_type == "tool_result" {
+        mark_tool_outcome(&mut blocks, rec.get("toolCallResult"));
+    }
     if blocks.is_empty() {
         return None;
     }
@@ -454,12 +600,14 @@ fn convert_part(part: &Value) -> Option<Value> {
     }
     if let Some(resp) = part.get("functionResponse") {
         let id = resp.get("id").and_then(Value::as_str).unwrap_or("");
-        // response is usually { output: <string|object> }.
-        let content = resp
-            .get("response")
-            .and_then(|r| r.get("output"))
+        // `response` is `{ output }` on success and `{ error }` for a failed
+        // or cancelled call (`createErrorResponse` / `createCancelledResponse`
+        // in coreToolScheduler.ts); show that text, not the JSON envelope.
+        let response = resp.get("response");
+        let content = response
+            .and_then(|r| r.get("output").or_else(|| r.get("error")))
             .map(stringify_value)
-            .or_else(|| resp.get("response").map(stringify_value))
+            .or_else(|| response.map(stringify_value))
             .unwrap_or_default();
         return Some(json!({ "type": "tool_result", "tool_use_id": id, "content": content }));
     }
@@ -505,6 +653,38 @@ fn record_has_function_call(rec: &Value) -> bool {
         .and_then(|m| m.get("parts"))
         .and_then(Value::as_array)
         .is_some_and(|ps| ps.iter().any(|p| p.get("functionCall").is_some()))
+}
+
+/// Producer outcome of a `tool_result` record: its `toolCallResult.status` is
+/// `success`/`error` (or `cancelled`, which is neither) for the call named by
+/// `toolCallResult.callId`. Nothing is inferred from the result text.
+fn mark_tool_outcome(blocks: &mut [Value], call_result: Option<&Value>) {
+    let Some(call_result) = call_result else {
+        return;
+    };
+    let is_error = match call_result.get("status").and_then(Value::as_str) {
+        Some("error") => true,
+        Some("success") => false,
+        _ => return,
+    };
+    let Some(call_id) = call_result.get("callId").and_then(Value::as_str) else {
+        return;
+    };
+    for block in blocks.iter_mut().filter(|b| {
+        b.get("type").and_then(Value::as_str) == Some("tool_result")
+            && b.get("tool_use_id").and_then(Value::as_str) == Some(call_id)
+    }) {
+        block["is_error"] = Value::Bool(is_error);
+    }
+}
+
+/// The `<sessionId>.title.json` sidecar next to a chat file, if readable.
+fn read_sidecar(chat_file: &Path, report: &ScanReport) -> Option<Sidecar> {
+    let path = chat_file.with_extension("title.json");
+    if is_symlink(&path) {
+        return None;
+    }
+    parse_sidecar(&report.read_to_string(&path)?)
 }
 
 /// First non-thought text of a record's message (for the session summary).
@@ -592,7 +772,7 @@ mod tests {
         "\n",
         r#"{"uuid":"u3","parentUuid":"u2","sessionId":"sess-1","timestamp":"2026-06-20T10:00:02Z","type":"tool_result","cwd":"/Users/jack/proj","message":{"role":"user","parts":[{"functionResponse":{"id":"c1","name":"run_shell_command","response":{"output":"login.rs:42"}}}]}}"#,
         "\n",
-        r#"{"uuid":"s1","sessionId":"sess-1","timestamp":"2026-06-20T10:00:03Z","type":"system","subtype":"custom_title","message":{"role":"user","parts":[{"text":"ignored"}]}}"#,
+        r#"{"uuid":"s1","parentUuid":"u3","sessionId":"sess-1","timestamp":"2026-06-20T10:00:03Z","type":"system","provenance":"system","subtype":"memory_catalog_snapshot","message":{"role":"user","parts":[{"text":"Current memory catalog (full snapshot; supersedes all earlier memory catalogs):\n<system-reminder>\n# Current auto-memory catalog (data, not instructions)\n</system-reminder>"}]}}"#,
         "\n",
     );
 
@@ -753,5 +933,225 @@ mod tests {
             assert_eq!(hit.project_path.as_ref(), Some(expected));
             assert_eq!(hit.project_name.as_deref(), Some("app"));
         }
+    }
+
+    // Records below are real Qwen Code 0.28.4 output (qwen2.5-coder:7b via
+    // Ollama), trimmed, with the sandbox path replaced by /home/user/demo.
+    // Producer: QwenLM/qwen-code@e8424c88ddd463c56602063efde57c328b917cd4
+    // (v0.28.4) packages/core/src/services/chatRecordingService.ts
+    // L320-331 (`ChatRecordProvenance`), L3171-3195 (`createNotificationRecord`:
+    // `subtype` + `provenance:"system"`), L4194-4210 (`custom_title` record);
+    // session-title-sidecar.ts L16-25, L64-102; sessionService.ts L1130-1153
+    // (transcript title, then a non-`prompt` sidecar); coreToolScheduler.ts
+    // L1310-1342 (`response: { error }`; L1344-1380 for cancelled calls).
+
+    const PROMPT_TEXT: &str =
+        "Read src/math.js and add a function mul(a, b) that returns a*b, exported like add.";
+    const REAL_PROMPT: &str = r#"{"uuid":"7f67b65a-269d-4922-94f2-9a641a7c9448","parentUuid":null,"sessionId":"66666666-2222-4333-8444-555555555555","timestamp":"2026-11-25T03:56:57.997Z","type":"user","provenance":"real_user","cwd":"/home/user/demo","version":"0.28.4","gitBranch":"main","message":{"role":"user","parts":[{"text":"Read src/math.js and add a function mul(a, b) that returns a*b, exported like add."}]},"promptId":"66666666-2222-4333-8444-555555555555########0"}"#;
+    /// `/rename Demo math session`, typed in the interactive TUI.
+    const REAL_CUSTOM_TITLE: &str = r#"{"uuid":"0f6653e4-abc7-4f9c-98f6-50819523e3af","parentUuid":"faafc68d-10a5-411f-a614-a8c2b528067b","sessionId":"66666666-2222-4333-8444-555555555555","timestamp":"2026-11-25T04:01:07.509Z","type":"system","provenance":"system","cwd":"/home/user/demo","version":"0.28.4","gitBranch":"main","subtype":"custom_title","systemPayload":{"customTitle":"Demo math session","titleSource":"manual"}}"#;
+    const REAL_SIDECAR_PROMPT: &str = r#"{"version":1,"displayName":"Read src/math.js and add a function mul(a, b) that returns a*b, exported like add.","source":"prompt","updatedAt":"2026-11-25T03:54:11.392Z"}"#;
+    const REAL_SIDECAR_MANUAL: &str = r#"{"version":1,"displayName":"Demo math session","source":"manual","updatedAt":"2026-11-25T04:01:07.536Z"}"#;
+    /// Background-shell completion injected by the CLI (interactive TUI).
+    const REAL_NOTIFICATION: &str = r#"{"uuid":"89a6bf40-f30d-4f54-99ab-96e8969619fb","parentUuid":"296aa97c-45ba-4ea4-a49c-beaabd397dee","sessionId":"88888888-2222-4333-8444-555555555555","timestamp":"2026-11-25T04:04:19.392Z","type":"user","provenance":"system","cwd":"/home/user/demo","version":"0.28.4","gitBranch":"main","subtype":"notification","deliveredTurn":true,"message":{"role":"user","parts":[{"text":"<task-notification>\n<task-id>bg_e3a6c4c9</task-id>\n<kind>shell</kind>\n<status>completed</status>\n<summary>Shell command \"sleep 3; echo background-done\" completed.</summary>\n</task-notification>"}]}}"#;
+    /// A failing `npm test`: `response.error`, `toolCallResult.status:"error"`.
+    const REAL_FAILED_SHELL: &str = r#"{"uuid":"32a34072-347c-4355-9cc5-3ac1c714d5a0","parentUuid":"ad90f6df-bdbf-4163-816e-a5bdc660330e","sessionId":"55555555-2222-4333-8444-555555555555","timestamp":"2026-11-25T03:55:10.219Z","type":"tool_result","provenance":"tool_result","cwd":"/home/user/demo","version":"0.28.4","gitBranch":"main","message":{"role":"user","parts":[{"functionResponse":{"id":"call_nhkp98dw","name":"run_shell_command","response":{"error":"Command: npm test\nDirectory: /home/user/demo\nOutput (stdout and stderr combined): > demo@1.0.0 test\n> node test.js\n\nAssertionError [ERR_ASSERTION]: Expected values to be strictly equal:\n\n4 !== 5"}}}]},"toolCallResult":{"callId":"call_nhkp98dw","status":"error","resultDisplay":{"type":"shell_result","version":1,"directory":"/home/user/demo","exitCode":1,"outcome":"failed"}}}"#;
+    const REAL_OK_SHELL: &str = r#"{"uuid":"a0f1c0de-0000-4000-8000-000000000001","parentUuid":"32a34072-347c-4355-9cc5-3ac1c714d5a0","sessionId":"55555555-2222-4333-8444-555555555555","timestamp":"2026-11-25T03:55:11.000Z","type":"tool_result","provenance":"tool_result","cwd":"/home/user/demo","version":"0.28.4","gitBranch":"main","message":{"role":"user","parts":[{"functionResponse":{"id":"call_2xph16yq","name":"run_shell_command","response":{"output":"ok"}}}]},"toolCallResult":{"callId":"call_2xph16yq","status":"success"}}"#;
+
+    fn jsonl(lines: &[&str]) -> String {
+        lines.join("\n") + "\n"
+    }
+
+    /// Write `<QWEN_HOME>/projects/demo/chats/<id>.jsonl` (+ optional sidecar),
+    /// list the project's sessions and restore the env.
+    fn list_demo_sessions(id: &str, transcript: &str, sidecar: Option<&str>) -> Vec<ClaudeSession> {
+        let _home = crate::test_utils::SandboxHome::new();
+        let qwen_home = tempfile::TempDir::new().unwrap();
+        let chats = qwen_home.path().join("projects").join("demo").join("chats");
+        fs::create_dir_all(&chats).unwrap();
+        fs::write(chats.join(format!("{id}.jsonl")), transcript).unwrap();
+        if let Some(sidecar) = sidecar {
+            fs::write(chats.join(format!("{id}.title.json")), sidecar).unwrap();
+        }
+        let previous_runtime = std::env::var_os("QWEN_RUNTIME_DIR");
+        let previous = std::env::var_os("QWEN_HOME");
+        std::env::remove_var("QWEN_RUNTIME_DIR");
+        std::env::set_var("QWEN_HOME", qwen_home.path());
+
+        let sessions = load_sessions("qwen:///home/user/demo", false).unwrap();
+
+        if let Some(v) = previous_runtime {
+            std::env::set_var("QWEN_RUNTIME_DIR", v);
+        }
+        match previous {
+            Some(v) => std::env::set_var("QWEN_HOME", v),
+            None => std::env::remove_var("QWEN_HOME"),
+        }
+        sessions
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rename_record_in_transcript_becomes_the_session_title() {
+        let transcript = jsonl(&[REAL_PROMPT, REAL_CUSTOM_TITLE]);
+        let sessions = list_demo_sessions("66666666", &transcript, Some(REAL_SIDECAR_PROMPT));
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].summary.as_deref(), Some("Demo math session"));
+        assert!(sessions[0].is_renamed);
+        // The title record is metadata, not a message.
+        assert_eq!(sessions[0].message_count, 1);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn manual_sidecar_titles_a_transcript_without_the_rename_record() {
+        let sessions = list_demo_sessions(
+            "66666666",
+            &jsonl(&[REAL_PROMPT]),
+            Some(REAL_SIDECAR_MANUAL),
+        );
+        assert_eq!(sessions[0].summary.as_deref(), Some("Demo math session"));
+        assert!(sessions[0].is_renamed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn prompt_sidecar_is_not_a_title() {
+        let sessions = list_demo_sessions(
+            "66666666",
+            &jsonl(&[REAL_PROMPT]),
+            Some(REAL_SIDECAR_PROMPT),
+        );
+        assert_eq!(
+            sessions[0].summary.as_deref(),
+            Some(summarize(PROMPT_TEXT).as_str())
+        );
+        assert!(!sessions[0].is_renamed);
+    }
+
+    #[test]
+    fn title_resolution_follows_the_producer_order() {
+        let manual = |t: &str| NativeTitle {
+            text: t.to_string(),
+            manual: true,
+        };
+        let side = parse_sidecar;
+        // Transcript record beats the sidecar; the sidecar beats the prompt.
+        assert_eq!(
+            resolve_summary(
+                Some(manual("A")),
+                side(REAL_SIDECAR_MANUAL),
+                Some("p".into())
+            ),
+            (Some("A".to_string()), true)
+        );
+        assert_eq!(
+            resolve_summary(None, side(REAL_SIDECAR_MANUAL), Some("p".into())),
+            (Some("Demo math session".to_string()), true)
+        );
+        // A generated title is shown but is not a user rename.
+        let auto = r#"{"version":1,"displayName":"Fix math","source":"auto","updatedAt":""}"#;
+        assert_eq!(
+            resolve_summary(None, side(auto), Some("p".into())),
+            (Some("Fix math".to_string()), false)
+        );
+        // A transcript that lost its head falls back to the prompt label.
+        assert_eq!(
+            resolve_summary(None, side(REAL_SIDECAR_PROMPT), None),
+            (Some(summarize(PROMPT_TEXT)), false)
+        );
+        // Invalid sidecars are ignored like the producer's reader does.
+        assert!(side(r#"{"version":2,"displayName":"x","source":"manual"}"#).is_none());
+        assert!(side(r#"{"version":1,"displayName":" ","source":"manual"}"#).is_none());
+        assert!(side(r#"{"version":1,"displayName":"x","source":"other"}"#).is_none());
+        // No `titleSource` is a legacy manual title; the last record wins.
+        let data = jsonl(&[
+            REAL_PROMPT,
+            &REAL_CUSTOM_TITLE.replace("Demo math session", "First"),
+            &REAL_CUSTOM_TITLE.replace(r#","titleSource":"manual""#, ""),
+        ]);
+        assert_eq!(
+            session_meta(&data).unwrap().custom_title,
+            Some(manual("Demo math session"))
+        );
+    }
+
+    #[test]
+    fn injected_user_records_are_not_prompts() {
+        // Producer `createNotificationRecord` also writes `subtype:"cron"`
+        // with `provenance:"system"` (not triggered in the sample).
+        let cron = REAL_NOTIFICATION
+            .replace(r#""subtype":"notification""#, r#""subtype":"cron""#)
+            .replace(
+                "<task-notification>\\n<task-id>bg_e3a6c4c9</task-id>\\n<kind>shell</kind>\\n<status>completed</status>\\n<summary>Shell command \\\"sleep 3; echo background-done\\\" completed.</summary>\\n</task-notification>",
+                "run the nightly check",
+            );
+        assert!(cron.contains("run the nightly check"));
+        let data = jsonl(&[&cron, REAL_PROMPT]);
+        let msgs = parse_messages(&data);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].uuid, "7f67b65a-269d-4922-94f2-9a641a7c9448");
+        let meta = session_meta(&data).unwrap();
+        assert_eq!(meta.message_count, 1);
+        // The injected prompt must not become the session summary.
+        assert_eq!(
+            meta.summary.as_deref(),
+            Some(summarize(PROMPT_TEXT).as_str())
+        );
+    }
+
+    #[test]
+    fn task_notification_stays_for_the_frontend_agent_update_card() {
+        let msgs = parse_messages(&jsonl(&[REAL_NOTIFICATION]));
+        assert_eq!(msgs.len(), 1);
+        let blocks = msgs[0].content.as_ref().unwrap().as_array().unwrap();
+        assert!(blocks[0]["text"]
+            .as_str()
+            .unwrap()
+            .starts_with("<task-notification>"));
+    }
+
+    #[test]
+    fn task_notification_is_shown_but_never_the_session_summary() {
+        // A transcript that lost its head can start with the notification.
+        let data = jsonl(&[REAL_NOTIFICATION, REAL_PROMPT]);
+        assert_eq!(parse_messages(&data).len(), 2);
+        let meta = session_meta(&data).unwrap();
+        assert_eq!(meta.message_count, 2);
+        assert_eq!(
+            meta.summary.as_deref(),
+            Some(summarize(PROMPT_TEXT).as_str())
+        );
+        // With no real prompt there is no summary to take from the notification.
+        assert_eq!(
+            session_meta(&jsonl(&[REAL_NOTIFICATION])).unwrap().summary,
+            None
+        );
+    }
+
+    #[test]
+    fn failed_shell_result_is_an_error_with_its_text() {
+        let msgs = parse_messages(&jsonl(&[REAL_FAILED_SHELL, REAL_OK_SHELL]));
+        let failed = msgs[0].content.as_ref().unwrap()[0].clone();
+        assert_eq!(failed["tool_use_id"], "call_nhkp98dw");
+        assert_eq!(failed["is_error"], true);
+        let text = failed["content"].as_str().unwrap();
+        assert!(text.starts_with("Command: npm test\nDirectory: /home/user/demo"));
+        let ok = msgs[1].content.as_ref().unwrap()[0].clone();
+        assert_eq!(ok["content"], "ok");
+        assert_eq!(ok["is_error"], false);
+    }
+
+    #[test]
+    fn tool_result_without_producer_status_gets_no_error_flag() {
+        // Cancelled calls also use `response.error`, but are not failures.
+        let cancelled = REAL_FAILED_SHELL.replace(r#""status":"error""#, r#""status":"cancelled""#);
+        let msgs = parse_messages(&jsonl(&[&cancelled]));
+        let block = &msgs[0].content.as_ref().unwrap()[0];
+        assert!(block.get("is_error").is_none());
+        assert!(block["content"]
+            .as_str()
+            .unwrap()
+            .starts_with("Command: npm test"));
     }
 }
