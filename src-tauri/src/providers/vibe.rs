@@ -344,15 +344,24 @@ fn load_store_entries(session_dir: &Path) -> StoreEntries {
     }
 
     if let Some(chunks) = resolve_manifest_chunks(session_dir) {
-        let read_all = |hashes: &[String]| -> Vec<Value> {
-            hashes
-                .iter()
-                .flat_map(|hash| read_chunk_file(&chunks_dir.join(format!("{hash}.json"))))
-                .collect()
-        };
+        let chunk_path = |hash: &String| chunks_dir.join(format!("{hash}.json"));
+        let checkpoint = chunks
+            .checkpoint
+            .iter()
+            .flat_map(|hash| read_chunk_file(&chunk_path(hash)))
+            .collect();
+        // A projection prefix is not the conversation: if any listed chunk is
+        // unreadable (for example a torn write), drop the projection so the
+        // checkpoint is used instead of showing a truncated history as complete.
+        let projection = chunks
+            .projection
+            .iter()
+            .map(|hash| read_chunk_file_checked(&chunk_path(hash)))
+            .collect::<Option<Vec<_>>>()
+            .map_or_else(Vec::new, |parts| parts.into_iter().flatten().collect());
         return StoreEntries {
-            checkpoint: read_all(&chunks.checkpoint),
-            projection: read_all(&chunks.projection),
+            checkpoint,
+            projection,
         };
     }
 
@@ -482,15 +491,19 @@ fn latest_generation(generations: &Path) -> Option<String> {
 /// session can leave a truncated final chunk — skip it instead of failing
 /// the whole session.
 fn read_chunk_file(path: &Path) -> Vec<Value> {
+    read_chunk_file_checked(path).unwrap_or_default()
+}
+
+/// Like [`read_chunk_file`], but `None` when the chunk is unreadable or not a
+/// JSON array, so a caller can tell a missing chunk from an empty one.
+fn read_chunk_file_checked(path: &Path) -> Option<Vec<Value>> {
     if is_symlink(path) {
-        return Vec::new();
+        return None;
     }
-    let Ok(content) = fs::read_to_string(path) else {
-        return Vec::new();
-    };
+    let content = fs::read_to_string(path).ok()?;
     match serde_json::from_str::<Value>(&content) {
-        Ok(Value::Array(items)) => items,
-        _ => Vec::new(),
+        Ok(Value::Array(items)) => Some(items),
+        _ => None,
     }
 }
 
@@ -2804,6 +2817,31 @@ mod tests {
             .as_deref()
             .unwrap()
             .starts_with("Call the read_file tool"));
+    }
+
+    #[test]
+    /// If a projection chunk the manifest lists cannot be read (torn write),
+    /// the readable prefix is not shown as the whole history: the checkpoint
+    /// is used instead.
+    fn unreadable_projection_chunk_falls_back_to_checkpoint() {
+        let temp = TempDir::new().expect("temp dir");
+        let (_cwd, session_dir) = write_store(
+            temp.path(),
+            &post_compaction_checkpoint(),
+            &full_projection(),
+        );
+        // Tear the second projection chunk.
+        fs::write(
+            Path::new(&session_dir).join(CHUNKS_DIR).join("p1.json"),
+            "[{\"type\": \"message\", \"ro",
+        )
+        .expect("tear chunk");
+
+        let messages = load_messages_from_base_path(temp.path().to_str().unwrap(), &session_dir)
+            .expect("load messages");
+        let kinds: Vec<&str> = messages.iter().map(|m| m.message_type.as_str()).collect();
+        assert_eq!(kinds, ["user", "system", "assistant"]);
+        assert!(block_text(&messages[2]).starts_with("The last line of"));
     }
 
     #[test]
