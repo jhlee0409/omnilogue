@@ -1490,6 +1490,7 @@ fn convert_assistant_bubble(
             .unwrap_or(Value::Object(serde_json::Map::default()));
 
         let mapped_name = map_cursor_tool_name(tool_name);
+        let args = normalize_cursor_tool_input(mapped_name, args);
 
         content_blocks.push(serde_json::json!({
             "type": "tool_use",
@@ -1595,15 +1596,44 @@ fn extract_bubble_timestamp(bubble: &Value) -> String {
 
 fn map_cursor_tool_name(name: &str) -> &str {
     match name {
-        "read_file" | "view_file" => "Read",
-        "write_to_file" | "create_file" | "edit_file" => "Write",
-        "execute_command" | "run_terminal_cmd" => "Bash",
+        "read_file" | "read_file_v2" | "view_file" => "Read",
+        "write_to_file" | "create_file" | "edit_file" | "write" => "Write",
+        "search_replace" => "Edit",
+        "execute_command" | "run_terminal_cmd" | "run_terminal_command_v2" => "Bash",
         "list_directory" | "list_dir" => "Glob",
-        "search_files" | "codebase_search" | "grep_search" => "Grep",
+        "search_files" | "codebase_search" | "grep_search" | "grep" | "rg" => "Grep",
+        "todo_write" => "TodoWrite",
         "web_search" => "WebSearch",
         "web_fetch" | "fetch_url" => "WebFetch",
         _ => name,
     }
+}
+
+/// Give a mapped Cursor tool's input the keys its card reads: Cursor names
+/// the file `target_file` (or `targetFile` in `params`) and a written file's
+/// text `contents`, where the cards read `file_path` and `content`. The
+/// original keys stay.
+fn normalize_cursor_tool_input(mapped_name: &str, mut args: Value) -> Value {
+    let Some(input) = args.as_object_mut() else {
+        return args;
+    };
+    let mut alias = |from: &[&str], to: &str| {
+        if input.contains_key(to) {
+            return;
+        }
+        if let Some(value) = from.iter().find_map(|key| input.get(*key)).cloned() {
+            input.insert(to.to_string(), value);
+        }
+    };
+    match mapped_name {
+        "Read" => alias(&["target_file", "targetFile"], "file_path"),
+        "Write" => {
+            alias(&["target_file", "relativeWorkspacePath"], "file_path");
+            alias(&["contents"], "content");
+        }
+        _ => {}
+    }
+    args
 }
 
 // ============================================================================
@@ -1925,6 +1955,47 @@ mod tests {
         assert_eq!(map_cursor_tool_name("codebase_search"), "Grep");
         assert_eq!(map_cursor_tool_name("write_to_file"), "Write");
         assert_eq!(map_cursor_tool_name("unknown_tool"), "unknown_tool");
+    }
+
+    /// Current Cursor tool names (as recorded in `state.vscdb`) reach the
+    /// Read / Edit / Write / Bash / Grep / `TodoWrite` cards with the input
+    /// keys those cards read.
+    #[test]
+    fn current_cursor_tools_use_the_canonical_cards() {
+        let tool = |name: &str, raw_args: &str| {
+            let bubble = json!({ "type": 2, "bubbleId": "b", "text": "", "toolFormerData": {
+                "toolCallId": "c", "status": "completed", "name": name, "rawArgs": raw_args
+            }});
+            let block = convert_cursor_bubble(&bubble, 2, "s")
+                .unwrap()
+                .content
+                .unwrap()[0]
+                .clone();
+            (
+                block["name"].as_str().unwrap().to_string(),
+                block["input"].clone(),
+            )
+        };
+        let (name, input) = tool("read_file", r#"{"target_file":"src/a.ts","offset":3}"#);
+        assert_eq!(
+            (name.as_str(), &input["file_path"]),
+            ("Read", &json!("src/a.ts"))
+        );
+        let (name, _) = tool("read_file_v2", r#"{"path":"src/a.ts"}"#);
+        assert_eq!(name, "Read");
+        let (name, input) = tool(
+            "search_replace",
+            r#"{"file_path":"a","old_string":"x","new_string":"y"}"#,
+        );
+        assert_eq!((name.as_str(), &input["old_string"]), ("Edit", &json!("x")));
+        let (name, input) = tool("write", r#"{"file_path":"a","contents":"body"}"#);
+        assert_eq!(
+            (name.as_str(), &input["content"]),
+            ("Write", &json!("body"))
+        );
+        assert_eq!(tool("run_terminal_command_v2", "null").0, "Bash");
+        assert_eq!(tool("grep", r#"{"pattern":"x","path":"."}"#).0, "Grep");
+        assert_eq!(tool("todo_write", r#"{"todos":[]}"#).0, "TodoWrite");
     }
 
     #[test]
