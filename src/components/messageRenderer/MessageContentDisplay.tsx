@@ -2,7 +2,7 @@ import { useId } from "react";
 import { Button } from "@/components/ui/button";
 import React, { useMemo, Children, isValidElement } from "react";
 import ReactMarkdown from "react-markdown";
-import { Copy, ChevronDown } from "lucide-react";
+import { Copy, ChevronDown, FileText } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { CommandRenderer, ImageRenderer, TaskNotificationRenderer, hasTaskNotification } from "../contentRenderer";
 import { isImageUrl, isBase64Image } from "../../utils/messageUtils";
@@ -13,6 +13,8 @@ import { cn } from "@/lib/utils";
 import { REMARK_PLUGINS, REHYPE_PLUGINS } from "@/lib/markdownPlugins";
 import { useCaptureExpandState } from "@/contexts/CaptureExpandContext";
 import { useAppStore } from "@/store/useAppStore";
+import { Renderer } from "@/shared/RendererHeader";
+import { isInjectedWrapperText } from "../MessageViewer/helpers/messageKinds";
 
 // Source lines shown before "Show more". 3 collapsed almost every reply behind
 // a click; 12 keeps typical answers fully visible and only folds long dumps.
@@ -146,7 +148,14 @@ export const MessageContentDisplay: React.FC<MessageContentDisplayProps> = ({
 
   if (!content) return null;
 
-  if (typeof content === "string") {
+  // Context the client injected into the user turn (Codex's
+  // `<environment_context>`, a lone `<system-reminder>` or
+  // `<local-command-caveat>`): a collapsed card, not a speech bubble or a
+  // command. While searching it is the plain bubble, so matches highlight.
+  const injectedContext =
+    messageType === "user" && typeof content === "string" && isInjectedWrapperText(content);
+
+  if (typeof content === "string" && !injectedContext) {
     // Strip code blocks (``` ... ```) and inline code (` ... `) before testing
     // so that tags mentioned inside code examples don't trigger special renderers
     const contentWithoutCode = content
@@ -178,6 +187,21 @@ export const MessageContentDisplay: React.FC<MessageContentDisplayProps> = ({
 
   if (typeof content !== "string") {
     return null; // Or some other fallback for non-string content
+  }
+
+  if (injectedContext && !searchQuery) {
+    return (
+      <Renderer className="mb-3 bg-muted/50 border-border" expandKey="injected-context" defaultExpanded={false}>
+        <Renderer.Header
+          title={t("messageContentDisplay.injectedContext")}
+          icon={<FileText className={cn(layout.iconSize, "text-muted-foreground")} />}
+          titleClassName="text-muted-foreground"
+        />
+        <Renderer.Content>
+          <div className="text-foreground whitespace-pre-wrap break-words text-body">{content}</div>
+        </Renderer.Content>
+      </Renderer>
+    );
   }
 
   if (messageType === "user") {

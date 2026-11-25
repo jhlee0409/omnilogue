@@ -17,6 +17,7 @@
   "message.system": "시스템",
   "message.user": "사용자",
   "messageContentDisplay.copyMessage": "메시지 복사하기",
+  "messageContentDisplay.injectedContext": "자동 삽입된 컨텍스트",
   "messageContentDisplay.showLess": "접기",
   "messageContentDisplay.showMore": "더 보기...",
   "messageContentDisplay.showMoreRows": "{{count}}개 행 더 보기...",

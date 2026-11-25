@@ -17,6 +17,7 @@
   "message.system": "システム",
   "message.user": "ユーザー",
   "messageContentDisplay.copyMessage": "メッセージをコピー",
+  "messageContentDisplay.injectedContext": "自動挿入されたコンテキスト",
   "messageContentDisplay.showLess": "折りたたむ",
   "messageContentDisplay.showMore": "もっと見る...",
   "messageContentDisplay.showMoreRows": "あと{{count}}行を表示...",
