@@ -409,14 +409,19 @@ fn resolve_summary(
 }
 
 /// A user-role record the CLI wrote on its own behalf rather than the person
-/// typing it, which the viewer must not show as a prompt. `<task-notification>`
-/// text is kept: the frontend renders it as an agent update.
-fn is_injected_user_record(rec: &Value) -> bool {
+/// typing it (not a prompt, so never a session summary).
+fn is_cli_written_user_record(rec: &Value) -> bool {
     let provenance = rec.get("provenance").and_then(Value::as_str);
     let subtype = rec.get("subtype").and_then(Value::as_str);
-    let injected = matches!(provenance, Some("system" | "external_agent" | "mod_prompt"))
-        || matches!(subtype, Some("notification" | "cron" | "agent_message"));
-    injected && !carries_task_notification(rec)
+    matches!(provenance, Some("system" | "external_agent" | "mod_prompt"))
+        || matches!(subtype, Some("notification" | "cron" | "agent_message"))
+}
+
+/// A CLI-written user record the viewer must not show as a message.
+/// `<task-notification>` text is kept: the frontend renders it as an agent
+/// update.
+fn is_injected_user_record(rec: &Value) -> bool {
+    is_cli_written_user_record(rec) && !carries_task_notification(rec)
 }
 
 fn carries_task_notification(rec: &Value) -> bool {
@@ -482,7 +487,7 @@ fn session_meta(data: &str) -> Option<SessionMeta> {
             }
             last_ts = Some(ts.to_string());
         }
-        if summary.is_none() && rec_type == "user" {
+        if summary.is_none() && rec_type == "user" && !is_cli_written_user_record(&rec) {
             summary = first_text(&rec).map(|t| summarize(&t));
         }
         if rec_type == "tool_result" || record_has_function_call(&rec) {
@@ -1104,6 +1109,24 @@ mod tests {
             .as_str()
             .unwrap()
             .starts_with("<task-notification>"));
+    }
+
+    #[test]
+    fn task_notification_is_shown_but_never_the_session_summary() {
+        // A transcript that lost its head can start with the notification.
+        let data = jsonl(&[REAL_NOTIFICATION, REAL_PROMPT]);
+        assert_eq!(parse_messages(&data).len(), 2);
+        let meta = session_meta(&data).unwrap();
+        assert_eq!(meta.message_count, 2);
+        assert_eq!(
+            meta.summary.as_deref(),
+            Some(summarize(PROMPT_TEXT).as_str())
+        );
+        // With no real prompt there is no summary to take from the notification.
+        assert_eq!(
+            session_meta(&jsonl(&[REAL_NOTIFICATION])).unwrap().summary,
+            None
+        );
     }
 
     #[test]
