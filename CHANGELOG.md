@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-11-25
+
 ### Added
 - **Expand long messages by default** (desktop and WebUI). An optional view setting, off by default, opens messages longer than the 12-line preview already expanded instead of behind "Show more". Turn it on from the gear menu's View section, the desktop View menu or the ⌘K palette ("Expand or Collapse Long Messages by Default"); it is saved in `settings.json` and applied in every window. A message's own Show more / Show less choice still wins, and thinking blocks, tool results, tables and diffs keep their own collapsed default. (#574)
 - **Every assistant in a shared folder is one click away** (desktop and WebUI). When several assistants worked in the same folder, its project row lists one assistant's sessions; the others were reachable only from the right-click menu. Expanding the row now shows a chip per assistant with its session count, and choosing one lists that assistant's sessions. The row's count is the total for all of them, and its tooltip gives each assistant's count.
