@@ -18,21 +18,27 @@
 //! fallback. Tool results live in a sibling `tool_results` map keyed by
 //! tool-use id and are surfaced as a following user turn (Claude convention).
 //!
-//! Projects group by the thread's first workspace folder (`folder_paths`).
-//! Schema is undocumented/unstable across Zed releases (see the `zed-chat-export`
-//! reference tool); tool inputs/results are treated as opaque JSON.
+//! Projects group by the thread's display-first workspace folder
+//! (`folder_paths`, see `workspace_of`). Sub-agent threads (`parent_id` set)
+//! are not listed as sessions; the `SubAgent` panel lists them under the
+//! thread that spawned them ([`load_subagents`]). Schema is
+//! undocumented/unstable across Zed releases (see the `zed-chat-export`
+//! reference tool); tool results are treated as opaque JSON.
 
 use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession};
+use crate::providers::opencode::ChildSession;
 use crate::providers::ProviderInfo;
 use crate::utils::{build_provider_message, search_json_value_case_insensitive};
 use rusqlite::{Connection, OpenFlags};
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 const PROVIDER: &str = "zed";
 const SCHEME: &str = "zed://";
 const UNKNOWN_WORKSPACE: &str = "unknown";
+/// Longest session title taken from a thread's first prompt.
+const SUMMARY_MAX_CHARS: usize = 100;
 
 fn get_db_path() -> Option<PathBuf> {
     // Mirror Zed's own `paths::data_dir()`. macOS uses ~/Library/Application
@@ -85,19 +91,38 @@ fn open_db() -> Result<Connection, String> {
     Ok(conn)
 }
 
-/// First workspace folder of a thread (from the `folder_paths` JSON array),
-/// used as the project grouping key.
-fn workspace_of(folder_paths: Option<&str>) -> String {
-    folder_paths
-        .and_then(|fp| serde_json::from_str::<Value>(fp).ok())
-        .and_then(|v| {
-            v.as_array()
-                .and_then(|a| a.first())
-                .and_then(Value::as_str)
-                .map(str::to_string)
-        })
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| UNKNOWN_WORKSPACE.to_string())
+/// Display-first workspace folder of a thread, used as the project grouping
+/// key. Zed writes `folder_paths` the way `PathList::serialize` does
+/// (`crates/util/src/path_list.rs`): the paths sorted lexicographically and
+/// joined with `\n`, with `folder_paths_order` giving each path's display
+/// position as comma-separated indices. The path at position 0 is the one Zed
+/// shows first. Like `PathList::deserialize` (which compares `PathBuf`s), an
+/// order that does not fit the paths falls back to the first path in sorted
+/// order.
+fn workspace_of(folder_paths: Option<&str>, folder_paths_order: Option<&str>) -> String {
+    let Some(serialized) = folder_paths.filter(|s| !s.is_empty()) else {
+        return UNKNOWN_WORKSPACE.to_string();
+    };
+    let mut paths: Vec<&Path> = serialized.split('\n').map(Path::new).collect();
+    let order: Vec<usize> = folder_paths_order
+        .unwrap_or("")
+        .split(',')
+        .filter_map(|ix| ix.trim().parse().ok())
+        .collect();
+    let first = if paths.is_sorted() && order.len() == paths.len() {
+        order
+            .iter()
+            .zip(&paths)
+            .min_by_key(|(ix, _)| **ix)
+            .map(|(_, path)| *path)
+    } else {
+        paths.sort_unstable();
+        paths.first().copied()
+    };
+    first
+        .and_then(Path::to_str)
+        .filter(|path| !path.is_empty())
+        .map_or_else(|| UNKNOWN_WORKSPACE.to_string(), str::to_string)
 }
 
 /// Column names present in `table` (via `PRAGMA table_info`). Lets SELECTs adapt
@@ -120,6 +145,21 @@ fn optional_col(cols: &HashSet<String>, name: &str) -> String {
         name.to_string()
     } else {
         format!("NULL AS {name}")
+    }
+}
+
+/// `WHERE` clause keeping only threads listed as sessions. Zed sets
+/// `parent_id` on a sub-agent thread (`DbThread.subagent_context
+/// .parent_thread_id`); [`load_subagents`] lists those under their parent.
+/// The parent must exist, so a run whose parent was deleted is still listed
+/// rather than lost. Older schemas have no sub-agents and no column. Search
+/// uses it too: a hit in a thread that is not listed could not be opened.
+fn top_level_filter(cols: &HashSet<String>) -> &'static str {
+    if cols.contains("parent_id") {
+        "WHERE NOT (COALESCE(threads.parent_id, '') <> '' \
+         AND EXISTS (SELECT 1 FROM threads p WHERE p.id = threads.parent_id))"
+    } else {
+        ""
     }
 }
 
@@ -146,8 +186,10 @@ pub fn scan_projects() -> Result<Vec<ClaudeProject>, String> {
 fn scan_projects_conn(conn: &Connection) -> Result<Vec<ClaudeProject>, String> {
     let cols = table_columns(conn, "threads");
     let sql = format!(
-        "SELECT {}, updated_at FROM threads",
-        optional_col(&cols, "folder_paths")
+        "SELECT {}, {}, updated_at FROM threads {}",
+        optional_col(&cols, "folder_paths"),
+        optional_col(&cols, "folder_paths_order"),
+        top_level_filter(&cols),
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
 
@@ -160,12 +202,13 @@ fn scan_projects_conn(conn: &Connection) -> Result<Vec<ClaudeProject>, String> {
     let rows = stmt
         .query_map([], |row| {
             let folder_paths: Option<String> = row.get(0)?;
-            let updated_at: Option<String> = row.get(1)?;
-            Ok((folder_paths, updated_at))
+            let folder_paths_order: Option<String> = row.get(1)?;
+            let updated_at: Option<String> = row.get(2)?;
+            Ok((folder_paths, folder_paths_order, updated_at))
         })
         .map_err(|e| e.to_string())?;
-    for (folder_paths, updated_at) in rows.flatten() {
-        let ws = workspace_of(folder_paths.as_deref());
+    for (folder_paths, folder_paths_order, updated_at) in rows.flatten() {
+        let ws = workspace_of(folder_paths.as_deref(), folder_paths_order.as_deref());
         let entry = by_ws.entry(ws).or_insert_with(|| Agg {
             session_count: 0,
             last_modified: String::new(),
@@ -210,10 +253,16 @@ pub fn load_sessions(
 
 fn load_sessions_conn(conn: &Connection, target_ws: &str) -> Result<Vec<ClaudeSession>, String> {
     let cols = table_columns(conn, "threads");
+    // `data` only for threads without a title, which fall back to their
+    // first prompt.
     let sql = format!(
-        "SELECT id, summary, {}, {}, updated_at FROM threads ORDER BY updated_at DESC",
+        "SELECT id, summary, {}, {}, {}, updated_at, data_type, \
+                CASE WHEN summary IS NULL OR trim(summary) = '' THEN data END \
+         FROM threads {} ORDER BY updated_at DESC",
         optional_col(&cols, "folder_paths"),
+        optional_col(&cols, "folder_paths_order"),
         optional_col(&cols, "created_at"),
+        top_level_filter(&cols),
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
 
@@ -222,33 +271,62 @@ fn load_sessions_conn(conn: &Connection, target_ws: &str) -> Result<Vec<ClaudeSe
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_default();
 
+    struct Row {
+        id: String,
+        summary: Option<String>,
+        folder_paths: Option<String>,
+        folder_paths_order: Option<String>,
+        created_at: Option<String>,
+        updated_at: Option<String>,
+        data_type: Option<String>,
+        untitled_data: Option<Vec<u8>>,
+    }
+
     let sessions = stmt
         .query_map([], |row| {
-            let id: String = row.get(0)?;
-            let summary: Option<String> = row.get(1)?;
-            let folder_paths: Option<String> = row.get(2)?;
-            let created_at: Option<String> = row.get(3)?;
-            let updated_at: Option<String> = row.get(4)?;
-            Ok((id, summary, folder_paths, created_at, updated_at))
+            Ok(Row {
+                id: row.get(0)?,
+                summary: row.get(1)?,
+                folder_paths: row.get(2)?,
+                folder_paths_order: row.get(3)?,
+                created_at: row.get(4)?,
+                updated_at: row.get(5)?,
+                data_type: row.get(6)?,
+                untitled_data: row.get(7)?,
+            })
         })
         .map_err(|e| e.to_string())?
         .flatten()
-        .filter(|(_, _, folder_paths, _, _)| workspace_of(folder_paths.as_deref()) == target_ws)
-        .map(|(id, summary, _, created_at, updated_at)| {
-            let created = created_at.unwrap_or_default();
-            let updated = updated_at.unwrap_or_default();
+        .filter(|row| {
+            workspace_of(
+                row.folder_paths.as_deref(),
+                row.folder_paths_order.as_deref(),
+            ) == target_ws
+        })
+        .map(|row| {
+            let created = row.created_at.unwrap_or_default();
+            let updated = row.updated_at.unwrap_or_default();
+            let summary = row
+                .summary
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    let data = row.untitled_data.as_deref()?;
+                    let thread = decode_thread_data(row.data_type.as_deref()?, data).ok()?;
+                    first_prompt_title(&thread)
+                })
+                .unwrap_or_else(|| row.id.clone());
             ClaudeSession {
-                session_id: format!("{SCHEME}{id}"),
-                actual_session_id: id.clone(),
-                file_path: format!("{SCHEME}{id}"),
+                session_id: format!("{SCHEME}{}", row.id),
+                file_path: format!("{SCHEME}{}", row.id),
+                actual_session_id: row.id,
                 project_name: project_name.clone(),
                 message_count: 0,
-                first_message_time: created.clone(),
+                first_message_time: created,
                 last_message_time: updated.clone(),
                 last_modified: updated,
                 has_tool_use: false,
                 has_errors: false,
-                summary: summary.filter(|s| !s.trim().is_empty()).or(Some(id)),
+                summary: Some(summary),
                 is_renamed: false,
                 provider: Some(PROVIDER.to_string()),
                 storage_type: Some("sqlite".to_string()),
@@ -258,6 +336,25 @@ fn load_sessions_conn(conn: &Connection, target_ws: &str) -> Result<Vec<ClaudeSe
         .collect();
 
     Ok(sessions)
+}
+
+/// Title for a thread Zed has not titled yet (`DbThread.title` is empty until
+/// title generation succeeds): its first typed prompt, cut to
+/// [`SUMMARY_MAX_CHARS`].
+fn first_prompt_title(thread: &Value) -> Option<String> {
+    let text = thread
+        .get("messages")?
+        .as_array()?
+        .iter()
+        .filter_map(|msg| msg.get("User")?.get("content")?.as_array())
+        .flatten()
+        .filter_map(|item| item.get("Text")?.as_str())
+        .map(str::trim)
+        .find(|text| !text.is_empty())?;
+    Some(match text.char_indices().nth(SUMMARY_MAX_CHARS) {
+        Some((idx, _)) => format!("{}...", &text[..idx]),
+        None => text.to_string(),
+    })
 }
 
 /// Load messages for one Zed thread (`zed://<thread_id>`).
@@ -276,6 +373,122 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
     Ok(parse_thread(&json, id, updated_at.as_deref().unwrap_or("")))
 }
 
+/// A sub-agent thread, for the `SubAgent` panel of the thread that spawned it.
+pub struct ZedSubagent {
+    pub session: ChildSession,
+    /// The parent's `spawn_agent` call that started the thread, when its
+    /// result names the thread.
+    pub tool_use_id: Option<String>,
+}
+
+/// The sub-agent threads `session_path` (`zed://<thread_id>`) spawned:
+/// threads whose `parent_id` is the thread, oldest first. A deeper run is
+/// listed by its own parent. Empty on schemas without `parent_id`.
+pub fn load_subagents(session_path: &str) -> Result<Vec<ZedSubagent>, String> {
+    let id = session_path.strip_prefix(SCHEME).unwrap_or(session_path);
+    load_subagents_conn(&open_db()?, id)
+}
+
+fn load_subagents_conn(conn: &Connection, parent_id: &str) -> Result<Vec<ZedSubagent>, String> {
+    let cols = table_columns(conn, "threads");
+    if !cols.contains("parent_id") {
+        return Ok(Vec::new());
+    }
+    let spawned_by = conn
+        .query_row(
+            "SELECT data_type, data FROM threads WHERE id = ?1",
+            [parent_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .ok()
+        .and_then(|(data_type, data)| decode_thread_data(&data_type, &data).ok())
+        .map(|thread| spawning_calls(&thread))
+        .unwrap_or_default();
+
+    let sql = format!(
+        "SELECT id, summary, {}, updated_at, data_type, data FROM threads \
+         WHERE parent_id = ?1 AND id != ?1 ORDER BY 3, updated_at",
+        optional_col(&cols, "created_at"),
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([parent_id], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Vec<u8>>(5)?,
+            ))
+        })
+        .map_err(|e| e.to_string())?;
+
+    let mut subagents = Vec::new();
+    for (id, summary, created_at, updated_at, data_type, data) in rows.flatten() {
+        let thread = decode_thread_data(&data_type, &data).ok();
+        let updated_at = updated_at.unwrap_or_default();
+        let title = summary
+            .filter(|s| !s.trim().is_empty())
+            .or_else(|| thread.as_ref().and_then(first_prompt_title))
+            .unwrap_or_default();
+        let message_count = thread
+            .as_ref()
+            .map_or(0, |thread| parse_thread(thread, &id, &updated_at).len());
+        subagents.push(ZedSubagent {
+            tool_use_id: spawned_by.get(&id).cloned(),
+            session: ChildSession {
+                created_at: created_at.unwrap_or_else(|| updated_at.clone()),
+                updated_at,
+                id,
+                title,
+                message_count,
+            },
+        });
+    }
+    Ok(subagents)
+}
+
+/// Sub-agent thread id -> the `spawn_agent` call that started it. The call's
+/// result keeps the tool's `SpawnAgentToolOutput` in `output`, whose
+/// `session_id` is the sub-agent thread's id
+/// (`crates/agent/src/tools/spawn_agent_tool.rs`). A follow-up call to the
+/// same agent names it again; the first call is kept.
+fn spawning_calls(thread: &Value) -> HashMap<String, String> {
+    let mut calls = HashMap::new();
+    let messages = thread.get("messages").and_then(Value::as_array);
+    for msg in messages.into_iter().flatten() {
+        let Some(results) = msg
+            .get("Agent")
+            .and_then(|agent| agent.get("tool_results"))
+            .and_then(Value::as_object)
+        else {
+            continue;
+        };
+        let calls_in_message = msg
+            .get("Agent")
+            .and_then(|agent| agent.get("content"))
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|item| item.get("ToolUse")?.get("id")?.as_str());
+        for call_id in calls_in_message {
+            let Some(child) = results
+                .get(call_id)
+                .and_then(|result| result.get("output"))
+                .and_then(|output| output.get("session_id"))
+                .and_then(Value::as_str)
+            else {
+                continue;
+            };
+            calls
+                .entry(child.to_string())
+                .or_insert_with(|| call_id.to_string());
+        }
+    }
+    calls
+}
+
 /// Search across all Zed threads.
 pub fn search(query: &str, limit: usize) -> Result<Vec<ClaudeMessage>, String> {
     if query.is_empty() || limit == 0 {
@@ -288,8 +501,10 @@ fn search_conn(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Claud
     let query_lower = query.to_lowercase();
     let cols = table_columns(conn, "threads");
     let sql = format!(
-        "SELECT id, data_type, data, updated_at, {} FROM threads",
-        optional_col(&cols, "folder_paths")
+        "SELECT id, data_type, data, updated_at, {}, {} FROM threads {}",
+        optional_col(&cols, "folder_paths"),
+        optional_col(&cols, "folder_paths_order"),
+        top_level_filter(&cols),
     );
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
@@ -300,16 +515,17 @@ fn search_conn(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Claud
                 row.get::<_, Vec<u8>>(2)?,
                 row.get::<_, Option<String>>(3)?,
                 row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })
         .map_err(|e| e.to_string())?;
 
     let mut results = Vec::new();
-    for (id, data_type, data, updated_at, folder_paths) in rows.flatten() {
+    for (id, data_type, data, updated_at, folder_paths, folder_paths_order) in rows.flatten() {
         let Ok(json) = decode_thread_data(&data_type, &data) else {
             continue;
         };
-        let ws = workspace_of(folder_paths.as_deref());
+        let ws = workspace_of(folder_paths.as_deref(), folder_paths_order.as_deref());
         let project_name = project_name_for(&ws);
         let project_path = project_path_for(&ws);
         for mut msg in parse_thread(&json, &id, updated_at.as_deref().unwrap_or("")) {
@@ -412,7 +628,34 @@ fn convert_message(
             out.push(make_msg(thread_id, idx, mapped, ts, blocks, None));
         }
     }
-    // "Resume" / {"Compaction":...} -> ignored.
+    // `{"Compaction":{"Summary":"…"}}`: the summary that replaced the earlier
+    // turns (`CompactionInfo::Summary`), shown as a compaction marker. A
+    // `ProviderNative` compaction keeps only provider items, so the marker has
+    // no summary. `"Resume"` carries nothing to show.
+    if let Some(compaction) = msg.get("Compaction") {
+        let summary = compaction
+            .get("Summary")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let text = summary.map_or_else(
+            || "Context compacted".to_string(),
+            |summary| format!("Context compacted\n\n{summary}"),
+        );
+        let mut message = build_provider_message(
+            PROVIDER,
+            format!("{thread_id}-{idx}"),
+            thread_id,
+            ts.to_string(),
+            "system",
+            None,
+            Some(Value::String(text)),
+            None,
+        );
+        message.subtype = Some("compact_boundary".to_string());
+        message.level = Some("info".to_string());
+        out.push(message);
+    }
 }
 
 fn user_blocks(content: Option<&Value>) -> Vec<Value> {
@@ -431,8 +674,19 @@ fn user_blocks(content: Option<&Value>) -> Vec<Value> {
                     blocks.push(json!({ "type": "text", "text": text }));
                 }
             }
+        } else if let Some(source) = item
+            .get("Image")
+            .and_then(|image| image.get("source"))
+            .and_then(Value::as_str)
+            .filter(|source| !source.is_empty())
+        {
+            // `LanguageModelImage.source`: base64 PNG bytes without a
+            // `data:` prefix (`crates/language_model/src/request.rs`).
+            blocks.push(json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": "image/png", "data": source }
+            }));
         }
-        // Image -> skipped in this MVP.
     }
     blocks
 }
@@ -462,15 +716,39 @@ fn agent_blocks(content: Option<&Value>) -> Vec<Value> {
                 .get("name")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown");
-            let input = tool
-                .get("input")
-                .or_else(|| tool.get("raw_input"))
-                .cloned()
-                .unwrap_or_else(|| json!({}));
+            let input = tool_input(tool);
             blocks.push(json!({ "type": "tool_use", "id": id, "name": name, "input": input }));
         }
     }
     blocks
+}
+
+/// Arguments of a `ToolUse`. Zed serializes `LanguageModelToolUse.input` as
+/// `{"type":"json","value":<args>}` or `{"type":"text","value":"…"}`
+/// (`crates/language_model_core/src/language_model_core.rs`), and reads any
+/// other value as the arguments themselves; `raw_input` holds the arguments
+/// as the model streamed them. Text input that parses as JSON is shown as
+/// that JSON.
+fn tool_input(tool: &Value) -> Value {
+    let parse = |text: &str| serde_json::from_str::<Value>(text).ok();
+    if let Some(input) = tool.get("input") {
+        let wrapped = input
+            .as_object()
+            .filter(|object| object.len() == 2)
+            .and_then(|object| Some((object.get("type")?.as_str()?, object.get("value")?)));
+        return match wrapped {
+            Some(("json", value)) => value.clone(),
+            Some(("text", Value::String(text))) => {
+                parse(text).unwrap_or_else(|| Value::String(text.clone()))
+            }
+            _ => input.clone(),
+        };
+    }
+    match tool.get("raw_input") {
+        Some(Value::String(raw)) => parse(raw).unwrap_or_else(|| Value::String(raw.clone())),
+        Some(other) => other.clone(),
+        None => json!({}),
+    }
 }
 
 fn legacy_segments(segments: Option<&Value>) -> Vec<Value> {
@@ -656,14 +934,31 @@ mod tests {
         assert_eq!(a[1]["type"], "text");
     }
 
+    // `PathList::serialize` (crates/util/src/path_list.rs): sorted paths
+    // joined with `\n`, display positions in `folder_paths_order`.
     #[test]
-    fn workspace_grouping_from_folder_paths() {
+    fn workspace_is_the_display_first_folder() {
         assert_eq!(
-            workspace_of(Some(r#"["/Users/jack/proj","/other"]"#)),
+            workspace_of(Some("/Users/jack/proj"), Some("0")),
             "/Users/jack/proj"
         );
-        assert_eq!(workspace_of(Some("[]")), "unknown");
-        assert_eq!(workspace_of(None), "unknown");
+        // Zed shows `/zz/api` first: position 0 belongs to the second path.
+        assert_eq!(
+            workspace_of(Some("/aa/web\n/zz/api"), Some("1,0")),
+            "/zz/api"
+        );
+        assert_eq!(
+            workspace_of(Some("/aa/web\n/zz/api"), Some("0,1")),
+            "/aa/web"
+        );
+        // An order that does not fit falls back to the first sorted path.
+        assert_eq!(workspace_of(Some("/aa/web\n/zz/api"), None), "/aa/web");
+        assert_eq!(
+            workspace_of(Some("/zz/api\n/aa/web"), Some("0,1")),
+            "/aa/web"
+        );
+        assert_eq!(workspace_of(Some(""), None), "unknown");
+        assert_eq!(workspace_of(None, None), "unknown");
     }
 
     #[test]
@@ -759,7 +1054,7 @@ mod tests {
                 &"2026-06-20T10:00:00Z",
                 &"json",
                 &data,
-                &r#"["/Users/jack/proj"]"#,
+                &"/Users/jack/proj",
                 &"2026-06-20T09:00:00Z",
             ],
         );
@@ -783,10 +1078,7 @@ mod tests {
             [],
         )
         .unwrap();
-        for (id, folders) in [
-            ("ta", r#"["/work/client-a/app"]"#),
-            ("tb", r#"["/work/client-b/app"]"#),
-        ] {
+        for (id, folders) in [("ta", "/work/client-a/app"), ("tb", "/work/client-b/app")] {
             let data = serde_json::to_vec(
                 &json!({ "messages": [{ "User": { "content": [{ "Text": "needle" }] } }] }),
             )
@@ -830,6 +1122,202 @@ mod tests {
         let compressed = zstd::encode_all(&json_bytes[..], 3).unwrap();
         let got = decode_thread_data("zstd", &compressed).unwrap();
         assert!(got.get("messages").is_some());
+    }
+
+    /// A `threads` table with the columns `save_thread_sync` writes
+    /// (crates/agent/src/db.rs).
+    fn current_schema() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute(
+            "CREATE TABLE threads (id TEXT PRIMARY KEY, parent_id TEXT, folder_paths TEXT, \
+             folder_paths_order TEXT, summary TEXT NOT NULL, updated_at TEXT NOT NULL, \
+             data_type TEXT NOT NULL, data BLOB NOT NULL, created_at TEXT)",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_current(
+        conn: &Connection,
+        id: &str,
+        parent_id: Option<&str>,
+        summary: &str,
+        created_at: &str,
+        thread: &Value,
+    ) {
+        let data = zstd::encode_all(&serde_json::to_vec(thread).unwrap()[..], 3).unwrap();
+        insert_thread(
+            conn,
+            "id, parent_id, folder_paths, folder_paths_order, summary, updated_at, data_type, \
+             data, created_at",
+            &[
+                &id,
+                &parent_id,
+                &"/aa/web\n/zz/api",
+                &"1,0",
+                &summary,
+                &created_at,
+                &"zstd",
+                &data,
+                &created_at,
+            ],
+        );
+    }
+
+    #[test]
+    fn newline_folder_paths_group_threads_into_their_project() {
+        let conn = current_schema();
+        let thread = json!({ "messages": [{ "User": { "content": [{ "Text": "needle" }] } }] });
+        insert_current(&conn, "t1", None, "Fix it", "2026-11-26T10:00:00Z", &thread);
+
+        let projects = scan_projects_conn(&conn).unwrap();
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].actual_path, "/zz/api");
+        assert_eq!(projects[0].name, "api");
+        assert_eq!(load_sessions_conn(&conn, "/zz/api").unwrap().len(), 1);
+        let hits = search_conn(&conn, "needle", 10).unwrap();
+        assert_eq!(hits[0].project_path.as_deref(), Some("zed:///zz/api"));
+    }
+
+    #[test]
+    fn untitled_thread_is_named_by_its_first_prompt() {
+        let conn = current_schema();
+        let long = "x".repeat(150);
+        let thread = json!({ "title": "", "messages": [
+            { "User": { "content": [{ "Mention": { "uri": "file:///a", "content": "ctx" } }, { "Text": "  " }] } },
+            { "User": { "content": [{ "Text": long }] } }
+        ] });
+        insert_current(&conn, "t1", None, "", "2026-11-26T10:00:00Z", &thread);
+        insert_current(&conn, "t2", None, "Named", "2026-11-26T09:00:00Z", &thread);
+
+        let sessions = load_sessions_conn(&conn, "/zz/api").unwrap();
+        let title = |id: &str| {
+            sessions
+                .iter()
+                .find(|s| s.actual_session_id == id)
+                .and_then(|s| s.summary.clone())
+                .unwrap()
+        };
+        assert_eq!(title("t1"), format!("{}...", "x".repeat(100)));
+        assert_eq!(title("t2"), "Named");
+    }
+
+    #[test]
+    fn sub_agent_threads_are_listed_under_the_thread_that_spawned_them() {
+        let conn = current_schema();
+        let parent = json!({ "messages": [
+            { "User": { "content": [{ "Text": "split the work" }] } },
+            { "Agent": {
+                "content": [
+                    { "ToolUse": { "id": "call-1", "name": "spawn_agent", "raw_input": "{}", "input": { "type": "json", "value": {} } } }
+                ],
+                "tool_results": { "call-1": {
+                    "tool_use_id": "call-1", "tool_name": "spawn_agent", "is_error": false,
+                    "content": [{ "Text": "{\"session_id\":\"child\",\"output\":\"done\"}" }],
+                    "output": { "session_id": "child", "output": "done", "session_info": {} }
+                } }
+            } }
+        ] });
+        let child = json!({ "messages": [
+            { "User": { "content": [{ "Text": "list the files" }] } },
+            { "Agent": { "content": [{ "Text": "a.rs" }], "tool_results": {} } }
+        ] });
+        insert_current(
+            &conn,
+            "parent",
+            None,
+            "Parent",
+            "2026-11-26T10:00:00Z",
+            &parent,
+        );
+        insert_current(
+            &conn,
+            "child",
+            Some("parent"),
+            "",
+            "2026-11-26T10:01:00Z",
+            &child,
+        );
+        insert_current(
+            &conn,
+            "orphan",
+            Some("gone"),
+            "Orphan",
+            "2026-11-26T10:02:00Z",
+            &child,
+        );
+
+        let listed: Vec<String> = load_sessions_conn(&conn, "/zz/api")
+            .unwrap()
+            .into_iter()
+            .map(|s| s.actual_session_id)
+            .collect();
+        assert_eq!(listed, ["orphan", "parent"]);
+        assert_eq!(scan_projects_conn(&conn).unwrap()[0].session_count, 2);
+        let hits = search_conn(&conn, "list the files", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].session_id, "orphan");
+
+        let subagents = load_subagents_conn(&conn, "parent").unwrap();
+        assert_eq!(subagents.len(), 1);
+        assert_eq!(subagents[0].session.id, "child");
+        assert_eq!(subagents[0].session.title, "list the files");
+        assert_eq!(subagents[0].session.message_count, 2);
+        assert_eq!(subagents[0].session.created_at, "2026-11-26T10:01:00Z");
+        assert_eq!(subagents[0].tool_use_id.as_deref(), Some("call-1"));
+        assert!(load_subagents_conn(&conn, "child").unwrap().is_empty());
+    }
+
+    // `LanguageModelToolUseInput` serialization
+    // (crates/language_model_core/src/language_model_core.rs).
+    #[test]
+    fn tool_input_is_unwrapped_from_its_type_tag() {
+        let input = |tool: Value| tool_input(&tool);
+        assert_eq!(
+            input(json!({ "input": { "type": "json", "value": { "path": "a.rs" } } })),
+            json!({ "path": "a.rs" })
+        );
+        assert_eq!(
+            input(json!({ "input": { "type": "text", "value": "{\"path\":\"a.rs\"}" } })),
+            json!({ "path": "a.rs" })
+        );
+        assert_eq!(
+            input(json!({ "input": { "type": "text", "value": "not json" } })),
+            json!("not json")
+        );
+        // Older threads stored the arguments directly.
+        assert_eq!(
+            input(json!({ "input": { "path": "a.rs" } })),
+            json!({ "path": "a.rs" })
+        );
+        assert_eq!(
+            input(json!({ "raw_input": "{\"path\":\"a.rs\"}" })),
+            json!({ "path": "a.rs" })
+        );
+    }
+
+    #[test]
+    fn compaction_summary_and_prompt_images_are_shown() {
+        let thread = json!({ "messages": [
+            { "Compaction": { "Summary": "Earlier: fixed login" } },
+            { "Compaction": { "ProviderNative": { "provider": "anthropic", "items": [] } } },
+            { "User": { "content": [{ "Text": "and this?" }, { "Image": { "source": "iVBORw0KGgo=" } }] } },
+            "Resume"
+        ] });
+        let msgs = parse_thread(&thread, "t", "2026-11-26T10:00:00Z");
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(msgs[0].subtype.as_deref(), Some("compact_boundary"));
+        assert_eq!(
+            msgs[0].content,
+            Some(json!("Context compacted\n\nEarlier: fixed login"))
+        );
+        assert_eq!(msgs[1].content, Some(json!("Context compacted")));
+        let blocks = msgs[2].content.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(
+            blocks[1],
+            json!({ "type": "image", "source": { "type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo=" } })
+        );
     }
 }
 

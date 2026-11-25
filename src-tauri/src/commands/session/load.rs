@@ -2309,6 +2309,27 @@ fn crush_subagents(session_path: &str) -> Result<Vec<SubagentSession>, String> {
         .collect())
 }
 
+/// Subagent rows for a `zed://<thread_id>` parent: the threads its
+/// `spawn_agent` calls started (#855), each addressed by its own `zed://` id
+/// so the panel opens it through the same reader as any Zed thread, and
+/// linked to the call whose result names it.
+fn zed_subagents(session_path: &str) -> Result<Vec<SubagentSession>, String> {
+    Ok(crate::providers::zed::load_subagents(session_path)?
+        .into_iter()
+        .map(|sub| SubagentSession {
+            file_path: format!("zed://{}", sub.session.id),
+            tool_use_id: sub.tool_use_id,
+            agent_id: sub.session.id,
+            message_count: sub.session.message_count,
+            file_size: 0,
+            first_message_time: Some(sub.session.created_at),
+            last_message_time: Some(sub.session.updated_at),
+            summary: (!sub.session.title.trim().is_empty()).then_some(sub.session.title),
+            workflow_run_id: None,
+        })
+        .collect())
+}
+
 /// Returns subagent sessions for a given parent session file.
 #[tauri::command]
 pub async fn get_session_subagents(session_path: String) -> Result<Vec<SubagentSession>, String> {
@@ -2331,6 +2352,10 @@ pub async fn get_session_subagents(session_path: String) -> Result<Vec<SubagentS
         return crush_subagents(&session_path);
     }
 
+    if session_path.starts_with("zed://") {
+        return zed_subagents(&session_path);
+    }
+
     // Other providers' files, and prompt-history sessions (#764): only the
     // prompts survive, no subagent run.
     if is_other_provider_session_file(&session_path)
@@ -2342,7 +2367,7 @@ pub async fn get_session_subagents(session_path: String) -> Result<Vec<SubagentS
     let path = PathBuf::from(&session_path);
     if !path.is_absolute() {
         // Providers that keep conversations in a database mint opaque ids
-        // (`cursor://…`, `zed://…`, `forgecode-db://…`) instead of files. They
+        // (`cursor://…`, `forgecode-db://…`) instead of files. They
         // have no on-disk subagent folder to scan, so no subagents is the
         // correct answer rather than a path error shown on every selection.
         if session_path.contains("://") {
