@@ -2278,6 +2278,37 @@ fn zcode_subagents(session_path: &str) -> Result<Vec<SubagentSession>, String> {
         .collect())
 }
 
+/// Subagent rows for a `crush://<project_dir>#<session_id>` parent: the runs
+/// `agent_dispatch` / `agentic_fetch` stored as child sessions (#848), each
+/// addressed by its own `crush://` id so the panel opens it through the same
+/// reader as any Crush session. The run's id ends in the spawning tool call's
+/// id, which links the panel entry to that call. A path without a session id
+/// has none.
+fn crush_subagents(session_path: &str) -> Result<Vec<SubagentSession>, String> {
+    let Some((project_dir, _)) = session_path
+        .strip_prefix("crush://")
+        .and_then(|rest| rest.rsplit_once('#'))
+    else {
+        return Ok(Vec::new());
+    };
+
+    Ok(crate::providers::crush::load_child_sessions(session_path)?
+        .into_iter()
+        .map(|child| SubagentSession {
+            file_path: format!("crush://{project_dir}#{}", child.id),
+            tool_use_id: crate::providers::crush::spawning_tool_call_id(&child.id)
+                .map(str::to_string),
+            agent_id: child.id,
+            message_count: child.message_count,
+            file_size: 0,
+            first_message_time: Some(child.created_at),
+            last_message_time: Some(child.updated_at),
+            summary: (!child.title.trim().is_empty()).then_some(child.title),
+            workflow_run_id: None,
+        })
+        .collect())
+}
+
 /// Returns subagent sessions for a given parent session file.
 #[tauri::command]
 pub async fn get_session_subagents(session_path: String) -> Result<Vec<SubagentSession>, String> {
@@ -2294,6 +2325,10 @@ pub async fn get_session_subagents(session_path: String) -> Result<Vec<SubagentS
 
     if session_path.starts_with("zcode://") {
         return zcode_subagents(&session_path);
+    }
+
+    if session_path.starts_with("crush://") {
+        return crush_subagents(&session_path);
     }
 
     // Other providers' files, and prompt-history sessions (#764): only the
@@ -5263,5 +5298,57 @@ mod tests {
             .await
             .unwrap();
         assert!(subagents.is_empty());
+    }
+
+    /// #848: a Crush sub-agent run is a child `sessions` row (id
+    /// `<assistant message id>$$<tool call id>`), listed by the panel under
+    /// its parent and linked to the call that spawned it.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn crush_sub_agent_runs_are_listed_under_their_parent_session() {
+        let home = crate::test_utils::SandboxHome::new();
+        let project = home.path().join("projects").join("demo");
+        let crush_dir = project.join(".crush");
+        std::fs::create_dir_all(&crush_dir).unwrap();
+        let conn = rusqlite::Connection::open(crush_dir.join("crush.db")).unwrap();
+        let child = "24ecc5a7-0f0c-4e0e-b40d-7b761f8a3b9a$$call_ff2c87f7";
+        let parent = "956a8b87-8531-43e9-9ee4-6ff155f9a29b";
+        conn.execute_batch(&format!(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, parent_session_id TEXT, title TEXT NOT NULL,
+                 updated_at INTEGER NOT NULL, created_at INTEGER NOT NULL);
+             CREATE TABLE messages (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, role TEXT NOT NULL,
+                 parts TEXT NOT NULL default '[]', created_at INTEGER NOT NULL);
+             INSERT INTO sessions VALUES ('{parent}', NULL, 'Demo session', 1795577949, 1795577949);
+             INSERT INTO sessions VALUES ('{child}', '{parent}', 'Lister', 1795577950, 1795577949);
+             INSERT INTO messages VALUES ('m1', '{child}', 'user',
+                 '[{{\"type\":\"text\",\"data\":{{\"text\":\"Enumerate the src directory (sub task)\"}}}}]', 1795577949);"
+        ))
+        .unwrap();
+        drop(conn);
+
+        let session = format!("crush://{}#{parent}", project.display());
+        let subagents = get_session_subagents(session).await.unwrap();
+        assert_eq!(subagents.len(), 1);
+        assert_eq!(subagents[0].agent_id, child);
+        assert_eq!(
+            subagents[0].file_path,
+            format!("crush://{}#{child}", project.display())
+        );
+        assert_eq!(subagents[0].tool_use_id.as_deref(), Some("call_ff2c87f7"));
+        assert_eq!(subagents[0].message_count, 1);
+        assert_eq!(subagents[0].summary.as_deref(), Some("Lister"));
+
+        // The run itself has no runs, and a path without a session id none.
+        let child_session = subagents[0].file_path.clone();
+        assert!(get_session_subagents(child_session)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(
+            get_session_subagents(format!("crush://{}", project.display()))
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 }
