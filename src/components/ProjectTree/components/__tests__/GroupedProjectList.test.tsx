@@ -71,7 +71,7 @@ describe("GroupedProjectList", () => {
     expanded?: boolean;
   }) {
     const setExpandedProjects = vi.fn();
-    render(
+    const ui = (selectedProject: ClaudeProject | null) => (
       <GroupedProjectList
         groupingMode={options.groupingMode}
         projects={options.projects ?? [options.project]}
@@ -79,7 +79,7 @@ describe("GroupedProjectList", () => {
         timeGroups={options.timeGroups ?? []}
         worktreeGroups={options.worktreeGroups ?? []}
         sessions={[]}
-        selectedProject={options.selectedProject ?? null}
+        selectedProject={selectedProject}
         selectedSession={null}
         isLoading={false}
         expandedProjects={options.expandedProjects ?? new Set<string>()}
@@ -91,7 +91,8 @@ describe("GroupedProjectList", () => {
         formatTimeAgo={(date) => date}
       />
     );
-    return { setExpandedProjects };
+    const view = render(ui(options.selectedProject ?? null));
+    return { setExpandedProjects, select: (project: ClaudeProject) => view.rerender(ui(project)) };
   }
 
   /**
@@ -162,6 +163,27 @@ describe("GroupedProjectList", () => {
     expect([...chips].map((chip) => chip.getAttribute("aria-pressed"))).toEqual(["true", "false"]);
     fireEvent.click(chips[1]!);
     expect(handleProjectClick).toHaveBeenCalledWith(codex);
+  });
+
+  // Switching the merged row's assistant changes the row's lead project; the
+  // row keeps its place, so keyboard focus stays on the chosen chip.
+  it("keeps focus on the chosen assistant chip after the switch", () => {
+    const claude = { ...createProject("/store/claude", "app"), actual_path: "/work/app" };
+    const codex = { ...createProject("/store/codex", "app"), actual_path: "/work/app", provider: "codex" };
+    const { select } = renderList({
+      groupingMode: "none",
+      project: claude,
+      projects: [claude, codex],
+      selectedProject: claude,
+      expanded: true,
+      handleProjectClick: vi.fn(),
+    });
+    const codexChip = () =>
+      screen.getByRole("group", { name: "project.assistantsInFolder" }).querySelectorAll("button")[1]!;
+    codexChip().focus();
+    select(codex);
+    expect(document.activeElement).toBe(codexChip());
+    expect(codexChip().getAttribute("aria-pressed")).toBe("true");
   });
 
   it("chevron expands without opening; the row opens (directory mode)", () => {

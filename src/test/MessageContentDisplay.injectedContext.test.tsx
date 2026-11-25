@@ -43,4 +43,14 @@ describe("injected context in a user turn", () => {
     render(<MessageContentDisplay content={ENV} messageType="user" searchQuery="zsh" />, { wrapper });
     expect(screen.queryByRole("button", { name: /messageContentDisplay\.injectedContext/ })).toBeNull();
   });
+
+  it("treats a lone local-command caveat as injected context, and as a plain bubble while searching", () => {
+    const caveat = "<local-command-caveat>Caveat: generated while running local commands.</local-command-caveat>";
+    render(<MessageContentDisplay content={caveat} messageType="user" />, { wrapper });
+    expect(screen.getByRole("button", { name: /messageContentDisplay\.injectedContext/ })).toBeTruthy();
+    cleanup();
+    render(<MessageContentDisplay content={caveat} messageType="user" searchQuery="caveat" />, { wrapper });
+    expect(screen.getByText(/generated while running/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /messageContentDisplay\.injectedContext/ })).toBeNull();
+  });
 });

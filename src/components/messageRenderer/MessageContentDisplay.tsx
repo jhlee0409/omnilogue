@@ -148,7 +148,14 @@ export const MessageContentDisplay: React.FC<MessageContentDisplayProps> = ({
 
   if (!content) return null;
 
-  if (typeof content === "string") {
+  // Context the client injected into the user turn (Codex's
+  // `<environment_context>`, a lone `<system-reminder>` or
+  // `<local-command-caveat>`): a collapsed card, not a speech bubble or a
+  // command. While searching it is the plain bubble, so matches highlight.
+  const injectedContext =
+    messageType === "user" && typeof content === "string" && isInjectedWrapperText(content);
+
+  if (typeof content === "string" && !injectedContext) {
     // Strip code blocks (``` ... ```) and inline code (` ... `) before testing
     // so that tags mentioned inside code examples don't trigger special renderers
     const contentWithoutCode = content
@@ -182,10 +189,7 @@ export const MessageContentDisplay: React.FC<MessageContentDisplayProps> = ({
     return null; // Or some other fallback for non-string content
   }
 
-  // Context the client injected into the user turn (Codex's
-  // `<environment_context>`, a lone `<system-reminder>`): a collapsed card,
-  // not a speech bubble. While searching it stays a bubble so matches show.
-  if (messageType === "user" && !searchQuery && isInjectedWrapperText(content)) {
+  if (injectedContext && !searchQuery) {
     return (
       <Renderer className="mb-3 bg-muted/50 border-border" expandKey="injected-context" defaultExpanded={false}>
         <Renderer.Header

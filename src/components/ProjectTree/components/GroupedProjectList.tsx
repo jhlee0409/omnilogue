@@ -145,7 +145,10 @@ export const GroupedProjectList: React.FC<GroupedProjectListProps> = ({
     project: ClaudeProject,
     variant: "default" | "main" | "worktree" = "default",
     ariaLevel = 1,
-    providerSiblings: ClaudeProject[] = []
+    providerSiblings: ClaudeProject[] = [],
+    // A merged row keeps its folder's key while its lead changes, so a
+    // focused assistant chip survives the switch it triggers.
+    rowKey: string = project.path
   ) => {
     const isExpanded = isProjectExpanded(project.path);
     const isOpen = selectedProject?.path === project.path;
@@ -161,7 +164,7 @@ export const GroupedProjectList: React.FC<GroupedProjectListProps> = ({
     // useDeferredValue, so the optimization is not worth the rendering bug.
 
     return (
-      <div key={project.path} role="none" className="relative">
+      <div key={rowKey} role="none" className="relative">
         <ProjectItem
           project={project}
           isExpanded={isExpanded}
@@ -456,8 +459,8 @@ export const GroupedProjectList: React.FC<GroupedProjectListProps> = ({
 
   return (
     <>
-      {mergeByFolder(availableProjects, selectedProject).map(({ lead, siblings }) =>
-        renderProjectWithSessions(lead, "default", 1, siblings)
+      {mergeByFolder(availableProjects, selectedProject).map(({ key, lead, siblings }) =>
+        renderProjectWithSessions(lead, "default", 1, siblings, `folder:${key}`)
       )}
       {renderBucketGroup("temporary", temporaryProjects)}
       {renderBucketGroup("unavailable", unavailableProjects)}
@@ -476,7 +479,7 @@ export const GroupedProjectList: React.FC<GroupedProjectListProps> = ({
 function mergeByFolder(
   list: ClaudeProject[],
   selectedProject: ClaudeProject | null
-): Array<{ lead: ClaudeProject; siblings: ClaudeProject[] }> {
+): Array<{ key: string; lead: ClaudeProject; siblings: ClaudeProject[] }> {
   const byFolder: Record<string, ClaudeProject[]> = {};
   const order: string[] = [];
   for (const project of list) {
@@ -493,6 +496,6 @@ function mergeByFolder(
       ? group.findIndex((p) => p.path === selectedProject.path)
       : -1;
     const lead = group[leadIndex === -1 ? 0 : leadIndex]!;
-    return { lead, siblings: group.filter((p) => p !== lead) };
+    return { key, lead, siblings: group.filter((p) => p !== lead) };
   });
 }
