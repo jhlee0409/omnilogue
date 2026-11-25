@@ -28,6 +28,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ||||||| f2b1ed96
 - **Qwen Code sessions show their `/rename` title, hide the CLI's own messages and show failed commands as errors** (desktop and WebUI). A session renamed with `/rename` (or titled by Qwen Code) was still named by its first prompt; it now shows that title, read from the transcript or the session's `.title.json` file. Cron prompts and other messages Qwen Code writes on its own behalf were listed as messages you typed and could become the session title; they are now hidden (background-task completions still appear as agent updates). A failed shell command showed its result as raw `{"error": …}` JSON; it now shows the command output and is marked as failed. (#857)
 ||||||| f2b1ed96
+- **Aider prompts, times and counts are right** (desktop and WebUI). A prompt of several lines showed as one message per line, every time was shifted by your UTC offset because Aider's local clock time was read as UTC, a session's message count was an estimate that differed from the messages listed, an extra empty untitled session appeared before the first one, and the continuation lines of a multi-line command banner showed as an assistant reply. A prompt is now one message (blank lines kept as paragraph breaks), times are converted from your local time, the count matches the messages shown, the empty session is gone and the whole banner stays together. (#844)
+||||||| f2b1ed96
 
 ## [2.1.1] - 2026-11-23
 
