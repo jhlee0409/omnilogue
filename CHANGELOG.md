@@ -33,6 +33,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ||||||| 692c984e
 - **ForgeCode tool calls show their results, and your prompts show as you typed them** (desktop and WebUI). ForgeCode's tool results carry only the call's id and keep their text in `output.values`, so every call showed "No result recorded" and the result held a raw `{is_error, values}` dump. Each result now sits under its call with the tool's own text, and a result ForgeCode marks failed is shown as failed; a `shell` result whose `exit_code` is not 0 is shown as failed too, although ForgeCode records it as not an error. Your prompts were shown inside ForgeCode's `<task>…</task>` / `<feedback>…</feedback>` and `<system_date>` wrapper, which also matched in search; they now show as you typed them. (#863)
 ||||||| 692c984e
+- **Cline's own reminders are no longer shown as messages from you, and prompts lose their wrapper** (desktop and WebUI). When the model ends a turn without calling its completion tool, Cline adds a user-role note ("[SYSTEM] This run is not complete until you call … submit_and_exit"); in a looping session these made up most of the "your messages", and they inflated message counts. Cline also stores every prompt inside `<user_input mode="act">…</user_input>` tags, which showed up around your text and in titles of sessions without a saved title. The reminders are now left out and prompts show as you typed them. (#849)
+||||||| 17be3362
 ||||||| f2b1ed96
 
 ## [2.1.1] - 2026-11-23
