@@ -849,7 +849,7 @@ fn map_image_message(
     let message_type = message_type_for_role(&role).to_string();
     let content = Value::Array(vec![json!({
         "type": "image",
-        "source": payload.clone(),
+        "source": image_source(payload),
     })]);
 
     let mut message = build_provider_message(
@@ -972,7 +972,7 @@ fn tool_value_block(value: &Value) -> Option<Value> {
         return text_block(text);
     }
     if let Some(image) = object.get("image") {
-        return Some(json!({ "type": "image", "source": image.clone() }));
+        return Some(json!({ "type": "image", "source": image_source(image) }));
     }
     if let Some(path) = object
         .get("fileDiff")
@@ -988,20 +988,45 @@ fn tool_value_block(value: &Value) -> Option<Value> {
         .and_then(tool_value_block)
 }
 
+/// Convert a `ForgeCode` `ImageRecord` (`{url, mime_type}`) into the `source`
+/// object the image renderers read.
+///
+/// The producer stores the image as a data URL, or as bare base64 when the
+/// prefix is absent (`From<ImageRecord> for Image`, `forge_repo`
+/// `conversation_record.rs:47-56`); an `http(s)` URL stays a URL source. A record
+/// without a usable `url` is kept as is.
+fn image_source(record: &Value) -> Value {
+    let Some(url) = record.get("url").and_then(Value::as_str) else {
+        return record.clone();
+    };
+    if url.starts_with("http://") || url.starts_with("https://") {
+        return json!({ "type": "url", "url": url });
+    }
+    let Some(media_type) = record.get("mime_type").and_then(Value::as_str) else {
+        return record.clone();
+    };
+    let data = url
+        .strip_prefix(&format!("data:{media_type};base64,"))
+        .unwrap_or(url);
+    json!({ "type": "base64", "media_type": media_type, "data": data })
+}
+
 /// Return the nonzero exit code a `ForgeCode` shell result records.
 ///
 /// The shell tool renders `<shell_output command=".." shell=".." exit_code="N">`
 /// with every attribute on its own line (`forge_app` `operation.rs` 597-598 writes
 /// `exit_code`; `forge_template` `element.rs` 77-92 renders the attributes) while
-/// the record's `is_error` stays false for a nonzero exit. The attribute is the
-/// last one before the `<stdout>` child, so it is read from the final line of
-/// the opening tag only, never from the command text or the captured output.
+/// the record's `is_error` stays false for a nonzero exit. `exit_code` is the last
+/// attribute, and the opening tag ends at the first `\n>\n<`: a child element
+/// (`<stdout>` / `<stderr>`, each omitted when empty, `operation.rs` 164-170) or
+/// the closing tag. The code is read from the final line of the opening tag
+/// only, never from the command text or the captured output.
 fn shell_failure_exit_code(content: &Value) -> Option<i32> {
     let text = content.as_str()?;
     if !text.starts_with("<shell_output\n") {
         return None;
     }
-    let opening_tag = &text[..text.find("\n>\n<stdout")?];
+    let opening_tag = &text[..text.find("\n>\n<")?];
     let code = opening_tag
         .lines()
         .next_back()?
@@ -2350,6 +2375,21 @@ mod tests {
             )),
             None
         );
+
+        // Streams that are empty are omitted, so the opening tag is followed by
+        // `<stderr>` or straight by the closing tag.
+        let no_output = "<shell_output\n  command=\"false\"\n  shell=\"/bin/sh\"\n  exit_code=\"1\"\n>\n</shell_output>";
+        let stderr_only = "<shell_output\n  command=\"ls missing\"\n  shell=\"/bin/sh\"\n  exit_code=\"2\"\n>\n<stderr\n  total_lines=\"1\"\n><![CDATA[ls: missing: No such file or directory]]>\n</stderr>\n</shell_output>";
+        let no_output_ok = no_output.replace("exit_code=\"1\"", "exit_code=\"0\"");
+        assert_eq!(
+            shell_failure_exit_code(&Value::String(no_output.into())),
+            Some(1)
+        );
+        assert_eq!(
+            shell_failure_exit_code(&Value::String(stderr_only.into())),
+            Some(2)
+        );
+        assert_eq!(shell_failure_exit_code(&Value::String(no_output_ok)), None);
     }
 
     #[test]
@@ -2451,7 +2491,11 @@ mod tests {
             first_block(&message, "tool_result")["content"],
             json!([
                 {"type": "text", "text": "screenshot"},
-                {"type": "image", "source": image},
+                {"type": "image", "source": {
+                    "type": "base64",
+                    "media_type": "image/png",
+                    "data": "iVBORw0KGgo=",
+                }},
             ])
         );
     }
@@ -2463,7 +2507,17 @@ mod tests {
         let message = map_entry(&json!({"message": {"image": image}}));
 
         assert_eq!(message.message_type, "user");
-        assert_eq!(first_block(&message, "image")["source"], image);
+        assert_eq!(
+            first_block(&message, "image")["source"],
+            json!({"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgo="})
+        );
+
+        let remote = json!({"url": "https://example.com/shot.png", "mime_type": "image/png"});
+        let message = map_entry(&json!({"message": {"image": remote}}));
+        assert_eq!(
+            first_block(&message, "image")["source"],
+            json!({"type": "url", "url": "https://example.com/shot.png"})
+        );
     }
 
     #[test]
