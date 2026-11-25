@@ -462,15 +462,13 @@ fn global_data_dir() -> Option<PathBuf> {
     global_data_dir_with(
         env("CRUSH_GLOBAL_DATA"),
         env("XDG_DATA_HOME"),
+        // Windows: `%LOCALAPPDATA%`, else `%USERPROFILE%\AppData\Local`. With
+        // neither set (and always in tests) there is no such directory, so the
+        // home-based default applies rather than a relative `AppData\Local`.
         if cfg!(windows) {
-            Some(env("LOCALAPPDATA").map_or_else(
-                || {
-                    PathBuf::from(env("USERPROFILE").unwrap_or_default())
-                        .join("AppData")
-                        .join("Local")
-                },
-                PathBuf::from,
-            ))
+            env("LOCALAPPDATA").map(PathBuf::from).or_else(|| {
+                env("USERPROFILE").map(|p| PathBuf::from(p).join("AppData").join("Local"))
+            })
         } else {
             None
         },
