@@ -154,8 +154,12 @@ impl ProviderAudit {
                     .and_then(Value::as_str)
                     .unwrap_or("<unnamed>");
                 *self.tool_names.entry(name.to_string()).or_default() += 1;
-                if let Some(id) = block.get("id").and_then(Value::as_str) {
-                    calls.insert(id.to_string());
+                match block.get("id").and_then(Value::as_str) {
+                    Some(id) => {
+                        calls.insert(id.to_string());
+                    }
+                    // Nothing can pair with a call that has no id.
+                    None => self.tool_calls_without_result += 1,
                 }
             }
             _ => {
@@ -187,7 +191,14 @@ pub fn run_audit(args: &[String]) -> i32 {
         }
     };
     // The Windows desktop build has no console to print to: `--output`.
-    let Some(path) = extract_flag_value(args, "--output") else {
+    let output_given = args
+        .iter()
+        .any(|a| a == "--output" || a.starts_with("--output="));
+    let Some(path) = extract_flag_value(args, "--output").filter(|path| !path.is_empty()) else {
+        if output_given {
+            eprintln!("{USAGE}");
+            return 2;
+        }
         println!("{json}");
         return 0;
     };
@@ -230,17 +241,24 @@ async fn audit(sessions_per_provider: usize) -> AuditReport {
         audit.projects = mine.len();
         mine.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
 
+        // Newest projects first; a project's sessions are no newer than the
+        // project itself, so stop once the N newest sessions found so far are
+        // all newer than the next project.
         let mut sessions = Vec::new();
-        for project in mine {
+        let mut remaining = mine.into_iter().peekable();
+        while let Some(project) = remaining.next() {
             match load_provider_sessions(id.clone(), project.path.clone(), None).await {
                 Ok(listed) => sessions.extend(listed.into_iter().map(|listed| listed.session)),
                 Err(_) => audit.load_errors += 1,
             }
-            if sessions.len() >= sessions_per_provider * 4 {
-                break;
+            sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
+            let enough = sessions.get(sessions_per_provider.saturating_sub(1));
+            if let (Some(nth), Some(next)) = (enough, remaining.peek()) {
+                if next.last_modified <= nth.last_modified {
+                    break;
+                }
             }
         }
-        sessions.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
         for session in sessions.into_iter().take(sessions_per_provider) {
             match load_provider_messages(id.clone(), session.file_path.clone()).await {
                 Ok(messages) => {
@@ -299,6 +317,7 @@ mod tests {
                 json!([
                     { "type": "tool_use", "id": "a", "name": "Read", "input": {} },
                     { "type": "tool_use", "id": "b", "name": "Bash", "input": {} },
+                    { "type": "tool_use", "name": "Grep", "input": {} },
                     { "type": "new_block" }
                 ]),
             ),
@@ -316,8 +335,8 @@ mod tests {
         assert_eq!(audit.sessions_without_title, 1);
         assert_eq!(audit.sessions_loaded_empty, 1);
         assert_eq!(audit.messages, 5);
-        assert_eq!(audit.tool_calls, 2);
-        assert_eq!(audit.tool_calls_without_result, 1);
+        assert_eq!(audit.tool_calls, 3);
+        assert_eq!(audit.tool_calls_without_result, 2);
         assert_eq!(audit.unknown_block_types.get("new_block"), Some(&1));
         assert_eq!(audit.role_mismatches, 1);
         assert_eq!(audit.empty_messages, 1);
