@@ -30,7 +30,7 @@ use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession, TokenUsage};
 use crate::providers::scan_report::ScanReport;
 use crate::providers::ProviderInfo;
 use crate::utils::{build_provider_message, search_json_value_case_insensitive};
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -178,20 +178,37 @@ fn legacy_scope(layout: &Layout) -> &'static str {
     }
 }
 
-/// Milliseconds since the epoch of a normalized timestamp, for ordering
-/// values that do not share a format (`Z` against `+00:00`).
-fn ts_millis(ts: &str) -> i64 {
-    chrono::DateTime::parse_from_rfc3339(ts).map_or(i64::MIN, |d| d.timestamp_millis())
+/// Microseconds since the epoch of a normalized timestamp, for ordering
+/// values that do not share a format (`Z` against `+00:00`). llm records
+/// microseconds, so coarser units would tie distinct instants.
+fn ts_key(ts: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(ts).map_or(i64::MIN, |d| d.timestamp_micros())
 }
 
 /// The later of `current` and `candidate`.
 fn later(current: Option<String>, candidate: String) -> Option<String> {
     match current {
         _ if candidate.is_empty() => current,
-        Some(c) if ts_millis(&c) >= ts_millis(&candidate) => Some(c),
+        Some(c) if ts_key(&c) >= ts_key(&candidate) => Some(c),
         _ => Some(candidate),
     }
 }
+
+/// One read snapshot for the queries of a scan: llm can commit a turn
+/// between a thread query and a legacy query, and a conversation continued
+/// in that gap would be in neither (the thread query ran before the thread
+/// existed, the legacy query skips conversations a thread owns).
+fn read_snapshot(conn: &Connection) -> Result<rusqlite::Transaction<'_>, String> {
+    conn.unchecked_transaction().map_err(|e| e.to_string())
+}
+
+/// SQL condition on a `parts p` row: a part [`part_block`] turns into a
+/// block, so that counts agree with the transcript. A `text` or `reasoning`
+/// part with no text (an opaque, redacted reasoning part) shows nothing.
+const DISPLAYABLE_PART: &str = "(p.type IN ('tool_call', 'tool_result', 'attachment') \
+     OR (p.type IN ('text', 'reasoning') \
+         AND (COALESCE(p.text, '') <> '' \
+              OR (p.text IS NULL AND p.payload LIKE '%\"text_ref\"%'))))";
 
 /// One synthetic project containing every `llm` conversation.
 pub fn scan_projects() -> Result<Vec<ClaudeProject>, String> {
@@ -249,6 +266,7 @@ fn project_stats(
     db: &Path,
     report: &ScanReport,
 ) -> Result<(usize, usize, String), String> {
+    let _snapshot = read_snapshot(conn)?;
     let layout = detect_layout(conn, db, report)?;
     let mut sessions = 0;
     let mut messages = 0;
@@ -356,6 +374,7 @@ fn load_sessions_conn_reporting(
     db: &Path,
     report: &ScanReport,
 ) -> Result<Vec<ClaudeSession>, String> {
+    let _snapshot = read_snapshot(conn)?;
     let layout = detect_layout(conn, db, report)?;
     let mut sessions = Vec::new();
     if layout.store {
@@ -364,7 +383,7 @@ fn load_sessions_conn_reporting(
     if layout.legacy {
         sessions.extend(legacy_sessions(conn, db, report, &layout)?);
     }
-    sessions.sort_by_key(|s| std::cmp::Reverse(ts_millis(&s.last_message_time)));
+    sessions.sort_by_key(|s| std::cmp::Reverse(ts_key(&s.last_message_time)));
     Ok(sessions)
 }
 
@@ -379,7 +398,7 @@ fn store_sessions(
     report: &ScanReport,
 ) -> Result<Vec<ClaudeSession>, String> {
     let mut stmt = conn
-        .prepare(
+        .prepare(&format!(
             "WITH RECURSIVE chain(tid, hash, parent) AS ( \
                  SELECT t.id, m.hash, m.parent_hash \
                  FROM threads t JOIN messages m ON m.hash = t.tip_message_hash \
@@ -387,7 +406,8 @@ fn store_sessions(
                  SELECT c.tid, m.hash, m.parent_hash \
                  FROM chain c JOIN messages m ON m.hash = c.parent) \
              SELECT t.id, t.name, t.datetime_utc, tt.first, tt.last, \
-                    COALESCE(SUM(EXISTS(SELECT 1 FROM parts p WHERE p.message_hash = c.hash)), 0), \
+                    COALESCE(SUM(EXISTS(SELECT 1 FROM parts p \
+                        WHERE p.message_hash = c.hash AND {DISPLAYABLE_PART})), 0), \
                     COALESCE(MAX(EXISTS(SELECT 1 FROM parts p \
                         WHERE p.message_hash = c.hash AND p.type = 'tool_call')), 0), \
                     COALESCE(MAX(EXISTS(SELECT 1 FROM parts p \
@@ -399,8 +419,8 @@ fn store_sessions(
              LEFT JOIN chain c ON c.tid = t.id \
              LEFT JOIN (SELECT thread_id, MIN(datetime_utc) AS first, MAX(datetime_utc) AS last \
                         FROM turns GROUP BY thread_id) tt ON tt.thread_id = t.id \
-             GROUP BY t.id",
-        )
+             GROUP BY t.id"
+        ))
         .map_err(|e| e.to_string())?;
 
     let sessions = stmt
@@ -562,11 +582,22 @@ const CHAIN_CTE: &str = "WITH RECURSIVE chain(hash, parent, role, depth) AS ( \
 /// What a turn records about the response that ended at its tip message.
 struct TurnInfo {
     thread_id: Option<String>,
+    parent: Option<String>,
     model: Option<String>,
     input_tokens: Option<i64>,
     output_tokens: Option<i64>,
     duration_ms: Option<i64>,
     datetime: Option<String>,
+}
+
+/// Where the time, model and usage of a chain message come from.
+#[derive(Clone, Copy)]
+enum Source<'a> {
+    /// A row of `turns`.
+    Turn(&'a TurnInfo),
+    /// Index into the legacy `responses` of the conversation the thread
+    /// continues.
+    Legacy(usize),
 }
 
 /// One row of `parts`.
@@ -580,9 +611,14 @@ struct PartRow {
 
 /// The messages of one thread, oldest first. Messages carry no timestamp,
 /// model or token count of their own (rows are shared between threads), so
-/// those come from the turn whose span of the chain the message falls in: a
-/// turn answers the messages after the previous turn's tip, up to its own
-/// tip.
+/// those come from the turn that wrote or answered them: a turn owns the
+/// trailing run of input messages (system, user, tool) ending at its
+/// `parent_message_hash`, and the messages after it up to its tip.
+///
+/// A legacy conversation continued with llm >= 0.32 has its earlier
+/// messages in the chain but no turn for them; they are matched to the
+/// legacy `responses` by response text, and otherwise carry no model or
+/// usage (never those of the first new turn).
 fn load_thread_messages(conn: &Connection, thread_id: &str) -> Result<Vec<ClaudeMessage>, String> {
     let (tip, thread_time): (Option<String>, Option<String>) = conn
         .query_row(
@@ -605,14 +641,40 @@ fn load_thread_messages(conn: &Connection, thread_id: &str) -> Result<Vec<Claude
         .collect::<Result<_, _>>()
         .map_err(|e| e.to_string())?;
 
-    // A forked thread reaches into its parent's turns, so a tip can belong
-    // to a turn of another thread (or of several threads that answered
-    // identically): prefer this thread's turn, then the earliest.
+    // The threads this one was forked from, nearest first: a fork reaches
+    // into its parent's turns.
+    let lineage: HashMap<String, usize> = conn
+        .prepare(
+            "WITH RECURSIVE lineage(id, depth) AS ( \
+                 SELECT id, 0 FROM threads WHERE id = ?1 \
+                 UNION ALL \
+                 SELECT t.forked_from, l.depth + 1 FROM lineage l JOIN threads t ON t.id = l.id \
+                 WHERE t.forked_from IS NOT NULL AND l.depth < 64) \
+             SELECT id, MIN(depth) FROM lineage GROUP BY id",
+        )
+        .map_err(|e| e.to_string())?
+        .query_map([thread_id], |r| {
+            Ok((r.get(0)?, crate::providers::sql_unsigned::<usize>(r, 1)?))
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    let rank = |turn: &TurnInfo| {
+        turn.thread_id
+            .as_deref()
+            .and_then(|id| lineage.get(id))
+            .copied()
+            .unwrap_or(usize::MAX)
+    };
+
+    // Several threads can answer identically (message rows are shared), so
+    // a tip can have several turns: take this thread's, else the nearest
+    // ancestor's, else the earliest.
     let mut turns: HashMap<String, TurnInfo> = HashMap::new();
     let mut stmt = conn
         .prepare(&format!(
-            "{CHAIN_CTE}SELECT t.tip_message_hash, t.thread_id, t.model, t.input_tokens, \
-                    t.output_tokens, t.duration_ms, t.datetime_utc \
+            "{CHAIN_CTE}SELECT t.tip_message_hash, t.thread_id, t.parent_message_hash, t.model, \
+                    t.input_tokens, t.output_tokens, t.duration_ms, t.datetime_utc \
              FROM turns t WHERE t.tip_message_hash IN (SELECT hash FROM chain) \
              ORDER BY t.datetime_utc"
         ))
@@ -623,40 +685,24 @@ fn load_thread_messages(conn: &Connection, thread_id: &str) -> Result<Vec<Claude
                 r.get::<_, String>(0)?,
                 TurnInfo {
                     thread_id: r.get(1)?,
-                    model: r.get(2)?,
-                    input_tokens: r.get(3)?,
-                    output_tokens: r.get(4)?,
-                    duration_ms: r.get(5)?,
-                    datetime: r.get(6)?,
+                    parent: r.get(2)?,
+                    model: r.get(3)?,
+                    input_tokens: r.get(4)?,
+                    output_tokens: r.get(5)?,
+                    duration_ms: r.get(6)?,
+                    datetime: r.get(7)?,
                 },
             ))
         })
         .map_err(|e| e.to_string())?;
     for row in rows {
         let (hash, turn) = row.map_err(|e| e.to_string())?;
-        let own = turn.thread_id.as_deref() == Some(thread_id);
         match turns.get(&hash) {
-            Some(known) if known.thread_id.as_deref() == Some(thread_id) || !own => {}
+            Some(known) if rank(known) <= rank(&turn) => {}
             _ => {
                 turns.insert(hash, turn);
             }
         }
-    }
-
-    let mut owner: Vec<Option<&TurnInfo>> = vec![None; chain.len()];
-    let mut pending = Vec::new();
-    let mut last_turn = None;
-    for (i, (hash, _)) in chain.iter().enumerate() {
-        pending.push(i);
-        if let Some(turn) = turns.get(hash) {
-            for j in pending.drain(..) {
-                owner[j] = Some(turn);
-            }
-            last_turn = Some(turn);
-        }
-    }
-    for j in pending {
-        owner[j] = last_turn;
     }
 
     let mut parts_stmt = conn
@@ -665,6 +711,115 @@ fn load_thread_messages(conn: &Connection, thread_id: &str) -> Result<Vec<Claude
              WHERE message_hash = ?1 ORDER BY position",
         )
         .map_err(|e| e.to_string())?;
+    let mut parts: Vec<Vec<PartRow>> = Vec::with_capacity(chain.len());
+    for (hash, _) in &chain {
+        parts.push(
+            parts_stmt
+                .query_map([hash], |r| {
+                    Ok(PartRow {
+                        position: r.get(0)?,
+                        kind: r.get(1)?,
+                        tool_name: r.get(2)?,
+                        text: r.get(3)?,
+                        payload: r.get(4)?,
+                    })
+                })
+                .map_err(|e| e.to_string())?
+                .collect::<Result<_, _>>()
+                .map_err(|e| e.to_string())?,
+        );
+    }
+
+    // Who owns each message: the turn whose input run or output it is.
+    let index: HashMap<&str, usize> = chain
+        .iter()
+        .enumerate()
+        .map(|(i, (hash, _))| (hash.as_str(), i))
+        .collect();
+    let is_input = |i: usize| matches!(chain[i].1.as_deref(), Some("system" | "user" | "tool"));
+    let mut owner: Vec<Option<(Source, bool)>> = vec![None; chain.len()];
+    for (tip_index, (hash, _)) in chain.iter().enumerate() {
+        let Some(turn) = turns.get(hash) else {
+            continue;
+        };
+        let start = match turn
+            .parent
+            .as_deref()
+            .and_then(|p| index.get(p))
+            .copied()
+            .filter(|p| *p <= tip_index)
+        {
+            Some(parent) if is_input(parent) => {
+                let mut start = parent;
+                while start > 0 && is_input(start - 1) {
+                    start -= 1;
+                }
+                start
+            }
+            Some(parent) => parent + 1,
+            None => tip_index,
+        };
+        for (j, slot) in owner.iter_mut().enumerate().take(tip_index + 1).skip(start) {
+            if slot.is_none() {
+                *slot = Some((Source::Turn(turn), j == tip_index));
+            }
+        }
+    }
+
+    // Messages no turn owns: the history of a legacy conversation that was
+    // continued after the upgrade. Pair them with its `responses` by text.
+    let mut legacy: Vec<(TurnInfo, String)> = Vec::new();
+    if owner.iter().any(Option::is_none)
+        && has_table(conn, "responses").map_err(|e| e.to_string())?
+    {
+        legacy = conn
+            .prepare(
+                "SELECT model, input_tokens, output_tokens, datetime_utc, response FROM responses \
+                 WHERE conversation_id = ?1 ORDER BY datetime_utc, id",
+            )
+            .map_err(|e| e.to_string())?
+            .query_map([thread_id], |r| {
+                Ok((
+                    TurnInfo {
+                        thread_id: None,
+                        parent: None,
+                        model: r.get(0)?,
+                        input_tokens: r.get(1)?,
+                        output_tokens: r.get(2)?,
+                        duration_ms: None,
+                        datetime: r.get(3)?,
+                    },
+                    r.get::<_, Option<String>>(4)?.unwrap_or_default(),
+                ))
+            })
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        let first_text = |j: usize| {
+            parts[j]
+                .iter()
+                .find(|p| p.kind == "text")
+                .and_then(|p| p.text.as_deref())
+        };
+        let mut segment_start = 0;
+        for (k, (_, response)) in legacy.iter().enumerate() {
+            let found = (segment_start..chain.len()).find(|&j| {
+                owner[j].is_none()
+                    && chain[j].1.as_deref() == Some("assistant")
+                    && !response.is_empty()
+                    && first_text(j) == Some(response.as_str())
+            });
+            if let Some(j) = found {
+                for (m, slot) in owner.iter_mut().enumerate().take(j + 1).skip(segment_start) {
+                    if slot.is_none() {
+                        *slot = Some((Source::Legacy(k), m == j));
+                    }
+                }
+                segment_start = j + 1;
+            }
+        }
+    }
+
     let mut messages = Vec::new();
     for (i, (hash, role)) in chain.iter().enumerate() {
         // A tool result is a `tool` message: surface it in the user lane
@@ -675,33 +830,24 @@ fn load_thread_messages(conn: &Connection, thread_id: &str) -> Result<Vec<Claude
             Some("user" | "tool") => ("user", "user"),
             _ => continue,
         };
-        let parts: Vec<PartRow> = parts_stmt
-            .query_map([hash], |r| {
-                Ok(PartRow {
-                    position: r.get(0)?,
-                    kind: r.get(1)?,
-                    tool_name: r.get(2)?,
-                    text: r.get(3)?,
-                    payload: r.get(4)?,
-                })
-            })
-            .map_err(|e| e.to_string())?
-            .collect::<Result<_, _>>()
-            .map_err(|e| e.to_string())?;
-        let blocks: Vec<Value> = parts
+        let blocks: Vec<Value> = parts[i]
             .iter()
             .filter_map(|part| part_block(conn, hash, part))
             .collect();
         if blocks.is_empty() {
             continue;
         }
-        let turn = owner[i];
+        let (info, is_tip) = match owner[i] {
+            Some((Source::Turn(turn), is_tip)) => (Some(turn), is_tip),
+            Some((Source::Legacy(k), is_tip)) => (legacy.get(k).map(|(turn, _)| turn), is_tip),
+            None => (None, false),
+        };
         let ts = normalize_utc_ts(
-            turn.and_then(|t| t.datetime.as_deref())
+            info.and_then(|t| t.datetime.as_deref())
                 .or(thread_time.as_deref())
                 .unwrap_or_default(),
         );
-        let model = turn
+        let model = info
             .filter(|_| message_type == "assistant")
             .and_then(|t| t.model.clone());
         let mut msg = build_provider_message(
@@ -715,7 +861,7 @@ fn load_thread_messages(conn: &Connection, thread_id: &str) -> Result<Vec<Claude
             model,
         );
         // Usage and duration belong to the response that ended at the tip.
-        if let Some(turn) = turns.get(hash).filter(|_| message_type == "assistant") {
+        if let Some(turn) = info.filter(|_| message_type == "assistant" && is_tip) {
             if turn.input_tokens.is_some() || turn.output_tokens.is_some() {
                 msg.usage = Some(TokenUsage {
                     input_tokens: turn.input_tokens.map(|t| t.max(0) as u32),
@@ -972,9 +1118,105 @@ fn search_conn(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Claud
     if layout.legacy {
         results.extend(search_legacy(conn, &layout, query, limit)?);
     }
-    results.sort_by_key(|m| std::cmp::Reverse(ts_millis(&m.timestamp)));
+    results.sort_by_key(|m| std::cmp::Reverse(ts_key(&m.timestamp)));
     results.truncate(limit);
     Ok(results)
+}
+
+/// `LIKE` pattern that prefilters to every row the Rust matcher can accept.
+/// SQLite's `LIKE` folds only ASCII case, so a non-ASCII query (`école`
+/// against `École`) is not prefiltered: the Rust comparison decides.
+fn like_pattern(query: &str) -> String {
+    if query.is_ascii() {
+        format!("%{query}%")
+    } else {
+        "%".to_string()
+    }
+}
+
+/// The case-insensitive match [`push_hits`] applies.
+fn has_text(text: &str, query_lower: &str) -> bool {
+    text.to_lowercase().contains(query_lower)
+}
+
+/// Whether `id` is a thread of the content-addressed store.
+fn is_thread(conn: &Connection, id: &str) -> Result<bool, String> {
+    conn.query_row("SELECT COUNT(*) FROM threads WHERE id = ?1", [id], |r| {
+        r.get::<_, i64>(0)
+    })
+    .map(|n| n > 0)
+    .map_err(|e| e.to_string())
+}
+
+/// The first (oldest) of the messages `sql` selects, by hash, that has a
+/// literal text part containing `query_lower`. The producer does not index
+/// fragment text for search either (`TURN_SEARCH_LITERAL`).
+fn first_message_with_text(
+    conn: &Connection,
+    sql: &str,
+    params: impl rusqlite::Params,
+    query_lower: &str,
+) -> Result<Option<String>, String> {
+    let hashes: Vec<String> = conn
+        .prepare(sql)
+        .map_err(|e| e.to_string())?
+        .query_map(params, |r| r.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<_, _>>()
+        .map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT text FROM parts WHERE message_hash = ?1 AND type = 'text' AND text IS NOT NULL",
+        )
+        .map_err(|e| e.to_string())?;
+    for hash in hashes {
+        let texts: Vec<String> = stmt
+            .query_map([&hash], |r| r.get(0))
+            .map_err(|e| e.to_string())?
+            .collect::<Result<_, _>>()
+            .map_err(|e| e.to_string())?;
+        if texts.iter().any(|t| has_text(t, query_lower)) {
+            return Ok(Some(hash));
+        }
+    }
+    Ok(None)
+}
+
+/// The hash of the message of `role` in a thread's chain whose first text
+/// part is exactly `text`.
+fn thread_message_by_text(
+    conn: &Connection,
+    thread_id: &str,
+    role: &str,
+    text: &str,
+) -> Result<Option<String>, String> {
+    conn.query_row(
+        "WITH RECURSIVE chain(hash, parent, role) AS ( \
+             SELECT m.hash, m.parent_hash, m.role \
+             FROM threads t JOIN messages m ON m.hash = t.tip_message_hash WHERE t.id = ?1 \
+             UNION ALL \
+             SELECT m.hash, m.parent_hash, m.role FROM chain c JOIN messages m ON m.hash = c.parent) \
+         SELECT c.hash FROM chain c JOIN parts p ON p.message_hash = c.hash \
+         WHERE c.role = ?2 AND p.type = 'text' AND p.text = ?3 LIMIT 1",
+        rusqlite::params![thread_id, role, text],
+        |r| r.get(0),
+    )
+    .optional()
+    .map_err(|e| e.to_string())
+}
+
+/// [`legacy_scope`] for search: a response of a thread-owned conversation
+/// that has no turn of its own (the conversation was continued after the
+/// upgrade, so its earlier responses exist only in `responses` and as chain
+/// messages) stays searchable. Dual-write rows have a turn with the same id
+/// and are found through `turn_search`.
+fn legacy_search_scope(layout: &Layout) -> &'static str {
+    if layout.store {
+        " AND (r.conversation_id IS NULL OR r.conversation_id NOT IN (SELECT id FROM threads) \
+         OR r.id NOT IN (SELECT id FROM turns))"
+    } else {
+        ""
+    }
 }
 
 /// One search hit: whichever side of the exchange matched `query_lower`.
@@ -1022,7 +1264,7 @@ fn search_store(
     query: &str,
     limit: usize,
 ) -> Result<Vec<ClaudeMessage>, String> {
-    let pattern = format!("%{query}%");
+    let pattern = like_pattern(query);
     let query_lower = query.to_lowercase();
     let mut stmt = conn
         .prepare(
@@ -1058,6 +1300,52 @@ fn search_store(
             continue;
         };
         let ts = normalize_utc_ts(&dt.unwrap_or_default());
+        // A turn's prompt and response can span several messages: anchor
+        // each hit on the message that holds the matched text, falling back
+        // to the message the turn answers / its tip.
+        let user_uuid = match (
+            &parent,
+            prompt.as_deref().is_some_and(|p| has_text(p, &query_lower)),
+        ) {
+            (Some(parent), true) => first_message_with_text(
+                conn,
+                "WITH RECURSIVE chain(hash, parent, role, depth) AS ( \
+                     SELECT hash, parent_hash, role, 0 FROM messages WHERE hash = ?1 \
+                     UNION ALL \
+                     SELECT m.hash, m.parent_hash, m.role, c.depth + 1 \
+                     FROM chain c JOIN messages m ON m.hash = c.parent \
+                     WHERE c.role IN ('user', 'tool', 'system')) \
+                 SELECT hash FROM chain WHERE role = 'user' ORDER BY depth DESC",
+                [parent],
+                &query_lower,
+            )?
+            .or_else(|| Some(parent.clone())),
+            _ => parent.clone(),
+        }
+        .unwrap_or_else(|| format!("{turn_id}-user"));
+        let asst_uuid = match (
+            &tip,
+            response
+                .as_deref()
+                .is_some_and(|r| has_text(r, &query_lower)),
+        ) {
+            (Some(tip), true) => first_message_with_text(
+                conn,
+                "WITH RECURSIVE chain(hash, parent, role, depth) AS ( \
+                     SELECT hash, parent_hash, role, 0 FROM messages WHERE hash = ?1 \
+                     UNION ALL \
+                     SELECT m.hash, m.parent_hash, m.role, c.depth + 1 \
+                     FROM chain c JOIN messages m ON m.hash = c.parent \
+                     WHERE c.hash IS NOT ?2) \
+                 SELECT hash FROM chain WHERE hash IS NOT ?2 AND role = 'assistant' \
+                 ORDER BY depth DESC",
+                [Some(tip.as_str()), parent.as_deref()],
+                &query_lower,
+            )?
+            .or_else(|| Some(tip.clone())),
+            _ => tip.clone(),
+        }
+        .unwrap_or_else(|| format!("{turn_id}-asst"));
         push_hits(
             &mut results,
             limit,
@@ -1065,18 +1353,8 @@ fn search_store(
             &thread_id,
             &ts,
             [
-                (
-                    parent.unwrap_or_else(|| format!("{turn_id}-user")),
-                    "user",
-                    prompt,
-                    None,
-                ),
-                (
-                    tip.unwrap_or_else(|| format!("{turn_id}-asst")),
-                    "assistant",
-                    response,
-                    model,
-                ),
+                (user_uuid, "user", prompt, None),
+                (asst_uuid, "assistant", response, model),
             ],
         );
     }
@@ -1090,9 +1368,9 @@ fn search_legacy(
     query: &str,
     limit: usize,
 ) -> Result<Vec<ClaudeMessage>, String> {
-    let pattern = format!("%{query}%");
+    let pattern = like_pattern(query);
     let query_lower = query.to_lowercase();
-    let scope = legacy_scope(layout);
+    let scope = legacy_search_scope(layout);
 
     let mut stmt = conn
         .prepare(&format!(
@@ -1123,6 +1401,20 @@ fn search_legacy(
         let (id, conv_id, prompt, response, model, dt) = row;
         let conv = conv_id.unwrap_or_else(|| NO_CONVERSATION.to_string());
         let ts = normalize_utc_ts(&dt.unwrap_or_default());
+        // A response of a conversation a thread owns (it was continued after
+        // the upgrade) is a message of that thread: anchor the hit on it.
+        let owned = layout.store && is_thread(conn, &conv)?;
+        let anchor =
+            |role: &str, text: &Option<String>, fallback: String| -> Result<String, String> {
+                match text.as_deref().filter(|t| owned && !t.is_empty()) {
+                    Some(text) => {
+                        Ok(thread_message_by_text(conn, &conv, role, text)?.unwrap_or(fallback))
+                    }
+                    None => Ok(fallback),
+                }
+            };
+        let user_uuid = anchor("user", &prompt, format!("{id}-user"))?;
+        let asst_uuid = anchor("assistant", &response, format!("{id}-asst"))?;
         push_hits(
             &mut results,
             limit,
@@ -1130,8 +1422,8 @@ fn search_legacy(
             &conv,
             &ts,
             [
-                (format!("{id}-user"), "user", prompt, None),
-                (format!("{id}-asst"), "assistant", response, model),
+                (user_uuid, "user", prompt, None),
+                (asst_uuid, "assistant", response, model),
             ],
         );
     }
@@ -1937,9 +2229,23 @@ mod tests {
         assert_eq!(load_messages_conn(&conn, "c-old").unwrap().len(), 2);
         assert_eq!(load_messages_conn(&conn, NO_CONVERSATION).unwrap().len(), 2);
 
-        // Search lists the shared conversation's text once, from the thread.
+        // A response of the shared conversation that has no turn (it predates
+        // the thread) stays searchable, as a hit in the thread's session.
         let hits = search_conn(&conn, "legacy", 10).unwrap();
-        assert!(hits.is_empty());
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|h| h.session_id == SYSTEM_THREAD));
+        // One with a turn of the same id (a dual-write era row) is found
+        // through `turn_search` only, not twice.
+        conn.execute(
+            "INSERT INTO responses VALUES ('01m88cgwjkv06pvd9nhw0rv7ws', 'gpt-4', \
+             'What does module.exports do in Node?', 'It makes functions available', \
+             ?1, '2026-11-25T03:38:21', 1, 2)",
+            [SYSTEM_THREAD],
+        )
+        .unwrap();
+        let hits = search_conn(&conn, "module.exports", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].uuid, "b2:405da203466b99d4034c35f3ddcd3532");
         let hits = search_conn(&conn, "answer", 10).unwrap();
         let sessions_hit: Vec<&str> = hits.iter().map(|h| h.session_id.as_str()).collect();
         assert!(sessions_hit.contains(&"c-old") && sessions_hit.contains(&NO_CONVERSATION));
@@ -2041,5 +2347,359 @@ mod tests {
         assert_eq!(blocks(&msgs[1])[0]["type"], "thinking");
         assert_eq!(blocks(&msgs[1])[0]["thinking"], "thinking it over");
         assert_eq!(blocks(&msgs[1])[1]["text"], "Done.");
+    }
+
+    // The cases below are not in the captured sample (it has no fork, no
+    // continued legacy conversation, no redacted reasoning, no multi-message
+    // response); they are built from the producer's writers in
+    // `simonw/llm@46f0461d9b1ea9e898cac8a1d7333ab9bc6c8f7f`: `LogStore.fork`
+    // (logs.py L417-431), `ensure_thread` + `ensure_chain` for `llm -c` on a
+    // legacy conversation (cli.py L1427-1500, logs.py L406-415, L477-500),
+    // `ReasoningPart.to_dict` (parts.py L120-143) and
+    // `_BaseResponse._messages_now` (models.py L1232-1248).
+
+    #[test]
+    fn recency_keeps_microseconds() {
+        let earlier = "2026-11-25T03:38:12.820036+00:00".to_string();
+        let later_ts = "2026-11-25T03:38:12.820509+00:00".to_string();
+        assert_eq!(
+            later(Some(earlier.clone()), later_ts.clone()),
+            Some(later_ts.clone())
+        );
+        assert_eq!(later(Some(later_ts.clone()), earlier), Some(later_ts));
+        // Different offsets compare as instants.
+        assert_eq!(
+            later(
+                Some("2026-11-25T12:00:00+09:00".to_string()),
+                "2026-11-25T04:00:00Z".to_string()
+            ),
+            Some("2026-11-25T04:00:00Z".to_string())
+        );
+    }
+
+    #[test]
+    fn messages_with_nothing_to_show_are_not_counted() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(STORE_DDL).unwrap();
+        let redacted = r#"{"redacted": true}"#;
+        insert_message(
+            &conn,
+            "b2:u1",
+            None,
+            "user",
+            &[("text", None, Some("hi"), None)],
+        );
+        // Opaque reasoning only: no block, so no message.
+        insert_message(
+            &conn,
+            "b2:a1",
+            Some("b2:u1"),
+            "assistant",
+            &[("reasoning", None, Some(""), Some(redacted))],
+        );
+        insert_message(
+            &conn,
+            "b2:u2",
+            Some("b2:a1"),
+            "user",
+            &[("text", None, Some("again"), None)],
+        );
+        // Opaque reasoning next to text is one message.
+        insert_message(
+            &conn,
+            "b2:a2",
+            Some("b2:u2"),
+            "assistant",
+            &[
+                ("reasoning", None, Some(""), Some(redacted)),
+                ("text", None, Some("ok"), None),
+            ],
+        );
+        insert_thread(&conn, "t1", "hi", "b2:a2", "2026-11-25 03:00:00+00:00");
+        let sessions = load_sessions_conn(&conn).unwrap();
+        assert_eq!(sessions[0].message_count, 3);
+        assert_eq!(scan_in_conn(&conn).unwrap()[0].message_count, 3);
+        assert_eq!(load_messages_conn(&conn, "t1").unwrap().len(), 3);
+    }
+
+    #[test]
+    fn fork_of_a_thread_takes_the_turn_of_the_thread_it_was_forked_from() {
+        // Threads A and B got the same reply to the same prompt from
+        // different models, so they share their messages (and tip); C is
+        // forked from B at that tip and has no turn of its own.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(STORE_DDL).unwrap();
+        insert_message(
+            &conn,
+            "b2:u",
+            None,
+            "user",
+            &[("text", None, Some("hi"), None)],
+        );
+        insert_message(
+            &conn,
+            "b2:a",
+            Some("b2:u"),
+            "assistant",
+            &[("text", None, Some("hello"), None)],
+        );
+        for (thread, turn, model, datetime) in [
+            ("A", "turn-a", "model-a", "2026-11-25T03:00:00+00:00"),
+            ("B", "turn-b", "model-b", "2026-11-25T04:00:00+00:00"),
+        ] {
+            insert_thread(&conn, thread, "hi", "b2:a", "2026-11-25 05:00:00+00:00");
+            insert_turn(
+                &conn,
+                &TurnSpec {
+                    id: turn,
+                    thread,
+                    parent: "b2:u",
+                    tip: "b2:a",
+                    model,
+                    tokens: (1, 1),
+                    duration_ms: 5,
+                    datetime,
+                },
+            );
+        }
+        conn.execute(
+            "INSERT INTO threads (id, name, tip_message_hash, forked_from, datetime_utc) \
+             VALUES ('C', 'hi', 'b2:a', 'B', '2026-11-25 06:00:00+00:00')",
+            [],
+        )
+        .unwrap();
+        let c = load_messages_conn(&conn, "C").unwrap();
+        assert_eq!(c[1].model.as_deref(), Some("model-b"));
+        assert_eq!(c[1].timestamp, "2026-11-25T04:00:00+00:00");
+        let a = load_messages_conn(&conn, "A").unwrap();
+        assert_eq!(a[1].model.as_deref(), Some("model-a"));
+    }
+
+    /// A legacy conversation `c1` (two responses, as llm < 0.32 wrote them)
+    /// continued once with llm >= 0.32: the thread `c1` holds the whole
+    /// chain, but the only turn is the new one.
+    fn continued_legacy_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(STORE_DDL).unwrap();
+        conn.execute_batch(LEGACY_DDL).unwrap();
+        conn.execute_batch(
+            "INSERT INTO conversations VALUES ('c1', 'zebra question', 'gpt-4');
+             INSERT INTO responses VALUES ('r1', 'gpt-4', 'zebra question', 'zebra answer',
+                 'c1', '2026-06-20T10:00:00', 12, 34);
+             INSERT INTO responses VALUES ('r2', 'gpt-4', 'giraffe question', 'giraffe answer',
+                 'c1', '2026-06-20T10:01:00', 5, 8);",
+        )
+        .unwrap();
+        let chain = [
+            ("b2:u1", None, "user", "zebra question"),
+            ("b2:a1", Some("b2:u1"), "assistant", "zebra answer"),
+            ("b2:u2", Some("b2:a1"), "user", "giraffe question"),
+            ("b2:a2", Some("b2:u2"), "assistant", "giraffe answer"),
+            ("b2:u3", Some("b2:a2"), "user", "and now a new one"),
+            ("b2:a3", Some("b2:u3"), "assistant", "a new answer"),
+        ];
+        for (hash, parent, role, text) in chain {
+            insert_message(
+                &conn,
+                hash,
+                parent,
+                role,
+                &[("text", None, Some(text), None)],
+            );
+        }
+        insert_thread(
+            &conn,
+            "c1",
+            "and now a new one",
+            "b2:a3",
+            "2026-11-25 03:00:10+00:00",
+        );
+        insert_turn(
+            &conn,
+            &TurnSpec {
+                id: "turn-new",
+                thread: "c1",
+                parent: "b2:u3",
+                tip: "b2:a3",
+                model: "llama",
+                tokens: (7, 9),
+                duration_ms: 20,
+                datetime: "2026-11-25T03:00:00+00:00",
+            },
+        );
+        insert_search(&conn, "turn-new", "and now a new one", "a new answer");
+        conn
+    }
+
+    #[test]
+    fn continued_legacy_history_keeps_its_own_time_model_and_usage() {
+        let conn = continued_legacy_db();
+        let msgs = load_messages_conn(&conn, "c1").unwrap();
+        assert_eq!(msgs.len(), 6);
+        // The two legacy exchanges are matched to their `responses`.
+        assert_eq!(msgs[0].timestamp, "2026-06-20T10:00:00Z");
+        assert_eq!(msgs[1].timestamp, "2026-06-20T10:00:00Z");
+        assert_eq!(msgs[1].model.as_deref(), Some("gpt-4"));
+        assert_eq!(msgs[1].usage.as_ref().unwrap().input_tokens, Some(12));
+        assert_eq!(msgs[2].timestamp, "2026-06-20T10:01:00Z");
+        assert_eq!(msgs[3].usage.as_ref().unwrap().output_tokens, Some(8));
+        // The new turn owns only its own prompt and answer.
+        assert_eq!(msgs[4].timestamp, "2026-11-25T03:00:00+00:00");
+        assert_eq!(msgs[5].model.as_deref(), Some("llama"));
+        assert_eq!(msgs[5].usage.as_ref().unwrap().input_tokens, Some(7));
+
+        // Without a legacy row to match, the history is not given the new
+        // turn's model or usage.
+        conn.execute("DELETE FROM responses", []).unwrap();
+        let msgs = load_messages_conn(&conn, "c1").unwrap();
+        assert!(msgs[1].model.is_none() && msgs[1].usage.is_none());
+        assert!(msgs[3].model.is_none() && msgs[3].usage.is_none());
+        assert_eq!(msgs[5].model.as_deref(), Some("llama"));
+    }
+
+    #[test]
+    fn continued_legacy_history_stays_searchable_and_lists_once() {
+        let conn = continued_legacy_db();
+        let sessions = load_sessions_conn(&conn).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].message_count, 6);
+
+        // A word only the pre-upgrade responses have is found once, on the
+        // message of the thread that holds it.
+        let hits = search_conn(&conn, "zebra", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        let user = hits
+            .iter()
+            .find(|h| h.role.as_deref() == Some("user"))
+            .unwrap();
+        let asst = hits
+            .iter()
+            .find(|h| h.role.as_deref() == Some("assistant"))
+            .unwrap();
+        assert_eq!(
+            (user.session_id.as_str(), user.uuid.as_str()),
+            ("c1", "b2:u1")
+        );
+        assert_eq!(
+            (asst.session_id.as_str(), asst.uuid.as_str()),
+            ("c1", "b2:a1")
+        );
+        let loaded = load_messages_conn(&conn, "c1").unwrap();
+        assert!(loaded.iter().any(|m| m.uuid == user.uuid));
+        assert!(loaded.iter().any(|m| m.uuid == asst.uuid));
+
+        // Text the new turn has is found through `turn_search`, once.
+        let hits = search_conn(&conn, "new one", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].uuid, "b2:u3");
+    }
+
+    #[test]
+    fn search_folds_case_of_non_ascii_text() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(STORE_DDL).unwrap();
+        conn.execute_batch(LEGACY_DDL).unwrap();
+        insert_message(
+            &conn,
+            "b2:u",
+            None,
+            "user",
+            &[("text", None, Some("École Polytechnique"), None)],
+        );
+        insert_message(
+            &conn,
+            "b2:a",
+            Some("b2:u"),
+            "assistant",
+            &[("text", None, Some("Paris"), None)],
+        );
+        insert_thread(
+            &conn,
+            "t1",
+            "École Polytechnique",
+            "b2:a",
+            "2026-11-25 03:00:00+00:00",
+        );
+        insert_turn(
+            &conn,
+            &TurnSpec {
+                id: "turn1",
+                thread: "t1",
+                parent: "b2:u",
+                tip: "b2:a",
+                model: "m",
+                tokens: (1, 1),
+                duration_ms: 1,
+                datetime: "2026-11-25T03:00:00+00:00",
+            },
+        );
+        insert_search(&conn, "turn1", "École Polytechnique", "Paris");
+        conn.execute(
+            "INSERT INTO responses VALUES ('r1', 'gpt-4', 'Ünïcode legacy', 'x', NULL, \
+             '2026-06-20T10:00:00', 1, 1)",
+            [],
+        )
+        .unwrap();
+        let hits = search_conn(&conn, "école", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].uuid, "b2:u");
+        assert_eq!(search_conn(&conn, "ünïcode", 10).unwrap().len(), 1);
+        // ASCII queries still fold ASCII case.
+        assert_eq!(search_conn(&conn, "PARIS", 10).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn search_anchors_on_the_message_of_the_turn_that_has_the_text() {
+        // A response of two assistant messages; only the first has text, the
+        // last (the tip) holds opaque reasoning, which the transcript omits.
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(STORE_DDL).unwrap();
+        insert_message(
+            &conn,
+            "b2:u",
+            None,
+            "user",
+            &[("text", None, Some("question"), None)],
+        );
+        insert_message(
+            &conn,
+            "b2:a1",
+            Some("b2:u"),
+            "assistant",
+            &[("text", None, Some("alpha keyword"), None)],
+        );
+        insert_message(
+            &conn,
+            "b2:a2",
+            Some("b2:a1"),
+            "assistant",
+            &[("reasoning", None, Some(""), Some(r#"{"redacted": true}"#))],
+        );
+        insert_thread(
+            &conn,
+            "t1",
+            "question",
+            "b2:a2",
+            "2026-11-25 03:00:00+00:00",
+        );
+        insert_turn(
+            &conn,
+            &TurnSpec {
+                id: "turn1",
+                thread: "t1",
+                parent: "b2:u",
+                tip: "b2:a2",
+                model: "m",
+                tokens: (1, 1),
+                duration_ms: 1,
+                datetime: "2026-11-25T03:00:00+00:00",
+            },
+        );
+        insert_search(&conn, "turn1", "question", "alpha keyword");
+        let hits = search_conn(&conn, "alpha", 10).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].uuid, "b2:a1");
+        let loaded = load_messages_conn(&conn, "t1").unwrap();
+        assert!(loaded.iter().any(|m| m.uuid == hits[0].uuid));
     }
 }
