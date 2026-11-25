@@ -1400,11 +1400,20 @@ fn convert_codex_item_with_tool(
             let role = item.get("role").and_then(|r| r.as_str()).unwrap_or("user");
             let content = convert_codex_content_array(item.get("content"));
 
-            Some(build_codex_message(
+            // Instructions Codex itself sends to the model (memory guide,
+            // multi-agent role, skills, permissions) are not replies: they
+            // show as a collapsed system prompt card, as other providers'
+            // system prompts do.
+            let instructions = matches!(role, "developer" | "system");
+            let mut msg = build_codex_message(
                 uuid,
                 session_id,
                 timestamp,
-                if role == "user" { "user" } else { "assistant" },
+                match role {
+                    "user" => "user",
+                    _ if instructions => "system",
+                    _ => "assistant",
+                },
                 Some(role),
                 content,
                 if role == "assistant" {
@@ -1412,7 +1421,11 @@ fn convert_codex_item_with_tool(
                 } else {
                     None
                 },
-            ))
+            );
+            if instructions {
+                msg.subtype = Some("system_prompt".to_string());
+            }
+            Some(msg)
         }
         "local_shell_call" => {
             let command = item
@@ -3212,6 +3225,60 @@ mod tests {
                 .and_then(Value::as_str);
             assert_eq!(actual_text, Some(*text), "message {i} content");
         }
+    }
+
+    /// Instructions Codex sends as `developer` messages are a system prompt
+    /// card, not an assistant reply; the user's prompt and the reply keep
+    /// their roles.
+    #[test]
+    #[serial]
+    fn load_messages_shows_developer_instructions_as_a_system_prompt() {
+        let tmp = TempDir::new().expect("temp dir should be created");
+        let codex_home = tmp.path().join("codex-home");
+        let sessions_dir = codex_home.join("sessions");
+        fs::create_dir_all(&sessions_dir).expect("sessions dir should be created");
+        let _guard = EnvVarGuard::set("CODEX_HOME", &codex_home);
+        let rollout_path = sessions_dir.join("rollout-developer.jsonl");
+        let item = |id: &str, role: &str, kind: &str, text: &str| {
+            json!({
+                "timestamp": "2026-11-24T10:00:00Z",
+                "type": "response_item",
+                "payload": { "id": id, "type": "message", "role": role,
+                    "content": [{ "type": kind, "text": text }] }
+            })
+        };
+        let lines = [
+            json!({ "timestamp": "2026-11-24T10:00:00Z", "type": "session_meta", "payload": { "id": "sess-dev" } }),
+            item(
+                "d1",
+                "developer",
+                "input_text",
+                "## Memory\nUse the memory folder.",
+            ),
+            item("u1", "user", "input_text", "fix the bug"),
+            item("a1", "assistant", "output_text", "done"),
+        ];
+        let content = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&rollout_path, format!("{content}\n")).expect("fixture should be written");
+
+        let messages = load_messages(rollout_path.to_str().expect("UTF-8 path"))
+            .expect("rollout should be parsed");
+        let kinds: Vec<_> = messages
+            .iter()
+            .map(|m| (m.message_type.as_str(), m.subtype.as_deref()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("system", Some("system_prompt")),
+                ("user", None),
+                ("assistant", None)
+            ]
+        );
     }
 
     #[test]
