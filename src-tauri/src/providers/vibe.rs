@@ -7,11 +7,18 @@
 //! - **Unified session store** (current Vibe) —
 //!   `~/.vibe/logs/session/unified/<session-id>/` holding `meta.json` plus an
 //!   event-sourced store: content-addressed `chunks/<sha256>.json` files and
-//!   `generations/<seq>/` snapshots. The conversation is recovered from the
-//!   latest generation's `manifest.json`, whose `checkpoint.chunks` list names
-//!   the chunks of the model-facing history in order. Each chunk is a JSON
-//!   array of history entries wrapping an OpenAI-style message
-//!   (`{ "message": { "role": ..., "content": [...] }, "source": "history" }`).
+//!   `generations/<seq>/` snapshots. The latest generation's `manifest.json`
+//!   names two ordered chunk lists, each chunk being a JSON array:
+//!   - `projection_state.chunks` — the public projection, the complete
+//!     conversation as the user saw it. Entries are flat and typed:
+//!     `message` (`user` / `assistant`), `reasoning`, `effect` (a tool call
+//!     and its result merged) and `checkpoint` (`kind: "compaction"` marks a
+//!     compaction). It survives compaction, so it is the source when present.
+//!   - `checkpoint.chunks` — the model-facing history, entries wrapping an
+//!     OpenAI-style message
+//!     (`{ "message": { "role": ..., "content": [...] }, "source": "history" }`).
+//!     After a compaction it holds only the summary and the turns since, so
+//!     it is the fallback for sessions without a projection.
 
 use super::ProviderInfo;
 use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession};
@@ -32,6 +39,7 @@ const GENERATIONS_DIR: &str = "generations";
 const MANIFEST_FILE: &str = "manifest.json";
 const CURRENT_FILE: &str = "CURRENT";
 const SCHEME: &str = "vibe://";
+const PROJECTION_SECTION: &str = "projection_state";
 
 pub fn detect() -> Option<ProviderInfo> {
     let base = get_base_path()?;
@@ -199,19 +207,10 @@ pub fn load_messages_from_base_path(
         .map(normalize_timestamp)
         .unwrap_or_default();
 
-    // Unified session store: conversation comes from the checkpoint chunks.
+    // Unified session store: the projection (or, without one, the checkpoint).
     if session_dir.join(CHUNKS_DIR).is_dir() {
-        let entries = load_history_entries(&session_dir);
-        let mut messages = Vec::new();
-        let mut counter = 0u64;
-        for entry in &entries {
-            if let Some(message) =
-                convert_history_entry(entry, &session_id, &timestamp, &mut counter)
-            {
-                messages.push(message);
-            }
-        }
-        return Ok(messages);
+        let entries = load_store_entries(&session_dir);
+        return Ok(build_conversation(&entries, &session_id, &timestamp));
     }
 
     // Legacy transcript: one OpenAI-style message per line.
@@ -320,25 +319,41 @@ fn is_session_dir(dir: &Path) -> bool {
     !is_symlink(&messages) && messages.is_file()
 }
 
-/// Read the ordered conversation history from a unified session store.
+/// The conversation records of a unified session store, split by origin.
+#[derive(Debug, Default)]
+struct StoreEntries {
+    /// Model-facing history: entries wrapping a message
+    /// (`{ "message": {...}, "source": ... }`).
+    checkpoint: Vec<Value>,
+    /// Public projection: flat `message` / `reasoning` / `effect` /
+    /// `checkpoint` entries.
+    projection: Vec<Value>,
+}
+
+/// Read the ordered checkpoint and projection entries from a unified store.
 ///
-/// The latest generation's `manifest.json` lists the ordered
-/// `checkpoint.chunks` that make up the model-facing history, so the manifest
-/// is the source of truth for both membership and ordering. When no manifest
-/// is readable (crashed or in-progress session), fall back to every chunk
-/// ordered by modification time, then by file name.
-fn load_history_entries(session_dir: &Path) -> Vec<Value> {
+/// The latest generation's `manifest.json` lists the ordered chunks of both
+/// histories, so the manifest is the source of truth for membership and
+/// ordering. When no manifest is readable (crashed or in-progress session),
+/// fall back to every chunk ordered by modification time, then by file name,
+/// and tell the two histories apart by entry shape.
+fn load_store_entries(session_dir: &Path) -> StoreEntries {
     let chunks_dir = session_dir.join(CHUNKS_DIR);
     if is_symlink(&chunks_dir) {
-        return Vec::new();
+        return StoreEntries::default();
     }
-    let mut entries = Vec::new();
 
-    if let Some(hashes) = resolve_checkpoint_chunks(session_dir) {
-        for hash in hashes {
-            entries.extend(read_chunk_file(&chunks_dir.join(format!("{hash}.json"))));
-        }
-        return entries;
+    if let Some(chunks) = resolve_manifest_chunks(session_dir) {
+        let read_all = |hashes: &[String]| -> Vec<Value> {
+            hashes
+                .iter()
+                .flat_map(|hash| read_chunk_file(&chunks_dir.join(format!("{hash}.json"))))
+                .collect()
+        };
+        return StoreEntries {
+            checkpoint: read_all(&chunks.checkpoint),
+            projection: read_all(&chunks.projection),
+        };
     }
 
     let mut chunk_files: Vec<PathBuf> = Vec::new();
@@ -366,8 +381,17 @@ fn load_history_entries(session_dir: &Path) -> Vec<Value> {
             path.file_name().map(std::ffi::OsStr::to_os_string),
         )
     });
+    let mut entries = StoreEntries::default();
     for path in chunk_files {
-        entries.extend(read_chunk_file(&path));
+        for entry in read_chunk_file(&path) {
+            // Checkpoint entries wrap a message object; a projection
+            // `checkpoint` entry also has a `message` key, but it is a string.
+            if entry.get("message").is_some_and(Value::is_object) {
+                entries.checkpoint.push(entry);
+            } else if entry.get("type").is_some_and(Value::is_string) {
+                entries.projection.push(entry);
+            }
+        }
     }
     entries
 }
@@ -383,8 +407,15 @@ fn is_safe_store_name(name: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 
-/// Resolve the ordered checkpoint chunk hashes of the latest generation.
-fn resolve_checkpoint_chunks(session_dir: &Path) -> Option<Vec<String>> {
+/// Ordered chunk hashes of the latest generation, per history.
+struct ManifestChunks {
+    checkpoint: Vec<String>,
+    projection: Vec<String>,
+}
+
+/// Resolve the ordered chunk hashes of the latest generation. `None` when no
+/// manifest is readable or it lists no chunks at all.
+fn resolve_manifest_chunks(session_dir: &Path) -> Option<ManifestChunks> {
     let generations = session_dir.join(GENERATIONS_DIR);
     if is_symlink(&generations) {
         return None;
@@ -397,23 +428,36 @@ fn resolve_checkpoint_chunks(session_dir: &Path) -> Option<Vec<String>> {
         })
         .or_else(|| latest_generation(&generations))?;
     let manifest = read_json_file(&generations.join(&generation).join(MANIFEST_FILE)).ok()?;
-    let chunks: Vec<String> = manifest
-        .get("checkpoint")?
-        .get("chunks")?
-        .as_array()?
-        .iter()
-        .filter_map(|chunk| {
-            chunk
-                .as_str()
-                .filter(|hash| is_safe_store_name(hash))
-                .map(str::to_owned)
-        })
-        .collect();
-    if chunks.is_empty() {
+    let chunks = ManifestChunks {
+        checkpoint: manifest_chunk_hashes(&manifest, "checkpoint"),
+        projection: manifest_chunk_hashes(&manifest, PROJECTION_SECTION),
+    };
+    if chunks.checkpoint.is_empty() && chunks.projection.is_empty() {
         None
     } else {
         Some(chunks)
     }
+}
+
+/// The safe chunk hashes a manifest section (`checkpoint` or
+/// `projection_state`) lists, in order.
+fn manifest_chunk_hashes(manifest: &Value, section: &str) -> Vec<String> {
+    manifest
+        .get(section)
+        .and_then(|section| section.get("chunks"))
+        .and_then(Value::as_array)
+        .map(|chunks| {
+            chunks
+                .iter()
+                .filter_map(|chunk| {
+                    chunk
+                        .as_str()
+                        .filter(|hash| is_safe_store_name(hash))
+                        .map(str::to_owned)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The `CURRENT` file points at the newest generation of a session.
@@ -447,6 +491,350 @@ fn read_chunk_file(path: &Path) -> Vec<Value> {
     match serde_json::from_str::<Value>(&content) {
         Ok(Value::Array(items)) => items,
         _ => Vec::new(),
+    }
+}
+
+/// Convert a unified store into viewer messages.
+///
+/// The projection holds the complete conversation (it keeps every turn across
+/// compactions), so it is preferred. Sessions without one fall back to the
+/// checkpoint, which after a compaction only holds the summary and the turns
+/// that followed it.
+fn build_conversation(
+    entries: &StoreEntries,
+    session_id: &str,
+    timestamp: &str,
+) -> Vec<ClaudeMessage> {
+    let mut messages = Vec::new();
+    let mut counter = 0u64;
+    if entries.projection.is_empty() {
+        for entry in &entries.checkpoint {
+            convert_checkpoint_entry(entry, session_id, timestamp, &mut counter, &mut messages);
+        }
+    } else {
+        for entry in &entries.projection {
+            convert_projection_entry(entry, session_id, timestamp, &mut counter, &mut messages);
+        }
+    }
+    messages
+}
+
+/// Convert one checkpoint entry, dropping what Vibe itself did not receive
+/// from the user.
+///
+/// After a compaction the checkpoint starts with entries tagged
+/// `source: "injection"`: a preamble, the `<compaction_summary>` and a notice
+/// about reduced items. They are model context, not user messages, so they are
+/// dropped; the summary is kept as a compaction marker so the boundary stays
+/// visible.
+fn convert_checkpoint_entry(
+    entry: &Value,
+    session_id: &str,
+    timestamp: &str,
+    counter: &mut u64,
+    out: &mut Vec<ClaudeMessage>,
+) {
+    if entry.get("source").and_then(Value::as_str) == Some("injection") {
+        if let Some(summary) = entry
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(compaction_summary)
+        {
+            *counter += 1;
+            let uuid = format!("{session_id}-{counter}");
+            out.push(compaction_message(
+                uuid,
+                session_id,
+                timestamp.to_string(),
+                &format!("Context compacted\n\n{summary}"),
+                "info",
+                None,
+            ));
+        }
+        return;
+    }
+    out.extend(convert_history_entry(entry, session_id, timestamp, counter));
+}
+
+/// The text of a `<compaction_summary>` block in message content.
+fn compaction_summary(content: &Value) -> Option<String> {
+    const OPEN: &str = "<compaction_summary>";
+    const CLOSE: &str = "</compaction_summary>";
+    content.as_array()?.iter().find_map(|block| {
+        let text = block.get("text").and_then(Value::as_str)?;
+        let start = text.find(OPEN)? + OPEN.len();
+        let end = text[start..].find(CLOSE).map_or(text.len(), |i| start + i);
+        Some(text[start..end].trim().to_string())
+    })
+}
+
+/// A `compact_boundary` system message, the marker the other providers use for
+/// a compaction.
+fn compaction_message(
+    uuid: String,
+    session_id: &str,
+    timestamp: String,
+    text: &str,
+    level: &str,
+    metadata: Option<Value>,
+) -> ClaudeMessage {
+    let mut message = build_provider_message(
+        PROVIDER_ID,
+        uuid,
+        session_id,
+        timestamp,
+        "system",
+        None,
+        Some(Value::String(text.to_string())),
+        None,
+    );
+    message.subtype = Some("compact_boundary".to_string());
+    message.level = Some(level.to_string());
+    message.compact_metadata = metadata;
+    message
+}
+
+/// Milliseconds since the epoch (projection `createdAt` / `updatedAt`) as an
+/// RFC 3339 UTC timestamp.
+fn millis_to_iso(millis: Option<i64>) -> Option<String> {
+    DateTime::<Utc>::from_timestamp_millis(millis?).map(|dt| dt.to_rfc3339())
+}
+
+/// Convert one public-projection entry into viewer messages.
+///
+/// Entries are flat and typed. `message` entries carry a user or assistant
+/// turn, `reasoning` entries the model's thinking, `effect` entries a tool call
+/// merged with its result (one call message plus one result message), and
+/// `checkpoint` entries with `kind: "compaction"` mark a compaction. Other
+/// entry types and checkpoint kinds are not conversation content.
+fn convert_projection_entry(
+    entry: &Value,
+    session_id: &str,
+    timestamp: &str,
+    counter: &mut u64,
+    out: &mut Vec<ClaudeMessage>,
+) {
+    let created = millis_to_iso(entry.get("createdAt").and_then(Value::as_i64))
+        .unwrap_or_else(|| timestamp.to_string());
+    let updated = millis_to_iso(entry.get("updatedAt").and_then(Value::as_i64))
+        .unwrap_or_else(|| created.clone());
+    let mut entry_uuid = || -> String {
+        if let Some(id) = entry.get("id").and_then(Value::as_str) {
+            id.to_string()
+        } else {
+            *counter += 1;
+            format!("{session_id}-{counter}")
+        }
+    };
+
+    match entry.get("type").and_then(Value::as_str) {
+        Some("message") => {
+            let role = match entry.get("role").and_then(Value::as_str) {
+                Some(role @ ("user" | "assistant")) => role,
+                _ => return,
+            };
+            let blocks = history_content_to_blocks(entry.get("content"));
+            if blocks.as_array().is_some_and(Vec::is_empty) {
+                return;
+            }
+            out.push(build_provider_message(
+                PROVIDER_ID,
+                entry_uuid(),
+                session_id,
+                created,
+                role,
+                Some(role),
+                Some(blocks),
+                None,
+            ));
+        }
+        Some("reasoning") => {
+            let text = entry
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+                .map(str::to_owned)
+                .or_else(|| {
+                    let summary = entry
+                        .get("summary")
+                        .and_then(Value::as_array)?
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    (!summary.is_empty()).then_some(summary)
+                });
+            let Some(thinking) = text else {
+                return;
+            };
+            out.push(build_provider_message(
+                PROVIDER_ID,
+                entry_uuid(),
+                session_id,
+                created,
+                "assistant",
+                Some("assistant"),
+                Some(json!([{ "type": "thinking", "thinking": thinking }])),
+                None,
+            ));
+        }
+        Some("effect") => {
+            convert_effect_entry(entry, &entry_uuid(), session_id, created, updated, out);
+        }
+        Some("checkpoint") => {
+            if entry.get("kind").and_then(Value::as_str) != Some("compaction")
+                || entry.get("generationStatus").and_then(Value::as_str) != Some("completed")
+            {
+                return;
+            }
+            let text = entry
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("Context compacted");
+            let details = entry.get("details");
+            let mut metadata = serde_json::Map::new();
+            for key in ["trigger", "attempt", "summaryLength"] {
+                if let Some(value) = details.and_then(|details| details.get(key)) {
+                    metadata.insert(key.to_string(), value.clone());
+                }
+            }
+            // A failed compaction (`details.error`) is flagged as a warning.
+            let failed = details.is_some_and(|details| details.get("error").is_some());
+            if failed {
+                let warning = details
+                    .and_then(|details| details.get("reason"))
+                    .and_then(Value::as_str)
+                    .unwrap_or(text);
+                metadata.insert("warning".to_string(), json!(warning));
+            }
+            out.push(compaction_message(
+                entry_uuid(),
+                session_id,
+                created,
+                text,
+                if failed { "warning" } else { "info" },
+                Some(Value::Object(metadata)),
+            ));
+        }
+        _ => {}
+    }
+}
+
+/// Convert an `effect` entry (a tool call merged with its result) into the
+/// `tool_use` assistant message and, once the effect has settled, the
+/// `tool_result` message.
+///
+/// The producer sets `state.display.success` to `false` for effects that
+/// failed, were skipped or were cancelled; that is the structured failure
+/// flag. A command that ran and exited non-zero still settles as a success.
+fn convert_effect_entry(
+    entry: &Value,
+    uuid: &str,
+    session_id: &str,
+    created: String,
+    updated: String,
+    out: &mut Vec<ClaudeMessage>,
+) {
+    let detail = entry.get("detail");
+    let state = entry.get("state");
+    let tool_call_id = entry
+        .get("toolCallId")
+        .and_then(Value::as_str)
+        .unwrap_or(uuid);
+    let raw_name = detail
+        .and_then(|detail| detail.get("toolName"))
+        .and_then(Value::as_str)
+        .or_else(|| entry.get("title").and_then(Value::as_str))
+        .unwrap_or("tool");
+    // Local tools are namespaced `file_system.<tool>` in the projection but
+    // the model (and the checkpoint) call them by their bare name.
+    let name = raw_name.strip_prefix("file_system.").unwrap_or(raw_name);
+    let input = detail
+        .and_then(|detail| detail.get("input"))
+        .cloned()
+        .unwrap_or(Value::Null);
+
+    out.push(build_provider_message(
+        PROVIDER_ID,
+        uuid.to_string(),
+        session_id,
+        created,
+        "assistant",
+        Some("assistant"),
+        Some(json!([{
+            "type": "tool_use",
+            "id": tool_call_id,
+            "name": name,
+            "input": input,
+        }])),
+        None,
+    ));
+
+    let Some(state) = state else {
+        return;
+    };
+    let status = state.get("status").and_then(Value::as_str);
+    if !matches!(
+        status,
+        Some("completed" | "failed" | "skipped" | "cancelled")
+    ) {
+        return;
+    }
+    let is_error = state
+        .get("display")
+        .and_then(|display| display.get("success"))
+        .and_then(Value::as_bool)
+        == Some(false);
+    let mut result = json!({
+        "type": "tool_result",
+        "tool_use_id": tool_call_id,
+        "content": effect_result_text(state, status),
+    });
+    if is_error {
+        result["is_error"] = Value::Bool(true);
+    }
+    out.push(build_provider_message(
+        PROVIDER_ID,
+        format!("{uuid}-result"),
+        session_id,
+        updated,
+        "tool",
+        Some("tool"),
+        Some(json!([result])),
+        None,
+    ));
+}
+
+/// The text of a settled effect's result: the tool's text output, else its
+/// structured output (the JSON the model receives), else the failure message
+/// or the reason a call was skipped or cancelled.
+fn effect_result_text(state: &Value, status: Option<&str>) -> String {
+    if let Some(text) = state
+        .get("outputText")
+        .and_then(Value::as_str)
+        .filter(|text| !text.is_empty())
+    {
+        return text.to_string();
+    }
+    let string_at = |value: Option<&Value>| value.and_then(Value::as_str).map(str::to_owned);
+    match status {
+        Some("completed") => {
+            let output = state.get("output");
+            output
+                .and_then(|output| output.get("structured_content"))
+                .filter(|value| !value.is_null())
+                .map(Value::to_string)
+                .or_else(|| {
+                    history_text_content(output.and_then(|output| output.get("content")))
+                        .as_str()
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default()
+        }
+        Some("failed") => string_at(state.get("error").and_then(|error| error.get("message")))
+            .or_else(|| string_at(state.get("display").and_then(|d| d.get("message"))))
+            .unwrap_or_default(),
+        _ => string_at(state.get("reason")).unwrap_or_default(),
     }
 }
 
@@ -749,8 +1137,9 @@ fn extract_session_info(session_dir: &Path) -> Option<SessionInfo> {
         .unwrap_or_else(|| start_time.clone());
 
     let (summary, storage_type, last_modified) = if session_dir.join(CHUNKS_DIR).is_dir() {
-        let entries = load_history_entries(session_dir);
-        let summary = summarize_history_entries(&entries);
+        let entries = load_store_entries(session_dir);
+        let messages = build_conversation(&entries, &session_id, &start_time);
+        let summary = summarize_messages(&messages);
         let last_modified = if end_time.is_empty() {
             file_modified_iso(&metadata_path).unwrap_or_default()
         } else {
@@ -790,38 +1179,32 @@ fn extract_session_info(session_dir: &Path) -> Option<SessionInfo> {
     })
 }
 
-/// Summarize unified-store history entries: message count, tool usage and
-/// the first user text (used as a fallback session summary).
-fn summarize_history_entries(entries: &[Value]) -> HistorySummary {
-    let mut summary = HistorySummary::default();
+/// Summarize converted messages: message count, tool usage and the first user
+/// text (used as a fallback session summary).
+fn summarize_messages(messages: &[ClaudeMessage]) -> HistorySummary {
+    let mut summary = HistorySummary {
+        message_count: messages.len(),
+        ..HistorySummary::default()
+    };
 
-    for entry in entries {
-        let Some(message) = entry.get("message") else {
-            continue;
-        };
-        let Some(role) = message.get("role").and_then(Value::as_str) else {
-            continue;
-        };
-        if !matches!(role, "user" | "assistant" | "tool") {
-            continue;
-        }
-        summary.message_count += 1;
-        if role == "tool" {
-            summary.has_tool_use = true;
-        }
-        let Some(items) = message.get("content").and_then(Value::as_array) else {
-            continue;
-        };
-        if items
-            .iter()
-            .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_call"))
+    for message in messages {
+        let blocks = message.content.as_ref().and_then(Value::as_array);
+        if message.message_type == "tool"
+            || blocks.is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+            })
         {
             summary.has_tool_use = true;
         }
-        if role == "user" && summary.first_user_text.is_none() {
-            summary.first_user_text = items
-                .iter()
-                .find_map(|block| block.get("text").and_then(Value::as_str))
+        if message.message_type == "user" && summary.first_user_text.is_none() {
+            summary.first_user_text = blocks
+                .and_then(|blocks| {
+                    blocks
+                        .iter()
+                        .find_map(|block| block.get("text").and_then(Value::as_str))
+                })
                 .map(str::trim)
                 .filter(|text| !text.is_empty())
                 .map(|text| truncate_chars(text, 200));
@@ -1317,11 +1700,11 @@ mod tests {
                     "content": [{
                         "type": "tool_call",
                         "id": "call-1",
-                        "name": "file_system.bash",
+                        "name": "edit",
                         "arguments": {
                             "type": "json",
-                            "raw": "{\"command\":\"just dev\"}",
-                            "value": { "command": "just dev" }
+                            "raw": "{\"file_path\": \"src/math.js\", \"old_string\": \"\", \"new_string\": \"x\"}",
+                            "value": { "file_path": "src/math.js", "old_string": "", "new_string": "x" }
                         }
                     }]
                 },
@@ -1331,10 +1714,10 @@ mod tests {
             {
                 "message": {
                     "role": "tool",
-                    "name": "file_system.bash",
+                    "name": "edit",
                     "outcome": "failure",
                     "tool_call_id": "call-1",
-                    "content": [{ "type": "text", "text": "{\"returncode\":1,\"stderr\":\"boom\"}" }]
+                    "content": [{ "type": "text", "text": "{\"result\":{\"type\":\"error\",\"error\":{\"name\":\"InvalidToolCall\",\"message\":\"tool arguments do not satisfy the declared input schema: at /old_string: \\\"\\\" is shorter than 1 character\"}}}" }]
                 },
                 "source": "history",
                 "turn_index": 0
@@ -1494,14 +1877,20 @@ mod tests {
         let tool_use = &messages[2].content.as_ref().unwrap()[0];
         assert_eq!(tool_use["type"], "tool_use");
         assert_eq!(tool_use["id"], "call-1");
-        assert_eq!(tool_use["name"], "file_system.bash");
-        assert_eq!(tool_use["input"], json!({ "command": "just dev" }));
+        assert_eq!(tool_use["name"], "edit");
+        assert_eq!(
+            tool_use["input"],
+            json!({ "file_path": "src/math.js", "old_string": "", "new_string": "x" })
+        );
 
         assert_eq!(messages[3].message_type, "tool");
         let result = &messages[3].content.as_ref().unwrap()[0];
         assert_eq!(result["type"], "tool_result");
         assert_eq!(result["tool_use_id"], "call-1");
-        assert_eq!(result["content"], "{\"returncode\":1,\"stderr\":\"boom\"}");
+        assert!(result["content"]
+            .as_str()
+            .unwrap()
+            .contains("InvalidToolCall"));
         assert_eq!(result["is_error"], Value::Bool(true));
     }
 
@@ -1865,7 +2254,7 @@ mod tests {
         )
         .expect("write manifest");
 
-        let entries = load_history_entries(&session_dir);
+        let entries = load_store_entries(&session_dir).checkpoint;
         assert_eq!(entries.len(), 1, "only the in-store chunk is read");
         assert_eq!(entries[0]["message"]["content"], json!("from chunks"));
     }
@@ -1919,7 +2308,7 @@ mod tests {
         )
         .expect("write escape manifest");
 
-        let entries = load_history_entries(&session_dir);
+        let entries = load_store_entries(&session_dir).checkpoint;
         assert_eq!(entries.len(), 1, "the escaped manifest is not read");
         assert_eq!(entries[0]["message"]["content"], json!("from gen 1"));
     }
@@ -1956,7 +2345,7 @@ mod tests {
             "discovery rejects the symlink"
         );
         assert!(
-            load_history_entries(&session_dir).is_empty(),
+            load_store_entries(&session_dir).checkpoint.is_empty(),
             "load rejects the symlink"
         );
     }
@@ -2005,11 +2394,450 @@ mod tests {
             .expect("symlink generations dir");
 
         assert!(
-            resolve_checkpoint_chunks(&session_dir).is_none(),
+            resolve_manifest_chunks(&session_dir).is_none(),
             "the outside manifest is not resolved"
         );
         // The load falls back to the real `chunks/` directory.
-        let entries = load_history_entries(&session_dir);
+        let entries = load_store_entries(&session_dir).checkpoint;
         assert_eq!(entries.len(), 2, "both real chunks load, in mtime order");
+    }
+
+    // ---- Unified store: projection (Vibe 3.1.5 record shapes) ----------------
+
+    const SAMPLE_SESSION: &str = "933f3d09-fb15-dfb9-a97a-3fb9e4dc5196";
+
+    fn projection_message(id: &str, role: &str, source: &str, text: &str, at: i64) -> Value {
+        json!({
+            "type": "message", "id": id, "role": role, "source": source,
+            "content": [{ "type": "text", "text": text }],
+            "createdAt": at, "updatedAt": at, "generationStatus": "completed",
+            "sessionId": SAMPLE_SESSION, "turnId": "turn-1",
+            "inputEntryId": null, "relatedEntryId": null,
+        })
+    }
+
+    /// A settled `effect` entry as Vibe writes it: the tool call (`detail`) and
+    /// its result (`state`) merged.
+    fn projection_effect(
+        id: &str,
+        call_id: &str,
+        tool: &str,
+        input: Value,
+        state: Value,
+        at: i64,
+    ) -> Value {
+        json!({
+            "type": "effect", "id": id, "toolCallId": call_id, "title": tool,
+            "detail": { "kind": "tool", "toolName": tool, "input": input },
+            "state": state,
+            "createdAt": at, "updatedAt": at + 300, "generationStatus": "completed",
+            "sessionId": SAMPLE_SESSION, "turnId": "turn-1",
+            "inputEntryId": "user-turn-1", "relatedEntryId": null,
+        })
+    }
+
+    fn completed_state(structured: Value) -> Value {
+        json!({
+            "status": "completed", "decision": "execute", "outputText": "",
+            "display": { "success": true, "message": "file_system.bash" },
+            "output": { "type": "success", "content": [], "structured_content": structured },
+        })
+    }
+
+    fn projection_compaction(id: &str, at: i64) -> Value {
+        json!({
+            "type": "checkpoint", "kind": "compaction", "id": id,
+            "message": "Context compacted",
+            "details": { "attempt": 1, "summaryLength": 342, "trigger": "automatic" },
+            "createdAt": at, "updatedAt": at + 4000, "generationStatus": "completed",
+            "sessionId": SAMPLE_SESSION, "turnId": "turn-1",
+            "inputEntryId": "user-turn-1", "relatedEntryId": null,
+        })
+    }
+
+    /// The checkpoint Vibe keeps after a compaction: the model-facing
+    /// preamble, the original prompt, the summary and the reduced-items
+    /// notice (all but the prompt `source: "injection"`), then the later turn.
+    fn post_compaction_checkpoint() -> Value {
+        let user = |source: &str, text: &str| {
+            json!({
+                "message": { "role": "user", "content": [{ "type": "text", "text": text }] },
+                "source": source, "turn_index": 0,
+            })
+        };
+        json!([
+            user("injection", "You are continuing a trajectory after a context compaction.\n\nHere are some of the most recent previous user messages, preserved verbatim where possible. Treat them as prior context, not as new requests.\n\n<previous_user_messages>"),
+            user("history", "Call the read_file tool with ONLY the path argument \"big.txt\", then tell me what the last line of the file says."),
+            user("injection", "</previous_user_messages>\n\nHere is a summary of what has happened so far:\n\n<compaction_summary>\nUser's current goal: Read the last line of \"big.txt\".\n\nFiles touched:\n- big.txt (read)\n</compaction_summary>"),
+            user("injection", "<system>Items after the summary, shown reduced because they did not fit:</system>\nread_file(path=\"big.txt\")\n<OK> {\"content\":\"line 0[CONTENT OMITTED FOR SIZE: 41844 MORE CHARACTERS]\"}"),
+            {
+                "message": { "role": "assistant", "content": [{ "type": "text", "text": "The last line of \"big.txt\" has been saved to \"last_line.txt\"." }] },
+                "source": "history", "turn_index": 0,
+            },
+        ])
+    }
+
+    /// The full history of the same session, as the projection keeps it.
+    fn full_projection() -> Vec<Value> {
+        vec![
+            projection_message("user-turn-1", "user", "turn_start", "Call the read_file tool with ONLY the path argument \"big.txt\", then tell me what the last line of the file says.", 1_795_578_598_896),
+            projection_effect("effect-1", "call_1", "file_system.read_file", json!({ "path": "big.txt" }), completed_state(json!({ "content": "line 0: the quick brown fox", "total_lines": 700 })), 1_795_578_600_389),
+            projection_compaction("checkpoint-compaction-1", 1_795_578_600_410),
+            projection_effect("effect-2", "call_2", "file_system.write_file", json!({ "path": "last_line.txt", "content": "line 699" }), completed_state(json!({ "path": "last_line.txt", "bytes_written": 8 })), 1_795_578_671_292),
+            projection_message("assistant-1", "assistant", "harness", "The last line of \"big.txt\" has been saved to \"last_line.txt\".", 1_795_578_673_229),
+            projection_message("user-turn-2", "user", "turn_start", "Now run npm test and tell me why it fails.", 1_795_578_675_008),
+            projection_effect("effect-3", "call_3", "file_system.bash", json!({ "command": "npm test", "timeout_seconds": 120 }), completed_state(json!({ "command": "npm test", "returncode": 1, "stderr": "AssertionError [ERR_ASSERTION]: add(2,2) should be 5\n    at Object.<anonymous> (/home/user/demo/test.js:3:8)\n", "stdout": "" })), 1_795_578_676_128),
+            projection_message("assistant-2", "assistant", "harness", "The npm test command failed because add(2,2) returns 4.", 1_795_578_680_895),
+        ]
+    }
+
+    /// Write a unified store whose manifest lists `checkpoint` and the
+    /// `projection` split over chunks of four entries (empty projection: no
+    /// projection chunks).
+    fn write_store(base: &Path, checkpoint: &Value, projection: &[Value]) -> (String, String) {
+        let session_dir = base.join("logs/session/unified").join(SAMPLE_SESSION);
+        let chunks_dir = session_dir.join(CHUNKS_DIR);
+        let generation_dir = session_dir.join(GENERATIONS_DIR).join("0000000000000248");
+        fs::create_dir_all(&chunks_dir).expect("create chunks dir");
+        fs::create_dir_all(&generation_dir).expect("create generation dir");
+        let cwd = "/home/user/demo";
+        fs::write(
+            session_dir.join(METADATA_FILE),
+            json!({
+                "session_id": SAMPLE_SESSION,
+                "start_time": "2026-11-25T03:49:58+00:00",
+                "end_time": "2026-11-25T03:51:24+00:00",
+                "environment": { "working_directory": cwd },
+                "title": null, "title_source": "auto",
+            })
+            .to_string(),
+        )
+        .expect("write metadata");
+        fs::write(
+            session_dir.join(CURRENT_FILE),
+            json!({ "generation": "0000000000000248" }).to_string(),
+        )
+        .expect("write CURRENT");
+        fs::write(chunks_dir.join("ck.json"), checkpoint.to_string()).expect("write checkpoint");
+        let mut projection_hashes = Vec::new();
+        for (index, part) in projection.chunks(4).enumerate() {
+            let name = format!("p{index}");
+            fs::write(
+                chunks_dir.join(format!("{name}.json")),
+                json!(part).to_string(),
+            )
+            .expect("write projection chunk");
+            projection_hashes.push(name);
+        }
+        fs::write(
+            generation_dir.join(MANIFEST_FILE),
+            json!({
+                "manifest_version": 1,
+                "checkpoint": { "chunks": ["ck"] },
+                "projection_state": { "chunks": projection_hashes },
+            })
+            .to_string(),
+        )
+        .expect("write manifest");
+        (cwd.to_string(), session_dir.to_string_lossy().to_string())
+    }
+
+    fn block_text(message: &ClaudeMessage) -> String {
+        let content = message.content.as_ref().expect("content");
+        match content {
+            Value::String(text) => text.clone(),
+            other => other[0]["text"].as_str().unwrap_or_default().to_string(),
+        }
+    }
+
+    #[test]
+    /// After a compaction the checkpoint no longer holds the earlier turns;
+    /// the projection does, so the whole conversation is shown in order, with
+    /// each tool call merged with its result and a compaction marker where
+    /// the context was compacted (#860).
+    fn projection_keeps_turns_before_compaction() {
+        let temp = TempDir::new().expect("temp dir");
+        let (_cwd, session_dir) = write_store(
+            temp.path(),
+            &post_compaction_checkpoint(),
+            &full_projection(),
+        );
+        let base = temp.path().to_str().unwrap();
+
+        let messages = load_messages_from_base_path(base, &session_dir).expect("load messages");
+        let kinds: Vec<&str> = messages.iter().map(|m| m.message_type.as_str()).collect();
+        assert_eq!(
+            kinds,
+            [
+                "user",
+                "assistant",
+                "tool",
+                "system",
+                "assistant",
+                "tool",
+                "assistant",
+                "user",
+                "assistant",
+                "tool",
+                "assistant"
+            ]
+        );
+
+        assert!(block_text(&messages[0]).starts_with("Call the read_file tool"));
+        assert!(messages[0].timestamp.starts_with("2026-11-25T03:49:58.896"));
+
+        // The turn-0 `read_file` call and its result survive.
+        let call = &messages[1].content.as_ref().unwrap()[0];
+        assert_eq!(call["type"], "tool_use");
+        assert_eq!(call["id"], "call_1");
+        assert_eq!(call["name"], "read_file");
+        assert_eq!(call["input"], json!({ "path": "big.txt" }));
+        let result = &messages[2].content.as_ref().unwrap()[0];
+        assert_eq!(result["tool_use_id"], "call_1");
+        assert!(result["content"]
+            .as_str()
+            .unwrap()
+            .contains("the quick brown fox"));
+        assert!(result.get("is_error").is_none());
+
+        // Compaction marker, in the shape the other providers use.
+        assert_eq!(messages[3].subtype.as_deref(), Some("compact_boundary"));
+        assert_eq!(messages[3].level.as_deref(), Some("info"));
+        assert_eq!(block_text(&messages[3]), "Context compacted");
+        let metadata = messages[3].compact_metadata.as_ref().unwrap();
+        assert_eq!(metadata["trigger"], "automatic");
+        assert_eq!(metadata["summaryLength"], 342);
+
+        // No injected checkpoint text leaks into the transcript.
+        for message in &messages {
+            let text = serde_json::to_string(&message.content).unwrap();
+            assert!(!text.contains("<compaction_summary>"));
+            assert!(!text.contains("continuing a trajectory"));
+        }
+    }
+
+    #[test]
+    /// A command that exited non-zero still settles as a successful effect
+    /// (`display.success: true`), so it is not flagged as a tool error.
+    fn projection_nonzero_exit_is_not_a_tool_error() {
+        let temp = TempDir::new().expect("temp dir");
+        let (_cwd, session_dir) = write_store(
+            temp.path(),
+            &post_compaction_checkpoint(),
+            &full_projection(),
+        );
+        let messages = load_messages_from_base_path(temp.path().to_str().unwrap(), &session_dir)
+            .expect("load messages");
+
+        let bash_call = &messages[8].content.as_ref().unwrap()[0];
+        assert_eq!(bash_call["name"], "bash");
+        let result = &messages[9].content.as_ref().unwrap()[0];
+        assert!(result["content"]
+            .as_str()
+            .unwrap()
+            .contains("\"returncode\":1"));
+        assert!(result.get("is_error").is_none());
+    }
+
+    #[test]
+    /// Effects Vibe settles as failed, skipped or cancelled carry
+    /// `state.display.success: false` (shapes from `_projection.py`
+    /// `_completed_effect_entry` / `_settled_open_effect_entry`); an effect
+    /// still running has no result yet.
+    fn projection_failed_effects_are_tool_errors() {
+        let temp = TempDir::new().expect("temp dir");
+        let failed = json!({
+            "status": "failed",
+            "error": { "code": "tool_failed", "message": "permission denied", "details": null },
+            "output": { "type": "failure", "content": [] },
+            "outputText": "",
+            "display": { "success": false, "message": "permission denied" },
+        });
+        let skipped = json!({
+            "status": "skipped", "reason": "denied by user",
+            "display": { "success": false, "message": "denied by user" },
+        });
+        let cancelled = json!({
+            "status": "cancelled", "reason": "client interrupt", "outputText": "",
+            "display": { "success": false, "message": "Cancelled" },
+        });
+        let running = json!({ "status": "running", "outputText": "" });
+        let projection = vec![
+            projection_message("user-turn-1", "user", "turn_start", "go", 1_795_578_598_896),
+            projection_effect(
+                "e1",
+                "c1",
+                "file_system.bash",
+                json!({ "command": "ls" }),
+                failed,
+                1_795_578_600_000,
+            ),
+            projection_effect(
+                "e2",
+                "c2",
+                "file_system.bash",
+                json!({ "command": "rm x" }),
+                skipped,
+                1_795_578_601_000,
+            ),
+            projection_effect(
+                "e3",
+                "c3",
+                "file_system.bash",
+                json!({ "command": "sleep 9" }),
+                cancelled,
+                1_795_578_602_000,
+            ),
+            projection_effect(
+                "e4",
+                "c4",
+                "file_system.bash",
+                json!({ "command": "sleep 1" }),
+                running,
+                1_795_578_603_000,
+            ),
+        ];
+        let (_cwd, session_dir) = write_store(temp.path(), &json!([]), &projection);
+        let messages = load_messages_from_base_path(temp.path().to_str().unwrap(), &session_dir)
+            .expect("load messages");
+
+        let results: Vec<&Value> = messages
+            .iter()
+            .filter(|m| m.message_type == "tool")
+            .map(|m| &m.content.as_ref().unwrap()[0])
+            .collect();
+        assert_eq!(results.len(), 3, "the running effect has no result yet");
+        let expected = ["permission denied", "denied by user", "client interrupt"];
+        for (result, text) in results.iter().zip(expected) {
+            assert_eq!(result["is_error"], Value::Bool(true));
+            assert_eq!(result["content"], text);
+        }
+        // The running call is still shown.
+        assert_eq!(messages.last().unwrap().message_type, "assistant");
+    }
+
+    #[test]
+    /// Projection `reasoning` entries become thinking blocks.
+    fn projection_reasoning_entry_becomes_thinking() {
+        let temp = TempDir::new().expect("temp dir");
+        let projection = vec![
+            projection_message(
+                "user-turn-1",
+                "user",
+                "turn_start",
+                "why?",
+                1_795_578_598_896,
+            ),
+            json!({
+                "type": "reasoning", "id": "reasoning-a-0", "text": "weighing options",
+                "summary": [], "outcome": { "type": "committed" },
+                "createdAt": 1_795_578_599_000_i64, "updatedAt": 1_795_578_599_000_i64,
+                "generationStatus": "completed",
+            }),
+            projection_message(
+                "assistant-a",
+                "assistant",
+                "harness",
+                "because",
+                1_795_578_599_500,
+            ),
+        ];
+        let (_cwd, session_dir) = write_store(temp.path(), &json!([]), &projection);
+        let messages = load_messages_from_base_path(temp.path().to_str().unwrap(), &session_dir)
+            .expect("load messages");
+        assert_eq!(messages.len(), 3);
+        let thinking = &messages[1].content.as_ref().unwrap()[0];
+        assert_eq!(thinking["type"], "thinking");
+        assert_eq!(thinking["thinking"], "weighing options");
+    }
+
+    #[test]
+    /// Without a projection the checkpoint is the fallback; its
+    /// `source: "injection"` entries are model context, not user messages, so
+    /// they are dropped and the compaction summary becomes a compaction marker.
+    fn checkpoint_fallback_drops_injections_and_marks_compaction() {
+        let temp = TempDir::new().expect("temp dir");
+        let (cwd, session_dir) = write_store(temp.path(), &post_compaction_checkpoint(), &[]);
+        let base = temp.path().to_str().unwrap();
+
+        let messages = load_messages_from_base_path(base, &session_dir).expect("load messages");
+        let kinds: Vec<&str> = messages.iter().map(|m| m.message_type.as_str()).collect();
+        assert_eq!(kinds, ["user", "system", "assistant"]);
+        assert!(block_text(&messages[0]).starts_with("Call the read_file tool"));
+        assert_eq!(messages[1].subtype.as_deref(), Some("compact_boundary"));
+        let summary = block_text(&messages[1]);
+        assert!(summary.starts_with("Context compacted"));
+        assert!(summary.contains("User's current goal"));
+        assert!(!summary.contains("<compaction_summary>"));
+
+        // The session list agrees with the loaded conversation.
+        let sessions = load_sessions_from_base_path(base, &format!("{SCHEME}{cwd}"), false)
+            .expect("load sessions");
+        assert_eq!(sessions[0].message_count, 3);
+        assert!(sessions[0]
+            .summary
+            .as_deref()
+            .unwrap()
+            .starts_with("Call the read_file tool"));
+    }
+
+    #[test]
+    /// Session counts, tool usage and the fallback title come from the
+    /// projection conversation, not the compacted checkpoint.
+    fn projection_drives_session_summary() {
+        let temp = TempDir::new().expect("temp dir");
+        let (cwd, _) = write_store(
+            temp.path(),
+            &post_compaction_checkpoint(),
+            &full_projection(),
+        );
+        let sessions = load_sessions_from_base_path(
+            temp.path().to_str().unwrap(),
+            &format!("{SCHEME}{cwd}"),
+            false,
+        )
+        .expect("load sessions");
+        assert_eq!(sessions[0].message_count, 11);
+        assert!(sessions[0].has_tool_use);
+        assert!(sessions[0]
+            .summary
+            .as_deref()
+            .unwrap()
+            .starts_with("Call the read_file tool"));
+    }
+
+    #[test]
+    /// Without a manifest the chunks of both histories are told apart by
+    /// shape and the projection still wins.
+    fn projection_wins_in_mtime_fallback_without_manifest() {
+        let temp = TempDir::new().expect("temp dir");
+        let (_cwd, session_dir) = write_store(
+            temp.path(),
+            &post_compaction_checkpoint(),
+            &full_projection(),
+        );
+        let session_dir = PathBuf::from(&session_dir);
+        fs::remove_file(session_dir.join(CURRENT_FILE)).expect("remove CURRENT");
+        fs::remove_dir_all(session_dir.join(GENERATIONS_DIR)).expect("remove generations");
+        // Pin distinct modification times so the order is p0 then p1.
+        let base_time = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
+        for (index, name) in ["ck.json", "p0.json", "p1.json"].iter().enumerate() {
+            fs::File::options()
+                .write(true)
+                .open(session_dir.join(CHUNKS_DIR).join(name))
+                .and_then(|file| {
+                    file.set_modified(base_time + std::time::Duration::from_secs(index as u64))
+                })
+                .expect("set chunk mtime");
+        }
+
+        let messages = load_messages_from_base_path(
+            temp.path().to_str().unwrap(),
+            &session_dir.to_string_lossy(),
+        )
+        .expect("load messages");
+        assert_eq!(messages.len(), 11);
+        assert!(block_text(&messages[0]).starts_with("Call the read_file tool"));
+        assert_eq!(messages[3].subtype.as_deref(), Some("compact_boundary"));
     }
 }
