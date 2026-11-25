@@ -5,8 +5,8 @@
  * 직접 수정하지 마세요.
  *
  * 생성 명령: pnpm run generate:i18n-types
- * 생성 시간: 2026-11-22T05:44:26.110Z
- * 총 키 개수: 2509
+ * 생성 시간: 2026-11-25T01:05:20.002Z
+ * 총 키 개수: 2511
  * Namespace 수: 13
  */
 
@@ -590,7 +590,7 @@ export type AnalyticsKeys =
   | 'analytics.weeklyActivity';
 
 /**
- * session namespace의 번역 키 (356개)
+ * session namespace의 번역 키 (357개)
  * 파일: locales/{lang}/session.json
  */
 export type SessionKeys =
@@ -602,6 +602,7 @@ export type SessionKeys =
   | 'project.a11y.keyboardHelp'
   | 'project.a11y.selectedState'
   | 'project.addPattern'
+  | 'project.assistantsInFolder'
   | 'project.clearUnavailable.acknowledge'
   | 'project.clearUnavailable.clearing'
   | 'project.clearUnavailable.confirm'
@@ -1656,7 +1657,7 @@ export type ErrorKeys =
   | 'error.viewDetails';
 
 /**
- * message namespace의 번역 키 (178개)
+ * message namespace의 번역 키 (179개)
  * 파일: locales/{lang}/message.json
  */
 export type MessageKeys =
@@ -1692,6 +1693,7 @@ export type MessageKeys =
   | 'message.system'
   | 'message.user'
   | 'messageContentDisplay.copyMessage'
+  | 'messageContentDisplay.injectedContext'
   | 'messageContentDisplay.showLess'
   | 'messageContentDisplay.showMore'
   | 'messageContentDisplay.showMoreRows'
@@ -3666,6 +3668,7 @@ export type TranslationKey =
   | 'message.system'
   | 'message.user'
   | 'messageContentDisplay.copyMessage'
+  | 'messageContentDisplay.injectedContext'
   | 'messageContentDisplay.showLess'
   | 'messageContentDisplay.showMore'
   | 'messageContentDisplay.showMoreRows'
@@ -3836,6 +3839,7 @@ export type TranslationKey =
   | 'project.a11y.keyboardHelp'
   | 'project.a11y.selectedState'
   | 'project.addPattern'
+  | 'project.assistantsInFolder'
   | 'project.clearUnavailable.acknowledge'
   | 'project.clearUnavailable.clearing'
   | 'project.clearUnavailable.confirm'
