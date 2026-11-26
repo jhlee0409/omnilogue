@@ -33,8 +33,13 @@
 //! Conversations in a claude.ai Project are grouped under that project; the
 //! rest go to one "Claude.ai" project per export. When a conversation records
 //! its active branch (`current_leaf_message_uuid` + parent links), only that
-//! branch is shown, as claude.ai shows it. Attachments and files appear as
-//! metadata (name, type, size); their contents are not shown. Exports record
+//! branch is shown, as claude.ai shows it. Exports from 2026 record no leaf
+//! (ModelBrain's 272-conversation export, 2026-10-30): a conversation with
+//! edited or regenerated turns then shows the branch of the latest-created
+//! child at each fork — approximate, since the user may have switched back
+//! to an older one. `injected_prompt_block` content is not shown.
+//! Attachments and files appear as metadata (name, type, size); their
+//! contents are not shown. Exports record
 //! no token usage, so the provider reports none.
 //!
 //! A parsed export is cached per path and reparsed only when the file
@@ -870,10 +875,12 @@ impl Conversation {
 }
 
 /// The messages claude.ai shows: the branch ending at the conversation's
-/// current leaf, root first. Conversations without branch data — or whose
+/// current leaf, root first. Exports that record no leaf get the one
+/// [`latest_leaf`] picks. Conversations without branch data — or whose
 /// parent links do not lead back to a root — keep the export's order.
 fn active_branch(raw: Vec<RawMessage>, leaf: Option<&str>) -> Vec<RawMessage> {
-    let Some(leaf) = leaf else {
+    let latest = leaf.is_none().then(|| latest_leaf(&raw)).flatten();
+    let Some(leaf) = leaf.or(latest.as_deref()) else {
         return raw;
     };
     let index: HashMap<&str, usize> = raw
@@ -917,6 +924,54 @@ fn active_branch(raw: Vec<RawMessage>, leaf: Option<&str>) -> Vec<RawMessage> {
         }
     }
     branch
+}
+
+/// The leaf of a conversation whose export records none: from the root, the
+/// latest-created child at each fork (ties by uuid), the heuristic export
+/// readers use since the export has no active-branch marker. It matches
+/// claude.ai unless the user switched back to an older branch. `None` when
+/// there is no fork to choose at, or when the parent links do not form a tree.
+fn latest_leaf(raw: &[RawMessage]) -> Option<String> {
+    let ids: HashSet<&str> = raw.iter().filter_map(|m| m.uuid.as_deref()).collect();
+    // Parent uuid → children; the root's parent (the sentinel) is "".
+    let mut children: HashMap<&str, Vec<&RawMessage>> = HashMap::new();
+    for message in raw {
+        message.uuid.as_deref()?;
+        let parent = message.parent.as_deref()?;
+        let parent = if is_root_sentinel(parent) {
+            ""
+        } else if ids.contains(parent) {
+            parent
+        } else {
+            return None;
+        };
+        children.entry(parent).or_default().push(message);
+    }
+    if children.values().all(|kids| kids.len() < 2) {
+        return None;
+    }
+    let latest = |kids: &[&'_ RawMessage]| -> Option<String> {
+        kids.iter()
+            .max_by_key(|m| {
+                (
+                    m.body
+                        .get("created_at")
+                        .and_then(Value::as_str)
+                        .and_then(parse_rfc3339_utc),
+                    m.uuid.clone(),
+                )
+            })
+            .and_then(|m| m.uuid.clone())
+    };
+    let mut current = latest(children.get("")?)?;
+    let mut seen = HashSet::new();
+    while seen.insert(current.clone()) {
+        match children.get(current.as_str()) {
+            Some(kids) => current = latest(kids)?,
+            None => break,
+        }
+    }
+    Some(current)
 }
 
 fn is_root_sentinel(uuid: &str) -> bool {
@@ -1022,7 +1077,9 @@ fn human_size(bytes: u64) -> String {
 /// claude.ai content blocks to viewer blocks. Text and thinking keep their
 /// text; tool calls and results keep their pairing, by `tool_use_id` or —
 /// in exports that omit ids — by the latest open call of the same tool.
-/// Other block types pass through unchanged for the fallback renderer.
+/// `injected_prompt_block` — context claude.ai adds to a turn, not words of
+/// the turn — is not shown. Other block types pass through unchanged for the
+/// fallback renderer.
 fn content_blocks(message_uuid: &str, items: Vec<Value>) -> Vec<Value> {
     let mut blocks = Vec::with_capacity(items.len());
     let mut open_calls: Vec<(String, String)> = Vec::new();
@@ -1084,6 +1141,7 @@ fn content_blocks(message_uuid: &str, items: Vec<Value>) -> Vec<Value> {
                     "is_error": is_error,
                 }));
             }
+            "injected_prompt_block" => {}
             _ => blocks.push(Value::Object(block)),
         }
     }

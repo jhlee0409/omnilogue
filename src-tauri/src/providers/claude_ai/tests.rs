@@ -518,3 +518,69 @@ async fn statistics_open_a_conversation_but_never_count_an_export() {
     assert_eq!(summary.total_sessions, 0);
     assert_eq!(summary.total_tokens, 0);
 }
+
+/// A conversation in the shape of a 2026 export: no `current_leaf_message_uuid`,
+/// messages linked by `parent_message_uuid` (the root's parent is the
+/// all-zero uuid). The first reply was regenerated, so the prompt has two
+/// replies, and the conversation went on from the newer one.
+fn regenerated_conversation() -> Value {
+    let message = |uuid: &str, parent: &str, sender: &str, at: &str, content: Value| {
+        json!({"uuid": uuid, "parent_message_uuid": parent, "sender": sender,
+               "created_at": at, "updated_at": at, "text": "", "content": content,
+               "attachments": [], "files": []})
+    };
+    let text = |t: &str| json!([{"type": "text", "text": t}]);
+    json!({
+        "uuid": "0b6a2f4e-1c3d-4e5f-8a9b-0000000000aa",
+        "name": "Regenerated",
+        "summary": "",
+        "created_at": "2026-10-01T10:00:00Z",
+        "updated_at": "2026-10-01T10:05:00Z",
+        "account": {"uuid": "acc"},
+        "chat_messages": [
+            message("m1", "00000000-0000-4000-8000-000000000000", "human", "2026-10-01T10:00:00Z",
+                json!([
+                    {"type": "injected_prompt_block", "text": "context claude.ai added"},
+                    {"type": "text", "text": "first prompt"}
+                ])),
+            message("m2-old", "m1", "assistant", "2026-10-01T10:00:10Z", text("old reply")),
+            message("m2-new", "m1", "assistant", "2026-10-01T10:01:00Z", text("new reply")),
+            message("m3", "m2-new", "human", "2026-10-01T10:02:00Z", text("follow-up")),
+            message("m4", "m3", "assistant", "2026-10-01T10:02:10Z", text("answer")),
+        ],
+    })
+}
+
+fn shown_texts(conversation: &Conversation) -> Vec<&str> {
+    conversation
+        .messages
+        .iter()
+        .flat_map(|m| m.blocks.iter())
+        .map(|b| b["text"].as_str().unwrap_or("<non-text block>"))
+        .collect()
+}
+
+#[test]
+fn without_a_recorded_leaf_the_latest_branch_is_shown() {
+    let Ok(conversation) = Conversation::from_value(regenerated_conversation()) else {
+        panic!("conversation rejected");
+    };
+    assert_eq!(
+        shown_texts(&conversation),
+        vec!["first prompt", "new reply", "follow-up", "answer"],
+        "one branch, the regenerated reply's; the injected block is not shown"
+    );
+}
+
+#[test]
+fn a_recorded_leaf_still_wins_over_the_latest_branch() {
+    let mut value = regenerated_conversation();
+    value["current_leaf_message_uuid"] = json!("m2-old");
+    let Ok(conversation) = Conversation::from_value(value) else {
+        panic!("conversation rejected");
+    };
+    assert_eq!(
+        shown_texts(&conversation),
+        vec!["first prompt", "old reply"]
+    );
+}
