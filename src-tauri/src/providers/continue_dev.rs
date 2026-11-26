@@ -565,7 +565,19 @@ fn assistant_blocks(
         Some(Value::String(text)) if !text.trim().is_empty() => {
             blocks.push(serde_json::json!({"type": "text", "text": text}));
         }
-        Some(Value::Array(parts)) => blocks.extend(parts.iter().cloned()),
+        // Blank text parts are nothing to show; other parts are kept.
+        Some(Value::Array(parts)) => blocks.extend(
+            parts
+                .iter()
+                .filter(|part| {
+                    part.get("type").and_then(Value::as_str) != Some("text")
+                        || part
+                            .get("text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| !text.trim().is_empty())
+                })
+                .cloned(),
+        ),
         _ => {}
     }
 
@@ -602,21 +614,27 @@ fn assistant_blocks(
             "name": call_name(call),
             "input": input,
         }));
-        if let Some(output) = state.get("output").and_then(Value::as_array) {
+        let status = state.get("status").and_then(Value::as_str);
+        let failed = matches!(status, Some("errored" | "canceled"));
+        let output = state.get("output").and_then(Value::as_array);
+        // A failed call shows that it failed even when it recorded no output.
+        if output.is_some() || failed {
             let text = output
-                .iter()
+                .into_iter()
+                .flatten()
                 .filter_map(|ctx| ctx.get("content").and_then(Value::as_str))
                 .collect::<Vec<_>>()
                 .join("\n");
+            let text = match (text.is_empty(), status) {
+                (true, Some(status)) if failed => format!("The tool call {status}."),
+                _ => text,
+            };
             let mut result = serde_json::json!({
                 "type": "tool_result",
                 "tool_use_id": id,
                 "content": text,
             });
-            if matches!(
-                state.get("status").and_then(Value::as_str),
-                Some("errored" | "canceled")
-            ) {
+            if failed {
                 result["is_error"] = Value::Bool(true);
             }
             blocks.push(result);
@@ -1073,5 +1091,25 @@ mod tests {
         assert_eq!(content[4][2]["is_error"], true);
         assert_eq!(doc.messages.len(), 5);
         assert_eq!(doc.title, None, "\"New Session\" is a placeholder");
+    }
+
+    #[test]
+    fn blank_parts_are_not_a_reply_and_a_call_canceled_without_output_failed() {
+        let data = serde_json::json!({"sessionId": "s", "history": [
+            {"message": {"role": "user", "content": "go"}},
+            {"message": {"role": "assistant", "content": [{"type": "text", "text": " "}]}},
+            {"message": {"role": "assistant", "content": ""},
+             "toolCallStates": [{"toolCallId": "c1",
+                "toolCall": {"id": "c1", "function": {"name": "Bash", "arguments": "{}"}},
+                "status": "canceled", "parsedArgs": {"command": "ls"}}]}
+        ]})
+        .to_string();
+        let doc = parse_session_doc(&data, "continue", "s", "").unwrap();
+        assert_eq!(doc.messages.len(), 2, "the blank reply is not shown");
+        let call = doc.messages[1].content.clone().unwrap();
+        assert_eq!(call[1]["type"], "tool_result");
+        assert_eq!(call[1]["is_error"], true);
+        assert_eq!(call[1]["content"], "The tool call canceled.");
+        assert!(doc.has_errors);
     }
 }
