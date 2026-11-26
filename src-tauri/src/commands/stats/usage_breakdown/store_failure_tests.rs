@@ -519,12 +519,14 @@ const DEVELOP_ANSWERS: &[(Fixture, &[&str])] = &[
     (
         copilot_vscode,
         &[
-            "1 1 1 1 1 1 E", // readable
+            // The last command reads a legacy `.json` session as Copilot
+            // (#854); it fell through to Claude before.
+            "1 1 1 1 1 1 2", // readable
             "0 0 0 0 0 0 E", // absent
             "0 0 0 0 0 0 E", // User
             "0 0 0 0 0 0 E", // workspaceStorage
             "0 0 0 0 0 0 E", // abc123
-            "0 1 1 1 1 0 E", // workspace.json
+            "0 1 1 1 1 0 2", // workspace.json
             "0 0 0 0 0 0 E", // chatSessions
             "0 0 0 0 0 0 E", // vs-1.json
         ],

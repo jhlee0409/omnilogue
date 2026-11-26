@@ -168,6 +168,7 @@ fn is_wsl_chat_storage_path(path: &Path) -> bool {
         return false;
     }
     let path = path.to_string_lossy().replace('/', "\\");
+    let empty_window = format!(r"globalStorage\{EMPTY_WINDOW_DIR}");
     [
         r"\.vscode-server\data\User\",
         r"\.vscode-server-insiders\data\User\",
@@ -175,12 +176,12 @@ fn is_wsl_chat_storage_path(path: &Path) -> bool {
     ]
     .iter()
     .any(|user_data| {
-        [
-            r"workspaceStorage\",
-            r"globalStorage\emptyWindowChatSessions",
-        ]
-        .iter()
-        .any(|dir| path.contains(&format!("{user_data}{dir}")))
+        let empty_window = format!("{user_data}{empty_window}");
+        path.contains(&format!(r"{user_data}workspaceStorage\"))
+            // The directory itself or something in it, not a sibling
+            // such as `emptyWindowChatSessions-copy`.
+            || path.ends_with(&empty_window)
+            || path.contains(&format!(r"{empty_window}\"))
     })
 }
 
@@ -443,8 +444,9 @@ fn scan_empty_window(
     custom_directory_label: Option<&str>,
     report: &ScanReport,
 ) -> Result<Option<ClaudeProject>, String> {
+    let global_storage = user_data.join("globalStorage");
     let dir = empty_window_dir(user_data);
-    if is_symlink(&dir) || !report.is_dir(&dir) {
+    if is_symlink(&global_storage) || is_symlink(&dir) || !report.is_dir(&dir) {
         return Ok(None);
     }
     let folder = dir.to_string_lossy().into_owned();
@@ -1129,13 +1131,18 @@ fn tool_input(part: &Value) -> Value {
         _ => {}
     }
     if input.is_empty() {
-        if let Some(Value::Object(raw)) = part
+        // JSON for most tools; `inputLanguage` may name another language
+        // (a shell command), kept as text.
+        if let Some(text) = part
             .get("resultDetails")
             .and_then(|d| d.get("input"))
             .and_then(Value::as_str)
-            .and_then(|text| serde_json::from_str(text).ok())
+            .filter(|text| !text.is_empty())
         {
-            return Value::Object(raw);
+            return match serde_json::from_str(text) {
+                Ok(Value::Object(raw)) => Value::Object(raw),
+                _ => serde_json::json!({ "input": text }),
+            };
         }
     }
     if input.is_empty() {
@@ -1160,7 +1167,12 @@ fn tool_result(part: &Value) -> Option<ToolResult> {
     let details = part.get("resultDetails");
     let error = part.get("resultError");
     let error_text = error.and_then(Value::as_str).filter(|e| !e.is_empty());
-    let mut is_error = error_text.is_some() || error.and_then(Value::as_bool) == Some(true);
+    let mut is_error = error_text.is_some()
+        || error.and_then(Value::as_bool) == Some(true)
+        || details
+            .and_then(|d| d.get("isError"))
+            .and_then(Value::as_bool)
+            == Some(true);
 
     let mut text = match (kind, data) {
         (Some("terminal"), Some(data)) => {
@@ -1189,7 +1201,6 @@ fn tool_result(part: &Value) -> Option<ToolResult> {
         text = match details {
             // IToolResultInputOutputDetails (MCP and extension tools).
             Some(Value::Object(d)) if d.get("output").is_some_and(Value::is_array) => {
-                is_error |= d.get("isError").and_then(Value::as_bool) == Some(true);
                 let parts: Vec<String> = d["output"]
                     .as_array()
                     .into_iter()
@@ -1212,9 +1223,11 @@ fn tool_result(part: &Value) -> Option<ToolResult> {
         .filter(|text| !text.is_empty());
     }
 
+    // A failure with nothing to show still reports that it failed.
     let text = text
         .or_else(|| error_text.map(String::from))
-        .or_else(|| markdown_text(part.get("pastTenseMessage")).map(String::from))?;
+        .or_else(|| markdown_text(part.get("pastTenseMessage")).map(String::from))
+        .or_else(|| is_error.then(|| "The tool call failed.".to_string()))?;
     Some(ToolResult { text, is_error })
 }
 
@@ -1341,6 +1354,10 @@ fn probe_session_metadata(session_path: &Path, report: &ScanReport) -> Option<Se
                 }
             }
             if let Some(response) = req.get("response").and_then(Value::as_array) {
+                let is_tool = |part: &Value| {
+                    part.get("kind").and_then(Value::as_str) == Some("toolInvocationSerialized")
+                };
+                has_tool_use |= response.iter().any(is_tool);
                 let any_visible = response.iter().any(|part| {
                     let kind = part.get("kind").and_then(Value::as_str);
                     match kind {
@@ -1350,10 +1367,7 @@ fn probe_session_metadata(session_path: &Path, report: &ScanReport) -> Option<Se
                             .map(|s| !s.is_empty())
                             .unwrap_or(false),
                         Some("thinking") => !thinking_text(part).is_empty(),
-                        Some("toolInvocationSerialized") => {
-                            has_tool_use = true;
-                            true
-                        }
+                        Some("toolInvocationSerialized") => true,
                         Some("progressTaskSerialized") => part
                             .get("content")
                             .and_then(|c| c.get("value"))
@@ -2187,5 +2201,43 @@ mod tests {
         assert!(hits
             .iter()
             .all(|h| h.project_path.as_ref() == Some(&merged[0].path)));
+    }
+
+    #[test]
+    fn failures_and_text_inputs_survive_every_result_shape() {
+        let part = |extra: Value| {
+            let mut p = json!({"kind": "toolInvocationSerialized", "toolId": "t",
+                "toolCallId": "c", "isComplete": true});
+            p.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            p
+        };
+        // A failure with no output, error text or past-tense sentence.
+        let bare = tool_result(&part(json!({"resultError": true}))).unwrap();
+        assert!(bare.is_error);
+        // `isError` is read even when another field supplies the text.
+        let simple = tool_result(&part(json!({
+            "toolSpecificData": {"kind": "simpleToolInvocation", "input": "x", "output": "boom"},
+            "resultDetails": {"input": "x", "output": [], "isError": true}
+        })))
+        .unwrap();
+        assert_eq!(simple.text, "boom");
+        assert!(simple.is_error);
+        // A non-JSON input (`inputLanguage: shellscript`) is kept as text.
+        assert_eq!(
+            tool_input(&part(json!({"resultDetails":
+                {"input": "echo hi", "inputLanguage": "shellscript", "output": []}}))),
+            json!({"input": "echo hi"})
+        );
+    }
+
+    #[test]
+    fn wsl_empty_window_store_is_matched_as_a_whole_directory() {
+        let base = r"\\wsl.localhost\Ubuntu\home\me\.vscode-server\data\User\globalStorage";
+        let ok = |p: &str| is_wsl_chat_storage_path(Path::new(&format!(r"{base}\{p}")));
+        assert!(ok("emptyWindowChatSessions"));
+        assert!(ok(r"emptyWindowChatSessions\s.jsonl"));
+        assert!(!ok(r"emptyWindowChatSessions-copy\chatSessions\s.jsonl"));
     }
 }

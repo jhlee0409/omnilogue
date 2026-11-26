@@ -639,10 +639,11 @@ fn detect_session_provider(session_path: &str) -> StatsProvider {
     {
         return StatsProvider::Copilot;
     }
+    // Both formats VS Code writes: `.jsonl` patch logs and legacy `.json`.
     if providers::copilot::is_vscode_session_path(session_path)
-        && PathBuf::from(session_path)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+        && PathBuf::from(session_path).extension().is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("jsonl") || ext.eq_ignore_ascii_case("json")
+        })
     {
         return StatsProvider::Copilot;
     }
