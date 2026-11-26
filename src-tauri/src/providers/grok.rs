@@ -773,16 +773,17 @@ fn normalize_content_block(item: &Value) -> Value {
     item.clone()
 }
 
+/// Whether a message has nothing to show: no items, or only blank text.
+/// A block of another kind (an image) is content.
 fn content_is_empty(content: &Value) -> bool {
     match content {
-        Value::Array(items) => {
-            items.is_empty()
-                || items.iter().all(|item| {
-                    item.get("text")
-                        .and_then(Value::as_str)
-                        .is_none_or(|text| text.trim().is_empty())
-                })
-        }
+        Value::Array(items) => items.iter().all(|item| {
+            item.get("type").and_then(Value::as_str) == Some("text")
+                && item
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .is_none_or(|text| text.trim().is_empty())
+        }),
         Value::String(text) => text.trim().is_empty(),
         Value::Null => true,
         _ => false,
@@ -1331,5 +1332,13 @@ mod tests {
             .and_then(|item| item.get("name"))
             .and_then(Value::as_str);
         assert_eq!(name, Some("web_search"));
+    }
+
+    #[test]
+    fn an_image_only_prompt_is_content_and_blank_text_is_not() {
+        let image = json!([{"type": "image", "source": {"type": "base64", "data": "AA=="}}]);
+        assert!(!content_is_empty(&image));
+        assert!(content_is_empty(&json!([{"type": "text", "text": "  "}])));
+        assert!(content_is_empty(&json!([])));
     }
 }
