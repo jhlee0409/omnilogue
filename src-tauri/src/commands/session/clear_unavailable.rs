@@ -353,8 +353,12 @@ impl Project {
                 {
                     return Err(NOT_IN_PROJECT.to_string());
                 }
-                Ok(std::iter::once(targets.session_dir)
-                    .chain(targets.legacy_file)
+                // The other layout first: if the primary then fails, the
+                // same transcript path still resolves on a retry.
+                Ok(targets
+                    .other_layout
+                    .into_iter()
+                    .chain(std::iter::once(targets.session_dir))
                     .chain(targets.metadata_dirs)
                     .collect())
             }
