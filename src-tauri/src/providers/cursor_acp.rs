@@ -6,7 +6,9 @@
 //! Agent CLI mirrors under `~/.cursor/projects` (`cursor-agent`):
 //!
 //! ```text
-//! ~/.cursor/acp-sessions/<session-id>/     (%USERPROFILE%\.cursor\... on Windows)
+//! ~/.cursor/acp-sessions/<session-id>/     (%USERPROFILE%\.cursor\... on Windows;
+//!                                          the CLI's config root, moved by
+//!                                          CURSOR_CONFIG_DIR / XDG_CONFIG_HOME)
 //! ├── meta.json   {"schemaVersion":1,"cwd":"<workspace>","title":"<title>"}
 //! └── store.db    SQLite (WAL): meta(key, value), blobs(id, data)
 //! ```
@@ -24,9 +26,10 @@
 //!
 //! - `meta` row `'0'` holds hex-encoded JSON with `latestRootBlobId`,
 //!   `name` and `createdAt` (ms). An empty root id means no conversation yet.
-//! - `blobs` is content-addressed: `id` is the lowercase hex SHA-256 of
-//!   `data`. A blob carries no type tag; its type follows from the field that
-//!   references it.
+//! - `blobs` maps a 32-byte id (lowercase hex) to `data`. The CLI names a
+//!   root blob by the SHA-256 of its bytes; other ids come from the server, so
+//!   ids are looked up, never recomputed. A blob carries no type tag; its type
+//!   follows from the field that references it.
 //! - The root blob is a protobuf `ConversationStateStructure`: field 1 lists
 //!   the prompt-message blob ids in conversation order (the model context:
 //!   system, user, assistant, tool), field 8 the UI turn blobs, field 13
@@ -88,9 +91,11 @@ pub(crate) const UNDECODED_SUBTYPE: &str = "undecoded_records";
 // Root and session discovery
 // ============================================================================
 
-/// `~/.cursor/acp-sessions` (`%USERPROFILE%\.cursor\acp-sessions`).
+/// `<config root>/acp-sessions`: `~/.cursor/acp-sessions`
+/// (`%USERPROFILE%\.cursor\...` on Windows) unless `CURSOR_CONFIG_DIR` or
+/// `XDG_CONFIG_HOME` moves the CLI's config root.
 fn sessions_root() -> Option<PathBuf> {
-    Some(crate::utils::home_dir()?.join(".cursor").join(SESSIONS_DIR))
+    Some(crate::providers::cursor_agent::config_root()?.join(SESSIONS_DIR))
 }
 
 /// A real (non-symlink) directory.

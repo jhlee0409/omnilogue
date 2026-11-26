@@ -353,7 +353,12 @@ impl Project {
                 {
                     return Err(NOT_IN_PROJECT.to_string());
                 }
-                Ok(std::iter::once(targets.session_dir)
+                // The other layout first: if the primary then fails, the
+                // same transcript path still resolves on a retry.
+                Ok(targets
+                    .other_layout
+                    .into_iter()
+                    .chain(std::iter::once(targets.session_dir))
                     .chain(targets.metadata_dirs)
                     .collect())
             }
@@ -382,9 +387,12 @@ impl Project {
 
         trash_only(first)?;
         for path in rest {
+            // `first` may be a Cursor Agent session's other copy, not the
+            // session itself, so name what was and was not moved.
             trash_only(path).map_err(|e| {
                 format!(
-                    "The session was moved to the trash, but {} was not: {e}",
+                    "{} was moved to the trash, but {} was not: {e}",
+                    first.display(),
                     path.display()
                 )
             })?;
