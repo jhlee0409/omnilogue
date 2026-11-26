@@ -115,6 +115,7 @@ fn scan_projects_from_path_reporting(
         let actual_path = infos
             .iter()
             .find_map(|info| info.cwd.clone())
+            .or_else(|| group_cwd(&project_dir))
             .unwrap_or_else(|| decode_cwd_dirname(&encoded_name));
         let name = project_name_from_actual_path(&actual_path, &encoded_name);
         let message_count = infos.iter().map(|info| info.message_count).sum();
@@ -224,8 +225,9 @@ fn load_sessions_from_base_path_reporting(
         };
         let project_name = info
             .cwd
-            .as_deref()
-            .map(|cwd| project_name_from_actual_path(cwd, &fallback_project_name))
+            .clone()
+            .or_else(|| group_cwd(&project_dir))
+            .map(|cwd| project_name_from_actual_path(&cwd, &fallback_project_name))
             .unwrap_or_else(|| {
                 project_name_from_actual_path(
                     &decode_cwd_dirname(&fallback_project_name),
@@ -320,8 +322,94 @@ pub fn load_messages_from_base_path(
     }
 
     attach_session_token_usage(&session_dir, &mut messages);
+    mark_failed_tool_results(&session_dir, &mut messages);
 
     Ok(messages)
+}
+
+/// A user record that is the user's prompt, as content blocks: the text
+/// inside its `<user_query>` wrapper. Grok also writes context it injects
+/// as user records: `synthetic_reason` (`system_reminder`,
+/// `task_completed`, …), or a record with neither a `prompt_index` nor a
+/// `<user_query>`; those are not prompts.
+fn user_prompt(value: &Value) -> Option<Value> {
+    if value.get("synthetic_reason").is_some_and(|r| !r.is_null()) {
+        return None;
+    }
+    let blocks = content_to_blocks(value.get("content"));
+    let mut wrapped = false;
+    let blocks: Vec<Value> = blocks
+        .as_array()?
+        .iter()
+        .map(|block| {
+            let Some(text) = block.get("text").and_then(Value::as_str) else {
+                return block.clone();
+            };
+            let Some(inner) = text
+                .split_once("<user_query>")
+                .and_then(|(_, rest)| rest.split_once("</user_query>"))
+                .map(|(inner, _)| inner.trim())
+            else {
+                return block.clone();
+            };
+            wrapped = true;
+            json!({"type": "text", "text": inner})
+        })
+        .collect();
+    if !wrapped && value.get("prompt_index").is_none() {
+        return None;
+    }
+    let content = Value::Array(blocks);
+    (!content_is_empty(&content)).then_some(content)
+}
+
+/// Tool calls that failed, by id. `chat_history.jsonl` records only the
+/// output; the outcome is in `updates.jsonl` (`tool_call_update.status`
+/// `failed`) and `events.jsonl` (`tool_completed.outcome` `error`, which
+/// also covers a command that exited non-zero).
+fn failed_tool_calls(session_dir: &Path) -> std::collections::HashSet<String> {
+    let mut failed = std::collections::HashSet::new();
+    for update in read_jsonl_values(&session_dir.join("updates.jsonl")).unwrap_or_default() {
+        let update = update.pointer("/params/update").unwrap_or(&Value::Null);
+        if update.get("sessionUpdate").and_then(Value::as_str) == Some("tool_call_update")
+            && update.get("status").and_then(Value::as_str) == Some("failed")
+        {
+            if let Some(id) = update.get("toolCallId").and_then(Value::as_str) {
+                failed.insert(id.to_string());
+            }
+        }
+    }
+    for event in read_jsonl_values(&session_dir.join("events.jsonl")).unwrap_or_default() {
+        if event.get("type").and_then(Value::as_str) == Some("tool_completed")
+            && event.get("outcome").and_then(Value::as_str) == Some("error")
+        {
+            if let Some(id) = event.get("tool_call_id").and_then(Value::as_str) {
+                failed.insert(id.to_string());
+            }
+        }
+    }
+    failed
+}
+
+fn mark_failed_tool_results(session_dir: &Path, messages: &mut [ClaudeMessage]) {
+    let failed = failed_tool_calls(session_dir);
+    if failed.is_empty() {
+        return;
+    }
+    for block in messages
+        .iter_mut()
+        .filter_map(|m| m.content.as_mut()?.as_array_mut())
+        .flatten()
+    {
+        let is_failed = block.get("type").and_then(Value::as_str) == Some("tool_result")
+            && block
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| failed.contains(id));
+        if is_failed {
+            block["is_error"] = Value::Bool(true);
+        }
+    }
 }
 
 pub fn search(query: &str, limit: usize) -> Result<Vec<ClaudeMessage>, String> {
@@ -448,37 +536,21 @@ fn extract_session_info(session_dir: &Path, report: &ScanReport) -> Option<Sessi
         .unwrap_or(created_at.as_str())
         .to_string();
 
-    let mut message_count = summary
-        .get("num_chat_messages")
-        .or_else(|| summary.get("num_messages"))
-        .and_then(Value::as_u64)
-        .map(|n| n as usize)
-        .unwrap_or(0);
+    // The messages the session shows (`num_chat_messages` counts the
+    // injected context records too).
+    let values = read_jsonl_values(&chat_path).unwrap_or_default();
+    let mut counter = 0u64;
+    let message_count = values
+        .iter()
+        .filter(|value| convert_chat_message(value, "", "", None, &mut counter).is_some())
+        .count();
 
     let signals = read_json_file(&session_dir.join("signals.json")).unwrap_or(Value::Null);
-    let mut has_tool_use = signals
+    let has_tool_use = signals
         .get("toolCallCount")
         .and_then(Value::as_u64)
-        .is_some_and(|n| n > 0);
-
-    if message_count == 0 {
-        if let Ok(values) = read_jsonl_values(&chat_path) {
-            message_count = values
-                .iter()
-                .filter(|value| {
-                    matches!(
-                        value.get("type").and_then(Value::as_str),
-                        Some("user" | "assistant" | "tool_result" | "reasoning" | "system")
-                    )
-                })
-                .count();
-            if !has_tool_use {
-                has_tool_use = values.iter().any(value_has_tool_use);
-            }
-        }
-    } else if !has_tool_use {
-        has_tool_use = chat_history_has_tool_use(&chat_path);
-    }
+        .is_some_and(|n| n > 0)
+        || values.iter().any(value_has_tool_use);
 
     if message_count == 0 {
         return None;
@@ -534,16 +606,19 @@ fn convert_chat_message(
                 None,
             ))
         }
-        "user" => Some(build_provider_message(
-            PROVIDER_ID,
-            uuid,
-            session_id,
-            timestamp.to_string(),
-            "user",
-            Some("user"),
-            Some(content_to_blocks(value.get("content"))),
-            None,
-        )),
+        "user" => {
+            let content = user_prompt(value)?;
+            Some(build_provider_message(
+                PROVIDER_ID,
+                uuid,
+                session_id,
+                timestamp.to_string(),
+                "user",
+                Some("user"),
+                Some(content),
+                None,
+            ))
+        }
         "assistant" => {
             let mut blocks = content_to_blocks(value.get("content"));
             if let Some(calls) = value.get("tool_calls").and_then(Value::as_array) {
@@ -719,6 +794,20 @@ fn decode_cwd_dirname(encoded: &str) -> String {
         .unwrap_or_else(|_| encoded.to_string())
 }
 
+/// A project directory whose cwd is too long to encode is named by a slug
+/// and hash, with the cwd in a `.cwd` file beside its sessions
+/// (`docs/user-guide/17-sessions.md`).
+fn group_cwd(project_dir: &Path) -> Option<String> {
+    let marker = project_dir.join(".cwd");
+    if is_symlink(&marker) {
+        return None;
+    }
+    fs::read_to_string(marker)
+        .ok()
+        .map(|cwd| cwd.trim().to_string())
+        .filter(|cwd| !cwd.is_empty())
+}
+
 fn attach_session_token_usage(session_dir: &Path, messages: &mut [ClaudeMessage]) {
     if messages.is_empty() {
         return;
@@ -794,28 +883,6 @@ fn value_has_tool_use(value: &Value) -> bool {
         .get("tool_calls")
         .and_then(Value::as_array)
         .is_some_and(|calls| !calls.is_empty())
-}
-
-fn chat_history_has_tool_use(path: &Path) -> bool {
-    use std::io::{BufRead, BufReader};
-
-    if is_symlink(path) || !path.is_file() {
-        return false;
-    }
-    let Ok(file) = fs::File::open(path) else {
-        return false;
-    };
-    for line in BufReader::new(file).lines().map_while(Result::ok) {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<Value>(&line) {
-            if value_has_tool_use(&value) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 fn file_modified_iso(path: &Path) -> Option<String> {
@@ -935,7 +1002,7 @@ mod tests {
 
         let lines = [
             r#"{"type":"system","content":"You are Grok."}"#,
-            r#"{"type":"user","content":[{"type":"text","text":"Hello grok"}]}"#,
+            r#"{"type":"user","prompt_index":0,"content":[{"type":"text","text":"<user_query>\nHello grok\n</user_query>"}]}"#,
             r#"{"type":"reasoning","id":"rs_1","summary":[{"type":"summary_text","text":"Thinking about hello"}]}"#,
             r#"{"type":"assistant","content":"Hi there","tool_calls":[{"id":"call-1","name":"read_file","arguments":"{\"target_file\":\"/tmp/a.txt\"}"}],"model_id":"grok-4.5"}"#,
             r#"{"type":"tool_result","tool_call_id":"call-1","content":"file contents"}"#,
@@ -1073,7 +1140,7 @@ mod tests {
             fs::write(session_dir.join(SUMMARY_FILE), summary.to_string()).unwrap();
             fs::write(
                 session_dir.join(CHAT_HISTORY_FILE),
-                r#"{"type":"user","content":[{"type":"text","text":"shared needle"}]}"#,
+                r#"{"type":"user","prompt_index":0,"content":[{"type":"text","text":"<user_query>shared needle</user_query>"}]}"#,
             )
             .unwrap();
         }
@@ -1098,6 +1165,103 @@ mod tests {
                 .expect("hit session belongs to a scanned project");
             assert_eq!(hit.project_path.as_deref(), Some(project.path.as_str()));
         }
+    }
+
+    /// Records in the shapes Grok 1.0.34 writes (the `SpecStory` capture of
+    /// `grok 1.0.34 (3736acbc8658)`): injected context as user records, the
+    /// prompt in `<user_query>`, and outcomes only in the sidecars.
+    #[test]
+    #[serial]
+    fn injected_user_records_are_not_prompts_and_failed_calls_are_marked() {
+        let _home = crate::test_utils::SandboxHome::new();
+        let temp = TempDir::new().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let session_dir = base.join(SESSIONS_DIR).join("%2Fw").join("s1");
+        fs::create_dir_all(&session_dir).unwrap();
+        fs::write(
+            session_dir.join(SUMMARY_FILE),
+            json!({"info": {"id": "s1", "cwd": "/w"}, "num_chat_messages": 9}).to_string(),
+        )
+        .unwrap();
+        let reminder = |extra: Value| {
+            let mut record = json!({"type": "user", "content": [
+                {"type": "text", "text": "<system-reminder>context</system-reminder>"}]});
+            record
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            record.to_string()
+        };
+        let lines = [
+            json!({"type": "system", "content": "rules"}).to_string(),
+            reminder(json!({})),
+            reminder(json!({"synthetic_reason": "system_reminder"})),
+            json!({"type": "user", "prompt_index": 0, "content": [
+                {"type": "text", "text": "<user_query>\nList the files\n</user_query>"}]})
+            .to_string(),
+            json!({"type": "assistant", "content": "Listing.", "tool_calls": [
+                {"id": "c-ok", "name": "list_dir", "arguments": "{}"},
+                {"id": "c-cmd", "name": "run_terminal_command", "arguments": "{\"command\":\"ls nope\"}"},
+                {"id": "c-read", "name": "read_file", "arguments": "{\"target_file\":\"x\"}"}]})
+            .to_string(),
+            json!({"type": "tool_result", "tool_call_id": "c-ok", "content": "a.txt"}).to_string(),
+            json!({"type": "tool_result", "tool_call_id": "c-cmd", "content": "exit: 1\nls: nope"})
+                .to_string(),
+            json!({"type": "tool_result", "tool_call_id": "c-read", "content": "Error: x does not exist"})
+                .to_string(),
+            reminder(json!({"prompt_index": 1, "synthetic_reason": "task_completed"})),
+        ];
+        fs::write(session_dir.join(CHAT_HISTORY_FILE), lines.join("\n")).unwrap();
+        let update = |id: &str, status: &str| {
+            json!({"timestamp": 1, "method": "session/update", "params": {"update": {
+                "sessionUpdate": "tool_call_update", "toolCallId": id, "status": status}}})
+            .to_string()
+        };
+        fs::write(
+            session_dir.join("updates.jsonl"),
+            [
+                update("c-ok", "completed"),
+                update("c-cmd", "completed"),
+                update("c-read", "failed"),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        fs::write(
+            session_dir.join("events.jsonl"),
+            json!({"type": "tool_completed", "tool_call_id": "c-cmd", "tool_name": "run_terminal_command",
+                "outcome": "error"})
+            .to_string(),
+        )
+        .unwrap();
+
+        let base = base.to_string_lossy().to_string();
+        let messages = load_messages_from_base_path(&base, &session_dir.to_string_lossy()).unwrap();
+        let prompts: Vec<&Value> = messages
+            .iter()
+            .filter(|m| m.message_type == "user")
+            .filter_map(|m| m.content.as_ref()?.as_array()?.first())
+            .filter(|b| b["type"] == "text")
+            .collect();
+        assert_eq!(prompts.len(), 1, "only the typed prompt");
+        assert_eq!(prompts[0]["text"], "List the files");
+
+        let result = |id: &str| {
+            messages
+                .iter()
+                .filter_map(|m| m.content.as_ref()?.as_array())
+                .flatten()
+                .find(|b| b["tool_use_id"] == id)
+                .unwrap()
+                .clone()
+        };
+        assert!(result("c-ok").get("is_error").is_none());
+        assert_eq!(result("c-cmd")["is_error"], true, "events.jsonl outcome");
+        assert_eq!(result("c-read")["is_error"], true, "updates.jsonl status");
+
+        let projects = scan_projects_from_path(&base).unwrap();
+        let sessions = load_sessions_from_base_path(&base, &projects[0].path, false).unwrap();
+        assert_eq!(sessions[0].message_count, messages.len());
     }
 
     #[test]
