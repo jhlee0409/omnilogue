@@ -1346,11 +1346,23 @@ mod tests {
         )
         .unwrap();
 
-        let ids: Vec<String> = load_task_history(&ext_dir, &ScanReport::default())
-            .iter()
-            .map(|item| item["id"].as_str().unwrap().to_string())
-            .collect();
-        assert_eq!(ids, ["kept"]);
+        let ids = || -> Vec<String> {
+            load_task_history(&ext_dir, &ScanReport::default())
+                .iter()
+                .map(|item| item["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(ids(), ["kept"]);
+
+        // A symlinked `storage` makes the Kilo scan list nothing, so the
+        // legacy entry must stay visible.
+        #[cfg(unix)]
+        {
+            let elsewhere = home.path().join("elsewhere");
+            fs::create_dir_all(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, kilo.join("storage")).unwrap();
+            assert_eq!(ids(), ["copied", "kept"]);
+        }
     }
 
     /// Kilo's legacy CLI: `~/.kilocode/cli/global/tasks/<id>/` with the task

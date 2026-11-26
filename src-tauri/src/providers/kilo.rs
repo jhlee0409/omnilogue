@@ -103,13 +103,20 @@ pub fn detect() -> Option<ProviderInfo> {
 /// (`legacy-migration/sessions/lib/session.ts`: `id = ses_migrated_<hash>`,
 /// `slug = <task id>`). Empty when there is no database or no such session.
 pub(crate) fn migrated_task_ids() -> HashSet<String> {
-    // The same policy the reader applies (a symlinked database is refused),
-    // so a task is never hidden from the Cline reader while this one cannot
-    // show its copy.
+    // The same policies the reader applies (a symlinked database is
+    // refused, and a symlinked `storage` beside it makes the scan list
+    // nothing), so a task is never hidden from the Cline reader while this
+    // one cannot show its copy.
     let regular = |db: &PathBuf| {
         std::fs::symlink_metadata(db).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
     };
-    let Some(db) = db_location().filter(regular) else {
+    let storage_ok = |db: &PathBuf| {
+        db.parent().is_some_and(|dir| {
+            !std::fs::symlink_metadata(dir.join("storage"))
+                .is_ok_and(|m| m.file_type().is_symlink())
+        })
+    };
+    let Some(db) = db_location().filter(regular).filter(storage_ok) else {
         return HashSet::new();
     };
     let Ok(conn) = rusqlite::Connection::open_with_flags(
