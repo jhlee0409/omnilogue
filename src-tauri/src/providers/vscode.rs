@@ -2171,7 +2171,8 @@ mod tests {
 
         let merged = crate::providers::copilot::scan_projects().unwrap();
         assert_eq!(merged.len(), 1, "both locations are one project");
-        assert_eq!(merged[0].actual_path, empty_dir.to_string_lossy());
+        // As paths: the fixture joins `AppData/Roaming` with `/` on Windows.
+        assert_eq!(Path::new(&merged[0].actual_path), empty_dir);
         assert_eq!(merged[0].session_count, 2);
 
         let sessions = crate::providers::copilot::load_sessions(&merged[0].path, false).unwrap();
