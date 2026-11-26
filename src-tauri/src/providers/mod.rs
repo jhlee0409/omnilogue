@@ -27,6 +27,8 @@ pub mod antigravity_cli;
 /// `state.vscdb` — titles and latest-step text the encrypted `.pb`
 /// transcripts cannot provide.
 pub mod antigravity_state_sync;
+/// Transcript step lines shared by the Antigravity desktop app and CLI.
+pub(crate) mod antigravity_transcript;
 pub mod claude;
 /// claude.ai account exports registered in Settings (read in place).
 pub mod claude_ai;
