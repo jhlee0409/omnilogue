@@ -327,40 +327,54 @@ pub fn load_messages_from_base_path(
     Ok(messages)
 }
 
-/// A user record that is the user's prompt, as content blocks: the text
-/// inside its `<user_query>` wrapper. Grok also writes context it injects
-/// as user records: `synthetic_reason` (`system_reminder`,
-/// `task_completed`, …), or a record with neither a `prompt_index` nor a
-/// `<user_query>`; those are not prompts.
+/// A user record that is the user's prompt, as content blocks, with a
+/// `<user_query>` wrapper reduced to the text inside it. Grok also writes
+/// context it injects as user records: one with a `synthetic_reason`
+/// (`system_reminder`, `task_completed`, …), or one whose text is nothing
+/// but `<system-reminder>` blocks; those are not prompts.
 fn user_prompt(value: &Value) -> Option<Value> {
     if value.get("synthetic_reason").is_some_and(|r| !r.is_null()) {
         return None;
     }
-    let blocks = content_to_blocks(value.get("content"));
-    let mut wrapped = false;
-    let blocks: Vec<Value> = blocks
+    let blocks: Vec<Value> = content_to_blocks(value.get("content"))
         .as_array()?
         .iter()
+        .filter(|block| {
+            !block
+                .get("text")
+                .and_then(Value::as_str)
+                .is_some_and(is_system_reminder)
+        })
         .map(|block| {
-            let Some(text) = block.get("text").and_then(Value::as_str) else {
-                return block.clone();
-            };
-            let Some(inner) = text
-                .split_once("<user_query>")
+            let inner = block
+                .get("text")
+                .and_then(Value::as_str)
+                .and_then(|text| text.split_once("<user_query>"))
                 .and_then(|(_, rest)| rest.split_once("</user_query>"))
-                .map(|(inner, _)| inner.trim())
-            else {
-                return block.clone();
-            };
-            wrapped = true;
-            json!({"type": "text", "text": inner})
+                .map(|(inner, _)| inner.trim());
+            match inner {
+                Some(inner) => json!({"type": "text", "text": inner}),
+                None => block.clone(),
+            }
         })
         .collect();
-    if !wrapped && value.get("prompt_index").is_none() {
-        return None;
-    }
     let content = Value::Array(blocks);
     (!content_is_empty(&content)).then_some(content)
+}
+
+/// Text made only of `<system-reminder>…</system-reminder>` blocks.
+fn is_system_reminder(text: &str) -> bool {
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return false;
+    }
+    while let Some(after) = rest.strip_prefix("<system-reminder>") {
+        let Some((_, tail)) = after.split_once("</system-reminder>") else {
+            return false;
+        };
+        rest = tail.trim_start();
+    }
+    rest.is_empty()
 }
 
 /// Tool calls that failed, by id. `chat_history.jsonl` records only the
@@ -536,14 +550,30 @@ fn extract_session_info(session_dir: &Path, report: &ScanReport) -> Option<Sessi
         .unwrap_or(created_at.as_str())
         .to_string();
 
-    // The messages the session shows (`num_chat_messages` counts the
-    // injected context records too).
-    let values = read_jsonl_values(&chat_path).unwrap_or_default();
-    let mut counter = 0u64;
-    let message_count = values
-        .iter()
-        .filter(|value| convert_chat_message(value, "", "", None, &mut counter).is_some())
-        .count();
+    // The messages the session shows (`num_chat_messages` also counts the
+    // injected context records). A history that cannot be read is recorded
+    // in `report`; the session is still listed by its summary's count.
+    let values: Option<Vec<Value>> = report.read_to_string(&chat_path).map(|content| {
+        content
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    });
+    let message_count = match &values {
+        Some(values) => {
+            let mut counter = 0u64;
+            values
+                .iter()
+                .filter(|value| convert_chat_message(value, "", "", None, &mut counter).is_some())
+                .count()
+        }
+        None => summary
+            .get("num_chat_messages")
+            .or_else(|| summary.get("num_messages"))
+            .and_then(Value::as_u64)
+            .map_or(0, |n| n as usize),
+    };
+    let values = values.unwrap_or_default();
 
     let signals = read_json_file(&session_dir.join("signals.json")).unwrap_or(Value::Null);
     let has_tool_use = signals
