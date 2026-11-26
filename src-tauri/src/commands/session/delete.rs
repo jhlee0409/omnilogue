@@ -98,6 +98,9 @@ pub(super) struct CursorAgentTargets {
     /// The `<projects>/<project>/agent-transcripts/<id>/` folder, or the
     /// older flat `agent-transcripts/<id>.jsonl` file.
     pub session_dir: PathBuf,
+    /// The older flat `agent-transcripts/<id>.jsonl` beside a nested
+    /// session: the same chat, listed again once the folder is gone.
+    pub legacy_file: Option<PathBuf>,
     /// The `<project>` folder name the transcript sits in.
     pub project: String,
     /// The CLI's `<chats>/<workspace-hash>/<id>/` metadata folders.
@@ -158,8 +161,19 @@ pub(super) fn resolve_cursor_agent_targets(
         _ => Vec::new(),
     };
 
+    let legacy_file = Some(
+        root.join(project)
+            .join(transcripts)
+            .join(format!("{id}.jsonl")),
+    )
+    .filter(|flat| *flat != session_dir)
+    .filter(|flat| {
+        fs::symlink_metadata(flat).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+    });
+
     Ok(CursorAgentTargets {
         session_dir,
+        legacy_file,
         project: project.clone(),
         metadata_dirs,
     })
@@ -174,6 +188,9 @@ fn delete_cursor_agent_session(
 ) -> Result<(), String> {
     let targets = resolve_cursor_agent_targets(projects_root, chats_root, transcript)?;
     trash_only(&targets.session_dir).map_err(|e| format!("Failed to delete session: {e}"))?;
+    if let Some(flat) = &targets.legacy_file {
+        trash_only(flat).map_err(|e| format!("Failed to delete session: {e}"))?;
+    }
     for dir in targets.metadata_dirs {
         trash_only(&dir).map_err(|e| {
             format!("The transcript was moved to the trash, but its Cursor Agent chat data was not: {e}")
@@ -462,6 +479,24 @@ mod tests {
         assert!(!flat.exists());
         assert!(!meta_dir.exists());
         assert!(current_dir.exists());
+    }
+
+    /// A chat with both layouts goes away whole: deleting the nested session
+    /// also trashes the flat copy that would otherwise be listed again.
+    #[tokio::test]
+    #[serial]
+    async fn cursor_agent_delete_takes_the_flat_copy_too() {
+        let home = crate::test_utils::SandboxHome::new();
+        let id = "both-1";
+        let (transcript, session_dir, _) = cursor_agent_session(home.path(), id);
+        let flat = session_dir.parent().unwrap().join(format!("{id}.jsonl"));
+        fs::write(&flat, "{}\n").unwrap();
+
+        delete_session(transcript.to_string_lossy().into())
+            .await
+            .unwrap();
+        assert!(!session_dir.exists());
+        assert!(!flat.exists());
     }
 
     /// Only `<id>/<id>.jsonl` names a Cursor Agent session; any other path

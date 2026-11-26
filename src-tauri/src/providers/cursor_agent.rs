@@ -555,11 +555,18 @@ fn convert_message(
     if content.is_empty() {
         return None;
     }
-    if role == "user" {
-        let first_text = content[0].get("text").and_then(Value::as_str);
-        if first_text.is_some_and(is_injected_query) {
-            return None;
-        }
+    // Only a `<user_query>` the harness wrote can be a notice; text the user
+    // typed that merely opens the same way stays a prompt.
+    let is_notice = role == "user"
+        && blocks.iter().any(|block| {
+            block
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|raw| raw.contains("<user_query>"))
+                .is_some_and(|raw| is_injected_query(&clean_user_text(raw)))
+        });
+    if is_notice {
+        return None;
     }
 
     let tool_use = content
@@ -720,7 +727,13 @@ pub(crate) fn project_display(project_dir: &Path) -> (String, String) {
 /// CLI still reads (`agent-transcript/dist/paths.js`) when that chat has no
 /// file in the current layout. A sub-agent's `<uuid>/subagents/*.jsonl` is
 /// not a session.
+///
+/// A symlinked `agent-transcripts` is not walked: it could lead outside the
+/// projects root.
 fn transcript_files(transcripts_dir: &Path) -> Vec<DirEntry> {
+    if is_symlink(transcripts_dir) {
+        return Vec::new();
+    }
     let files: Vec<DirEntry> = WalkDir::new(transcripts_dir)
         .min_depth(1)
         .max_depth(2)
@@ -1160,6 +1173,15 @@ mod tests {
         r#"{"type":"turn_ended","status":"success"}"#,
         "\n",
     );
+
+    /// Only a harness-written `<user_query>` can be a notice: a prompt typed
+    /// without the wrapper that opens like one is still the user's.
+    #[test]
+    fn a_typed_prompt_that_opens_like_a_notice_is_kept() {
+        let line = r#"{"role":"user","message":{"content":[{"type":"text","text":"The background shell command fails on Windows. Please fix it."}]}}"#;
+        let messages = parse_transcript(line, "s", "");
+        assert_eq!(messages.len(), 1);
+    }
 
     #[test]
     fn tool_only_turns_show_their_calls_and_injected_notices_are_not_prompts() {

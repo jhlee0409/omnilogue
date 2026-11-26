@@ -354,6 +354,7 @@ impl Project {
                     return Err(NOT_IN_PROJECT.to_string());
                 }
                 Ok(std::iter::once(targets.session_dir)
+                    .chain(targets.legacy_file)
                     .chain(targets.metadata_dirs)
                     .collect())
             }
