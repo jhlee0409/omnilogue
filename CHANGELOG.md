@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Zed threads are grouped by their project folder** (desktop and WebUI). Zed records a thread's folders one per line, and the app read them as a JSON list, so every thread landed in one "unknown" project. Threads now group under the folder Zed shows first. Tool calls show their arguments instead of a `{"type":"json","value":…}` wrapper, a thread Zed has not titled yet is named by its first prompt instead of its id, a compacted thread shows its summary as a "Context compacted" marker, and images attached to a prompt are shown. Sub-agent threads started with `spawn_agent` are no longer listed as threads of their own; they appear in the SubAgent panel of the thread that started them, linked to that call. (#855)
+
 ## [2.2.0] - 2026-11-25
 
 ### Added
