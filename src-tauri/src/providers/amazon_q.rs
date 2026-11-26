@@ -155,10 +155,11 @@ pub fn load_sessions(
     let Some(value) = value else {
         return Ok(vec![]);
     };
-    let msg_count = q_conversation::message_count(&value);
-    if msg_count == 0 {
+    let messages = q_conversation::parse_history(PROVIDER, &value, key);
+    if messages.is_empty() {
         return Ok(vec![]);
     }
+    let (has_tool_use, has_errors) = q_conversation::session_flags(&messages);
 
     let project_name = Path::new(key)
         .file_name()
@@ -176,12 +177,12 @@ pub fn load_sessions(
         actual_session_id: key.to_string(),
         file_path: format!("{SCHEME}{key}"),
         project_name,
-        message_count: msg_count,
+        message_count: messages.len(),
         first_message_time: first,
         last_message_time: last.clone(),
         last_modified: last,
-        has_tool_use: false,
-        has_errors: false,
+        has_tool_use,
+        has_errors,
         summary,
         is_renamed: false,
         provider: Some(PROVIDER.to_string()),
