@@ -446,7 +446,13 @@ fn parse_session_doc(
         .and_then(Value::as_str)
         .map(str::to_string);
 
-    let history = obj.get("history").and_then(Value::as_array);
+    // PearAI keeps a "PearAI Search" (Perplexity) conversation in
+    // `perplexityHistory` (`PersistedSessionInfo`, `IntegrationHistoryMap` in
+    // its fork's `core/index.d.ts`), same item shape, `history` left empty.
+    let history = ["history", "perplexityHistory"]
+        .iter()
+        .filter_map(|key| obj.get(*key).and_then(Value::as_array))
+        .find(|items| !items.is_empty());
 
     let mut messages = Vec::new();
     let mut first_user_text: Option<String> = None;
@@ -882,6 +888,23 @@ mod tests {
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].provider.as_deref(), Some("pearai"));
         assert_eq!(projects[0].path, "pearai:///Users/jack/client/my-project");
+    }
+
+    /// A "`PearAI` Search" session (`integrationType: "perplexity"`) keeps its
+    /// conversation in `perplexityHistory`, `history` empty.
+    #[test]
+    fn pearai_search_sessions_read_perplexity_history() {
+        let data = r#"{
+            "sessionId": "p1", "title": "rust lifetimes", "workspaceDirectory": "/w",
+            "history": [],
+            "perplexityHistory": [
+                { "message": { "role": "user", "content": "what are lifetimes" }, "contextItems": [] },
+                { "message": { "role": "assistant", "content": "Lifetimes are..." }, "contextItems": [] }
+            ]
+        }"#;
+        let doc = parse_session_doc(data, "pearai", "p1", "").unwrap();
+        assert_eq!(doc.messages.len(), 2);
+        assert_eq!(doc.first_user_text.as_deref(), Some("what are lifetimes"));
     }
 
     #[test]

@@ -23,6 +23,9 @@ const EXTENSIONS: &[(&str, &str)] = &[
     // by the extension id — so load_task_history falls back to reading that. The cwd
     // field there is `workspace`, not `cwdOnTaskInitialization` (see task_cwd).
     ("kilocode.kilo-code", "Kilo Code"),
+    // PearAI's agent is a Roo Code fork (`trypear/PearAI-Roo-Code`, extension
+    // `PearAI.pearai-roo-cline`), with Roo's task files and globalState index.
+    ("pearai.pearai-roo-cline", "PearAI Agent"),
 ];
 
 /// Kilo Code's own legacy CLI ran the extension against a mock VS Code whose
@@ -474,6 +477,8 @@ fn collect_base_paths_under(root: &Path, report: &ScanReport) -> Vec<(PathBuf, S
         ("Code - Insiders", "VS Code Insiders"),
         ("VSCodium", "VSCodium"),
         ("Codium", "VSCodium"),
+        // The PearAI editor (`pearai-app` `product.json` `nameShort`).
+        ("PearAI", "PearAI"),
     ];
 
     let mut paths = Vec::new();
@@ -654,7 +659,9 @@ fn load_task_history_from_global_state(
     let raw: String = report.db(
         &db_path,
         conn.query_row(
-            "SELECT value FROM ItemTable WHERE key = ?1",
+            // VS Code keys globalState by the extension id as published
+            // (`PearAI.pearai-roo-cline`); the storage dir is lowercased.
+            "SELECT value FROM ItemTable WHERE key = ?1 COLLATE NOCASE",
             [ext_id],
             |row| {
                 // VS Code stores the value as TEXT; tolerate BLOB-stored bytes too.
@@ -1044,6 +1051,40 @@ mod tests {
         assert!(found.iter().any(|(path, _)| path == &cline));
         assert!(labels.contains(&"Cline (VS Code)"));
         assert!(labels.contains(&"Roo Code (Cursor)"));
+    }
+
+    /// The `PearAI` agent (a Roo fork) in the `PearAI` editor: found, and its
+    /// task index read from globalState, which VS Code keys by the published
+    /// id `PearAI.pearai-roo-cline` while the storage dir is lowercased.
+    #[test]
+    fn pearai_agent_tasks_are_found_in_the_pearai_editor() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let global_storage = tmp.path().join("PearAI/User/globalStorage");
+        let agent = global_storage.join("pearai.pearai-roo-cline");
+        fs::create_dir_all(&agent).unwrap();
+        let found = collect_base_paths_under(tmp.path(), &ScanReport::default());
+        assert_eq!(
+            found,
+            vec![(agent.clone(), "PearAI Agent (PearAI)".to_string())]
+        );
+
+        let conn = Connection::open(global_storage.join("state.vscdb")).unwrap();
+        conn.execute(
+            "CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES ('PearAI.pearai-roo-cline', ?1)",
+            [
+                json!({"taskHistory": [{"id": "t1", "ts": 1, "task": "x", "workspace": "/w"}]})
+                    .to_string(),
+            ],
+        )
+        .unwrap();
+        let history = load_task_history(&agent, &ScanReport::default());
+        assert_eq!(history.len(), 1);
+        assert_eq!(task_cwd(&history[0]), Some("/w"));
     }
 
     #[cfg(unix)]
