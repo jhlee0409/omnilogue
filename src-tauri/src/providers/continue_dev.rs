@@ -448,11 +448,14 @@ fn parse_session_doc(
 
     // PearAI keeps a "PearAI Search" (Perplexity) conversation in
     // `perplexityHistory` (`PersistedSessionInfo`, `IntegrationHistoryMap` in
-    // its fork's `core/index.d.ts`), same item shape, `history` left empty.
-    let history = ["history", "perplexityHistory"]
+    // its fork's `core/index.d.ts`), same item shape. Its save writes both
+    // histories (`gui/src/hooks/useHistory.tsx`), so both are read: the chat,
+    // then the search.
+    let history: Vec<&Value> = ["history", "perplexityHistory"]
         .iter()
         .filter_map(|key| obj.get(*key).and_then(Value::as_array))
-        .find(|items| !items.is_empty());
+        .flatten()
+        .collect();
 
     let mut messages = Vec::new();
     let mut first_user_text: Option<String> = None;
@@ -465,8 +468,7 @@ fn parse_session_doc(
     // instead of the fallback text, marked failed.
     let mut failed_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
     let tool_items: std::collections::HashSet<String> = history
-        .into_iter()
-        .flatten()
+        .iter()
         .filter_map(|item| item.get("message"))
         .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
         .filter_map(|m| m.get("toolCallId").and_then(Value::as_str))
@@ -479,89 +481,87 @@ fn parse_session_doc(
     };
     let mut idx = 0u64;
 
-    if let Some(history) = history {
-        for item in history {
-            let Some(message) = item.get("message") else {
-                continue;
-            };
-            let Some(role) = message.get("role").and_then(Value::as_str) else {
-                continue;
-            };
+    for item in &history {
+        let Some(message) = item.get("message") else {
+            continue;
+        };
+        let Some(role) = message.get("role").and_then(Value::as_str) else {
+            continue;
+        };
 
-            let (role, content) = match role {
-                "user" | "system" => {
-                    let content = message.get("content").cloned();
-                    if first_user_text.is_none() && role == "user" {
-                        first_user_text = content.as_ref().and_then(extract_text);
-                    }
-                    (role, content)
+        let (role, content) = match role {
+            "user" | "system" => {
+                let content = message.get("content").cloned();
+                if first_user_text.is_none() && role == "user" {
+                    first_user_text = content.as_ref().and_then(extract_text);
                 }
-                "assistant" => {
-                    let blocks = assistant_blocks(item, message, &mut results);
-                    has_tool_use |= blocks.iter().any(|b| b["type"] == "tool_use");
-                    has_errors |= blocks.iter().any(|b| b["is_error"] == true);
-                    if blocks.is_empty() {
-                        continue;
-                    }
-                    (role, Some(Value::Array(blocks)))
+                (role, content)
+            }
+            "assistant" => {
+                let blocks = assistant_blocks(item, message, &mut results);
+                has_tool_use |= blocks.iter().any(|b| b["type"] == "tool_use");
+                has_errors |= blocks.iter().any(|b| b["is_error"] == true);
+                if blocks.is_empty() {
+                    continue;
                 }
-                "thinking" => {
-                    // Continue's `ThinkingChatMessage` may carry `toolCalls`
-                    // too: its text is reasoning, its calls are calls.
-                    let mut blocks: Vec<Value> = message
-                        .get("content")
-                        .and_then(extract_text)
-                        .map(|text| serde_json::json!({"type": "thinking", "thinking": text}))
-                        .into_iter()
-                        .collect();
-                    let mut calls_only = message.clone();
-                    if let Some(obj) = calls_only.as_object_mut() {
-                        obj.remove("content");
-                    }
-                    blocks.extend(assistant_blocks(item, &calls_only, &mut results));
-                    has_tool_use |= blocks.iter().any(|b| b["type"] == "tool_use");
-                    has_errors |= blocks.iter().any(|b| b["is_error"] == true);
-                    if blocks.is_empty() {
-                        continue;
-                    }
-                    ("assistant", Some(Value::Array(blocks)))
+                (role, Some(Value::Array(blocks)))
+            }
+            "thinking" => {
+                // Continue's `ThinkingChatMessage` may carry `toolCalls`
+                // too: its text is reasoning, its calls are calls.
+                let mut blocks: Vec<Value> = message
+                    .get("content")
+                    .and_then(extract_text)
+                    .map(|text| serde_json::json!({"type": "thinking", "thinking": text}))
+                    .into_iter()
+                    .collect();
+                let mut calls_only = message.clone();
+                if let Some(obj) = calls_only.as_object_mut() {
+                    obj.remove("content");
                 }
-                "tool" => {
-                    let id = message
-                        .get("toolCallId")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default();
-                    if results.shown.contains(id) {
-                        continue;
-                    }
-                    let text = message
-                        .get("content")
-                        .and_then(extract_text)
-                        .unwrap_or_default();
-                    let mut result = serde_json::json!(
-                        {"type": "tool_result", "tool_use_id": id, "content": text}
-                    );
-                    if results.failed.contains(id) {
-                        result["is_error"] = Value::Bool(true);
-                        has_errors = true;
-                    }
-                    ("user", Some(serde_json::json!([result])))
+                blocks.extend(assistant_blocks(item, &calls_only, &mut results));
+                has_tool_use |= blocks.iter().any(|b| b["type"] == "tool_use");
+                has_errors |= blocks.iter().any(|b| b["is_error"] == true);
+                if blocks.is_empty() {
+                    continue;
                 }
-                _ => continue,
-            };
+                ("assistant", Some(Value::Array(blocks)))
+            }
+            "tool" => {
+                let id = message
+                    .get("toolCallId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if results.shown.contains(id) {
+                    continue;
+                }
+                let text = message
+                    .get("content")
+                    .and_then(extract_text)
+                    .unwrap_or_default();
+                let mut result = serde_json::json!(
+                    {"type": "tool_result", "tool_use_id": id, "content": text}
+                );
+                if results.failed.contains(id) {
+                    result["is_error"] = Value::Bool(true);
+                    has_errors = true;
+                }
+                ("user", Some(serde_json::json!([result])))
+            }
+            _ => continue,
+        };
 
-            messages.push(build_provider_message(
-                provider_id,
-                format!("{session_id}-{idx}"),
-                &session_id,
-                timestamp.to_string(),
-                role,
-                Some(role),
-                content,
-                None,
-            ));
-            idx += 1;
-        }
+        messages.push(build_provider_message(
+            provider_id,
+            format!("{session_id}-{idx}"),
+            &session_id,
+            timestamp.to_string(),
+            role,
+            Some(role),
+            content,
+            None,
+        ));
+        idx += 1;
     }
 
     Some(SessionDoc {
@@ -905,6 +905,23 @@ mod tests {
         let doc = parse_session_doc(data, "pearai", "p1", "").unwrap();
         assert_eq!(doc.messages.len(), 2);
         assert_eq!(doc.first_user_text.as_deref(), Some("what are lifetimes"));
+    }
+
+    /// `PearAI` saves both histories; one session can hold a chat and a search.
+    #[test]
+    fn pearai_session_with_both_histories_shows_both() {
+        let data = r#"{
+            "sessionId": "p2",
+            "history": [ { "message": { "role": "user", "content": "chat question" } } ],
+            "perplexityHistory": [ { "message": { "role": "user", "content": "search question" } } ]
+        }"#;
+        let doc = parse_session_doc(data, "pearai", "p2", "").unwrap();
+        let texts: Vec<String> = doc
+            .messages
+            .iter()
+            .map(|m| m.content.as_ref().unwrap().as_str().unwrap().to_string())
+            .collect();
+        assert_eq!(texts, ["chat question", "search question"]);
     }
 
     #[test]
