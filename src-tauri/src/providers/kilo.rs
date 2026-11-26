@@ -103,7 +103,13 @@ pub fn detect() -> Option<ProviderInfo> {
 /// (`legacy-migration/sessions/lib/session.ts`: `id = ses_migrated_<hash>`,
 /// `slug = <task id>`). Empty when there is no database or no such session.
 pub(crate) fn migrated_task_ids() -> HashSet<String> {
-    let Some(db) = db_location().filter(|db| db.is_file()) else {
+    // The same policy the reader applies (a symlinked database is refused),
+    // so a task is never hidden from the Cline reader while this one cannot
+    // show its copy.
+    let regular = |db: &PathBuf| {
+        std::fs::symlink_metadata(db).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
+    };
+    let Some(db) = db_location().filter(regular) else {
         return HashSet::new();
     };
     let Ok(conn) = rusqlite::Connection::open_with_flags(
@@ -501,7 +507,10 @@ mod tests {
     use super::test_support::{create_db, create_test_db, seed};
     use super::*;
 
+    // Serial: these read `db_file()`, which `kilo_db_names_the_database`
+    // changes through `KILO_DB`.
     #[test]
+    #[serial_test::serial]
     fn scan_projects_rebrands_to_kilo_scheme() {
         let tmp = tempfile::tempdir().unwrap();
         let conn = create_test_db(tmp.path());
@@ -517,6 +526,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn sidebar_groups_and_pages_kilo_runs_with_kilo_ids() {
         let tmp = tempfile::tempdir().unwrap();
         let conn = create_test_db(tmp.path());
@@ -549,6 +559,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn load_sessions_and_messages_roundtrip_through_kilo_scheme() {
         let tmp = tempfile::tempdir().unwrap();
         let conn = create_test_db(tmp.path());
@@ -579,6 +590,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn search_finds_text_and_rebrands_provider() {
         let tmp = tempfile::tempdir().unwrap();
         let conn = create_test_db(tmp.path());
@@ -593,6 +605,7 @@ mod tests {
     /// #672: hits carry the `kilo://` path scan emits for their project, so
     /// same-named worktrees stay apart.
     #[test]
+    #[serial_test::serial]
     fn search_hits_carry_scanned_kilo_project_path() {
         let tmp = tempfile::tempdir().unwrap();
         let conn = create_test_db(tmp.path());
@@ -646,6 +659,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn errors_are_reported_in_kilo_terms() {
         let tmp = tempfile::tempdir().unwrap();
         drop(create_test_db(tmp.path()));
@@ -668,6 +682,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn child_sessions_read_from_kilo_db() {
         let tmp = tempfile::tempdir().unwrap();
         let conn = create_test_db(tmp.path());

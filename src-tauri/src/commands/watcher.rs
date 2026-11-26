@@ -1000,9 +1000,15 @@ fn extract_kimi_code_paths(path: &Path) -> Option<(String, String)> {
 /// refreshes all data for that store (`opencode://*` or `kilo://*`).
 fn extract_opencode_db_event(path: &Path) -> Option<(String, String)> {
     let filename = path.file_name()?.to_str()?;
+    // `KILO_DB` can name another file; it and its `-wal`/`-shm` count too.
+    let kilo_db = crate::providers::kilo::db_file();
     let scheme = if filename.starts_with("opencode.") {
         "opencode"
-    } else if filename.starts_with("kilo.") {
+    } else if filename.starts_with("kilo.")
+        || filename
+            .strip_prefix(kilo_db.as_str())
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
+    {
         "kilo"
     } else {
         return None;
