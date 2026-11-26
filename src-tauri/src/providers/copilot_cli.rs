@@ -1116,6 +1116,10 @@ fn is_renderable_message_event(event_type: &str, data: Option<&Value>) -> bool {
                     .and_then(Value::as_array)
                     .map(|requests| !requests.is_empty())
                     .unwrap_or(false)
+                || data
+                    .get("reasoningText")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.trim().is_empty())
         }
         _ => false,
     }
@@ -1746,6 +1750,10 @@ mod tests {
                     "data": {"content": "", "source": "autopilot", "isAutopilotContinuation": true}}),
                 json!({"type": "user.message", "timestamp": "2026-11-26T09:00:07.000Z",
                     "data": {"content": "/review", "source": "command-review"}}),
+                json!({"type": "assistant.message", "timestamp": "2026-11-26T09:00:08.000Z",
+                    "data": {"messageId": "m2", "content": "", "reasoningText": "Reviewing the diff."}}),
+                json!({"type": "assistant.message", "timestamp": "2026-11-26T09:00:09.000Z",
+                    "data": {"messageId": "m3", "content": "", "reasoningText": "  "}}),
             ],
         )
     }
@@ -1769,12 +1777,14 @@ mod tests {
             })
             .collect();
         assert_eq!(prompts, ["run the steps", "/review"]);
-        assert_eq!(messages.len(), 3);
+        // Prompts, the tool-calling reply, and a reply that is reasoning only;
+        // blank reasoning is no message. The list counts what is shown.
+        assert_eq!(messages.len(), 4);
         assert_eq!(
             extract_session_info(Path::new(&path))
                 .unwrap()
                 .message_count,
-            3
+            4
         );
 
         let runs = load_subagents(&path).unwrap();
