@@ -26,13 +26,23 @@ use crate::utils::build_provider_message;
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 
+/// Step kinds that are context, not turns of the conversation.
+const CONTEXT_KINDS: [&str; 4] = [
+    "CONVERSATION_HISTORY",
+    "SYSTEM_MESSAGE",
+    "CHECKPOINT",
+    "ERROR_MESSAGE",
+];
+
 /// Reads a transcript's step lines in order, pairing each tool result with
 /// the call it answers.
 pub(crate) struct StepReader<'a> {
     provider: &'a str,
     session_id: &'a str,
-    /// Ids of the latest planner response's calls not yet answered.
-    pending: VecDeque<String>,
+    /// The latest planner response's calls not yet answered: the step index
+    /// each call's result is expected at (the kth call's is the planner's
+    /// index + k + 1), and the call's id.
+    pending: VecDeque<(Option<u64>, String)>,
 }
 
 impl<'a> StepReader<'a> {
@@ -44,8 +54,9 @@ impl<'a> StepReader<'a> {
         }
     }
 
-    /// The message one step record shows, if any. `step_index` falls back to
-    /// `line_idx`.
+    /// The message one step record shows, if any. A record without
+    /// `step_index` is named by its line (`-line-<n>`), apart from the ids
+    /// of indexed steps.
     pub(crate) fn step(
         &mut self,
         rec: &Value,
@@ -54,11 +65,14 @@ impl<'a> StepReader<'a> {
     ) -> Option<ClaudeMessage> {
         let source = rec.get("source").and_then(Value::as_str).unwrap_or("");
         let kind = rec.get("type").and_then(Value::as_str).unwrap_or("");
-        let step_index = rec
-            .get("step_index")
-            .and_then(Value::as_u64)
-            .unwrap_or(line_idx);
-        let uuid = format!("{}-step-{step_index}", self.session_id);
+        if CONTEXT_KINDS.contains(&kind) {
+            return None;
+        }
+        let step_index = rec.get("step_index").and_then(Value::as_u64);
+        let uuid = match step_index {
+            Some(index) => format!("{}-step-{index}", self.session_id),
+            None => format!("{}-line-{line_idx}", self.session_id),
+        };
         let text = |key: &str| {
             rec.get(key)
                 .and_then(Value::as_str)
@@ -94,19 +108,42 @@ impl<'a> StepReader<'a> {
                     "name": call.get("name").and_then(Value::as_str).unwrap_or("tool"),
                     "input": call_args(call.get("args")),
                 }));
-                self.pending.push_back(id);
+                self.pending
+                    .push_back((step_index.map(|n| n + 1 + k as u64), id));
             }
             if blocks.is_empty() {
                 return None;
             }
             ("assistant", blocks)
         } else if source == "MODEL" {
-            // A tool result: the oldest unanswered call's.
-            let id = self.pending.pop_front().unwrap_or_else(|| uuid.clone());
+            // A tool result: the call whose result is expected at this
+            // step, else the oldest unanswered one. Matching by index keeps
+            // the other calls right when a result line was unreadable.
+            let by_index = step_index.and_then(|index| {
+                self.pending
+                    .iter()
+                    .position(|(expected, _)| *expected == Some(index))
+            });
+            let call = match by_index {
+                Some(position) => self.pending.remove(position),
+                None => self.pending.pop_front(),
+            };
             let status = rec.get("status").and_then(Value::as_str).unwrap_or("");
             let body = text("content").map(result_body).unwrap_or_default();
+            // A result that answers no call and holds nothing is noise.
+            if call.is_none() && body.is_empty() && text("error").is_none() {
+                return None;
+            }
+            let id = call.map_or_else(|| uuid.clone(), |(_, id)| id);
             let (content, is_error) = match status {
-                "ERROR" => (text("error").map(str::to_string).unwrap_or(body), true),
+                "ERROR" => (
+                    if body.is_empty() {
+                        text("error").unwrap_or_default().to_string()
+                    } else {
+                        body
+                    },
+                    true,
+                ),
                 // The rest of a background start is instructions to the
                 // model; the first line names the task.
                 "RUNNING" => (body.lines().next().unwrap_or_default().to_string(), false),
@@ -227,8 +264,8 @@ mod tests {
         assert_eq!(second[0]["tool_use_id"], calls[2]["id"]);
         assert_eq!(second[0]["is_error"], true);
         assert_eq!(
-            second[0]["content"],
-            "permission check failed for view_file: user denied permission"
+            second[0]["content"], "Encountered error in step execution: permission check failed",
+            "the result body is kept; `error` only fills an empty one"
         );
         assert_eq!(content(4)[0]["text"], "Done.");
     }
@@ -249,6 +286,56 @@ mod tests {
         assert_eq!(
             result.content.unwrap()[0]["content"],
             "Tool is running as a background task with task id: c/task-2"
+        );
+    }
+
+    fn records(lines: &[&str]) -> Vec<Value> {
+        lines
+            .iter()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    /// Steps 20 calls A and B; A's result line (21) was unreadable and
+    /// dropped. B's result (22) still goes to B, and A stays unanswered.
+    #[test]
+    fn a_lost_result_line_does_not_shift_the_others() {
+        let mut reader = StepReader::new("antigravity", "s");
+        let steps = records(&[
+            r#"{"step_index":20,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"name":"a","args":{}},{"name":"b","args":{}}]}"#,
+            r#"{"step_index":22,"source":"MODEL","type":"GENERIC","status":"DONE","content":"B output"}"#,
+        ]);
+        let planner = reader.step(&steps[0], 0, "").unwrap();
+        let result = reader.step(&steps[1], 2, "").unwrap();
+        assert_eq!(
+            result.content.unwrap()[0]["tool_use_id"],
+            planner.content.unwrap()[1]["id"]
+        );
+    }
+
+    #[test]
+    fn context_records_and_empty_orphans_are_not_results() {
+        let mut reader = StepReader::new("antigravity", "s");
+        let steps = records(&[
+            r#"{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","tool_calls":[{"name":"a","args":{}}]}"#,
+            r#"{"step_index":2,"source":"MODEL","type":"CONVERSATION_HISTORY","content":"replayed"}"#,
+            r#"{"step_index":3,"source":"MODEL","type":"GENERIC","status":"ERROR","error":"denied"}"#,
+            r#"{"step_index":4,"source":"MODEL","type":"GENERIC","status":"DONE"}"#,
+        ]);
+        let planner = reader.step(&steps[0], 0, "").unwrap();
+        assert!(
+            reader.step(&steps[1], 1, "").is_none(),
+            "context, not a result"
+        );
+        let result = reader.step(&steps[2], 2, "").unwrap().content.unwrap();
+        assert_eq!(result[0]["tool_use_id"], planner.content.unwrap()[0]["id"]);
+        assert_eq!(
+            result[0]["content"], "denied",
+            "`error` fills an empty body"
+        );
+        assert!(
+            reader.step(&steps[3], 3, "").is_none(),
+            "no call left and nothing to show"
         );
     }
 }

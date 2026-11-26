@@ -1581,7 +1581,8 @@ fn message_text_matches(message: &ClaudeMessage, query_lower: &str) -> bool {
     match &message.content {
         Some(Value::String(s)) => s.to_lowercase().contains(query_lower),
         Some(Value::Array(arr)) => arr.iter().any(|block| {
-            ["text", "thinking"].iter().any(|key| {
+            // `content` is a tool result's text.
+            ["text", "thinking", "content"].iter().any(|key| {
                 block
                     .get(key)
                     .and_then(Value::as_str)
