@@ -387,9 +387,12 @@ impl Project {
 
         trash_only(first)?;
         for path in rest {
+            // `first` may be a Cursor Agent session's other copy, not the
+            // session itself, so name what was and was not moved.
             trash_only(path).map_err(|e| {
                 format!(
-                    "The session was moved to the trash, but {} was not: {e}",
+                    "{} was moved to the trash, but {} was not: {e}",
+                    first.display(),
                     path.display()
                 )
             })?;

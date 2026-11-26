@@ -166,14 +166,29 @@ pub(super) fn resolve_cursor_agent_targets(
     let transcripts_dir = root.join(project).join(transcripts);
     let flat = transcripts_dir.join(format!("{id}.jsonl"));
     let nested = transcripts_dir.join(&id);
-    let other_layout = if session_dir == flat {
-        Some(nested).filter(|dir| {
-            fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
-        })
+    let (other, want_dir) = if session_dir == flat {
+        (nested, true)
     } else {
-        Some(flat).filter(|file| {
-            fs::symlink_metadata(file).is_ok_and(|m| m.is_file() && !m.file_type().is_symlink())
-        })
+        (flat, false)
+    };
+    // Only absence means "no other copy"; an entry that cannot be inspected
+    // fails the delete before anything is trashed.
+    let other_layout = match fs::symlink_metadata(&other) {
+        Ok(m)
+            if !m.file_type().is_symlink()
+                && (m.is_dir() == want_dir)
+                && (m.is_file() != want_dir) =>
+        {
+            Some(other)
+        }
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(format!(
+                "Cannot inspect the other copy of the session {}: {e}",
+                other.display()
+            ))
+        }
     };
 
     Ok(CursorAgentTargets {
