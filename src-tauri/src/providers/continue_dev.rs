@@ -51,6 +51,11 @@ const SUMMARY_MAX_CHARS: usize = 80;
 /// `cwd` bucket for sessions with no `workspaceDirectory`.
 const UNKNOWN_WORKSPACE: &str = "unknown";
 
+/// Titles Continue gives a session before it is named: the extension's
+/// `NEW_SESSION_TITLE` (`core/util/constants.ts`) and the CLI's
+/// `DEFAULT_SESSION_TITLE` (`extensions/cli/src/constants/session.ts`).
+const PLACEHOLDER_TITLES: [&str; 2] = ["New Session", "Untitled Session"];
+
 /// Configuration distinguishing the members of the Continue family.
 pub(crate) struct Family {
     /// Provider id stamped on projects/sessions/messages (e.g. `"continue"`).
@@ -262,7 +267,7 @@ pub(crate) fn load_sessions_for(
             last_message_time: mtime.clone(),
             last_modified: mtime,
             has_tool_use: doc.has_tool_use,
-            has_errors: false,
+            has_errors: doc.has_errors,
             summary,
             is_renamed: doc.title.is_some(),
             provider: Some(f.provider_id.to_string()),
@@ -405,6 +410,8 @@ struct SessionDoc {
     workspace_directory: Option<String>,
     first_user_text: Option<String>,
     has_tool_use: bool,
+    /// A tool call ended `errored` or `canceled`.
+    has_errors: bool,
     messages: Vec<ClaudeMessage>,
 }
 
@@ -427,11 +434,13 @@ fn parse_session_doc(
         .filter(|s| !s.is_empty())
         .unwrap_or(fallback_session_id)
         .to_string();
+    // Placeholders, not names: the extension's `NEW_SESSION_TITLE` and the
+    // CLI's `DEFAULT_SESSION_TITLE`.
     let title = obj
         .get("title")
         .and_then(Value::as_str)
         .map(str::to_string)
-        .filter(|t| !t.trim().is_empty());
+        .filter(|t| !t.trim().is_empty() && !PLACEHOLDER_TITLES.contains(&t.trim()));
     let workspace_directory = obj
         .get("workspaceDirectory")
         .and_then(Value::as_str)
@@ -442,6 +451,10 @@ fn parse_session_doc(
     let mut messages = Vec::new();
     let mut first_user_text: Option<String> = None;
     let mut has_tool_use = false;
+    let mut has_errors = false;
+    // Results already shown from a call's `toolCallStates`, so a separate
+    // `role: "tool"` item for the same call is not shown twice.
+    let mut shown_results: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut idx = 0u64;
 
     if let Some(history) = history {
@@ -452,18 +465,54 @@ fn parse_session_doc(
             let Some(role) = message.get("role").and_then(Value::as_str) else {
                 continue;
             };
-            if !matches!(role, "user" | "assistant" | "system") {
-                continue;
-            }
 
-            let content = message.get("content").cloned();
-
-            if first_user_text.is_none() && role == "user" {
-                first_user_text = content.as_ref().and_then(extract_text);
-            }
-            if item_has_tool_use(item) {
-                has_tool_use = true;
-            }
+            let (role, content) = match role {
+                "user" | "system" => {
+                    let content = message.get("content").cloned();
+                    if first_user_text.is_none() && role == "user" {
+                        first_user_text = content.as_ref().and_then(extract_text);
+                    }
+                    (role, content)
+                }
+                "assistant" => {
+                    let blocks = assistant_blocks(item, message, &mut shown_results);
+                    has_tool_use |= blocks.iter().any(|b| b["type"] == "tool_use");
+                    has_errors |= blocks.iter().any(|b| b["is_error"] == true);
+                    if blocks.is_empty() {
+                        continue;
+                    }
+                    (role, Some(Value::Array(blocks)))
+                }
+                "thinking" => {
+                    let Some(text) = message.get("content").and_then(extract_text) else {
+                        continue;
+                    };
+                    (
+                        "assistant",
+                        Some(serde_json::json!([{"type": "thinking", "thinking": text}])),
+                    )
+                }
+                "tool" => {
+                    let id = message
+                        .get("toolCallId")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if shown_results.contains(id) {
+                        continue;
+                    }
+                    let text = message
+                        .get("content")
+                        .and_then(extract_text)
+                        .unwrap_or_default();
+                    (
+                        "user",
+                        Some(serde_json::json!([
+                            {"type": "tool_result", "tool_use_id": id, "content": text}
+                        ])),
+                    )
+                }
+                _ => continue,
+            };
 
             messages.push(build_provider_message(
                 provider_id,
@@ -485,31 +534,126 @@ fn parse_session_doc(
         workspace_directory,
         first_user_text,
         has_tool_use,
+        has_errors,
         messages,
     })
 }
 
-/// True if a history item carries tool calls (Continue `toolCallStates`) or a
-/// tool-use content part.
-fn item_has_tool_use(item: &Value) -> bool {
-    if item
+/// An assistant history item as content blocks: its reasoning, its text,
+/// then each tool call with its result.
+///
+/// A call and its result come from the item's `toolCallStates`
+/// (`ToolCallState {toolCallId, toolCall: {function: {name, arguments}},
+/// status, parsedArgs, output?: ContextItem[]}`); a call the message lists in
+/// `toolCalls` without a state is shown without a result. A call whose
+/// status is `errored` or `canceled` is a failure.
+fn assistant_blocks(
+    item: &Value,
+    message: &Value,
+    shown_results: &mut std::collections::HashSet<String>,
+) -> Vec<Value> {
+    let mut blocks = Vec::new();
+    if let Some(text) = item
+        .get("reasoning")
+        .and_then(|r| r.get("text"))
+        .and_then(Value::as_str)
+        .filter(|t| !t.trim().is_empty())
+    {
+        blocks.push(serde_json::json!({"type": "thinking", "thinking": text}));
+    }
+    match message.get("content") {
+        Some(Value::String(text)) if !text.trim().is_empty() => {
+            blocks.push(serde_json::json!({"type": "text", "text": text}));
+        }
+        Some(Value::Array(parts)) => blocks.extend(parts.iter().cloned()),
+        _ => {}
+    }
+
+    let states = item
         .get("toolCallStates")
         .and_then(Value::as_array)
-        .is_some_and(|a| !a.is_empty())
-    {
-        return true;
-    }
-    item.get("message")
-        .and_then(|m| m.get("content"))
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let listed = message
+        .get("toolCalls")
         .and_then(Value::as_array)
-        .is_some_and(|parts| {
-            parts.iter().any(|p| {
-                matches!(
-                    p.get("type").and_then(Value::as_str),
-                    Some("tool_use" | "toolUse")
-                )
-            })
-        })
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    let state_ids: std::collections::HashSet<&str> = states
+        .iter()
+        .filter_map(|s| s.get("toolCallId").and_then(Value::as_str))
+        .collect();
+
+    for state in states {
+        let call = state.get("toolCall").unwrap_or(&Value::Null);
+        let id = state
+            .get("toolCallId")
+            .or_else(|| call.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let input = state
+            .get("parsedArgs")
+            .filter(|args| args.is_object())
+            .cloned()
+            .unwrap_or_else(|| call_arguments(call));
+        blocks.push(serde_json::json!({
+            "type": "tool_use",
+            "id": id,
+            "name": call_name(call),
+            "input": input,
+        }));
+        if let Some(output) = state.get("output").and_then(Value::as_array) {
+            let text = output
+                .iter()
+                .filter_map(|ctx| ctx.get("content").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let mut result = serde_json::json!({
+                "type": "tool_result",
+                "tool_use_id": id,
+                "content": text,
+            });
+            if matches!(
+                state.get("status").and_then(Value::as_str),
+                Some("errored" | "canceled")
+            ) {
+                result["is_error"] = Value::Bool(true);
+            }
+            blocks.push(result);
+            shown_results.insert(id.to_string());
+        }
+    }
+    for call in listed {
+        let id = call.get("id").and_then(Value::as_str).unwrap_or_default();
+        if state_ids.contains(id) {
+            continue;
+        }
+        blocks.push(serde_json::json!({
+            "type": "tool_use",
+            "id": id,
+            "name": call_name(call),
+            "input": call_arguments(call),
+        }));
+    }
+    blocks
+}
+
+fn call_name(call: &Value) -> &str {
+    call.get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        .unwrap_or("tool")
+}
+
+/// `function.arguments`, a JSON string, as an object (`{}` when it does not
+/// parse to one).
+fn call_arguments(call: &Value) -> Value {
+    call.get("function")
+        .and_then(|f| f.get("arguments"))
+        .and_then(Value::as_str)
+        .and_then(|args| serde_json::from_str::<Value>(args).ok())
+        .filter(Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}))
 }
 
 /// Concatenate the text of a `content` value (plain string, or an array of
@@ -744,7 +888,7 @@ mod tests {
             "sessionId": "x",
             "history": [
                 { "message": { "role": "user", "content": "ok" } },
-                { "message": { "role": "tool", "content": "ignored" } },
+                { "message": { "role": "function", "content": "ignored" } },
                 { "contextItems": [] },
                 { "message": { "content": "no role" } }
             ]
@@ -835,5 +979,99 @@ mod tests {
                 assert_eq!(hit.project_name.as_deref(), Some("app"));
             }
         }
+    }
+
+    /// A session the Continue CLI 1.5.47 wrote (`cn -p … --auto` against a
+    /// scripted model): Bash `seq 1 5`, Bash exiting 3, Read of a missing
+    /// file, then List and Search in one turn. Only the workspace path is
+    /// rewritten.
+    const CLI_SESSION: &str = include_str!("../../tests/fixtures/continue-cli-1.5.47-tools.json");
+
+    #[test]
+    fn recorded_tool_calls_show_with_their_results_and_failures() {
+        let doc = parse_session_doc(CLI_SESSION, "continue", "x", "").unwrap();
+        // The prompt and five replies; none is empty.
+        assert_eq!(doc.messages.len(), 6);
+        assert!(doc.has_tool_use);
+        assert!(doc.has_errors);
+
+        let blocks = |i: usize| doc.messages[i].content.clone().unwrap();
+        let seq = blocks(1);
+        assert_eq!(seq[0]["type"], "tool_use");
+        assert_eq!(seq[0]["name"], "Bash");
+        assert_eq!(seq[0]["input"], serde_json::json!({"command": "seq 1 5"}));
+        assert_eq!(seq[1]["type"], "tool_result");
+        assert_eq!(seq[1]["tool_use_id"], seq[0]["id"]);
+        assert_eq!(seq[1]["content"], "1\n2\n3\n4\n5\n");
+        assert!(seq[1].get("is_error").is_none());
+
+        let failed = blocks(2);
+        assert_eq!(failed[1]["is_error"], true);
+        assert!(failed[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("exit code 3"));
+
+        let two = blocks(4);
+        let kinds: Vec<&str> = two
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|b| b["type"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            kinds,
+            ["tool_use", "tool_result", "tool_use", "tool_result"]
+        );
+        assert_eq!(blocks(5)[0]["text"], "All steps done.");
+
+        // "Untitled Session" is the CLI's placeholder: the prompt titles it.
+        assert_eq!(doc.title, None);
+        assert_eq!(
+            doc.first_user_text.as_deref(),
+            Some("RUN-T please run the steps")
+        );
+    }
+
+    #[test]
+    fn reasoning_thinking_items_and_tool_items_are_shown_once() {
+        let data = serde_json::json!({
+            "sessionId": "s",
+            "title": "New Session",
+            "history": [
+                {"message": {"role": "user", "content": "go"}},
+                {"message": {"role": "thinking", "content": "Plan first."}},
+                {"message": {"role": "assistant", "content": "",
+                    "toolCalls": [{"id": "c1", "type": "function",
+                        "function": {"name": "Read", "arguments": "{\"filepath\":\"a\"}"}}]},
+                 "reasoning": {"active": false, "text": "Need the file."}},
+                {"message": {"role": "tool", "toolCallId": "c1", "content": "file a"}},
+                {"message": {"role": "assistant", "content": "ok"},
+                 "toolCallStates": [{"toolCallId": "c2",
+                    "toolCall": {"id": "c2", "function": {"name": "Bash", "arguments": "{}"}},
+                    "status": "canceled", "parsedArgs": {"command": "rm -rf /"},
+                    "output": [{"content": "Canceled by the user"}]}]},
+                {"message": {"role": "tool", "toolCallId": "c2", "content": "Canceled by the user"}}
+            ]
+        })
+        .to_string();
+        let doc = parse_session_doc(&data, "continue", "s", "").unwrap();
+        let content: Vec<Value> = doc
+            .messages
+            .iter()
+            .map(|m| m.content.clone().unwrap())
+            .collect();
+
+        assert_eq!(content[1][0]["thinking"], "Plan first.");
+        assert_eq!(content[2][0]["thinking"], "Need the file.");
+        // A call listed on the message, with no state: no result there...
+        assert_eq!(content[2][1]["input"], serde_json::json!({"filepath": "a"}));
+        // ...so the tool item carries it.
+        assert_eq!(content[3][0]["type"], "tool_result");
+        assert_eq!(content[3][0]["tool_use_id"], "c1");
+        // A canceled call is a failure, and its tool item is not repeated.
+        assert_eq!(content[4][2]["is_error"], true);
+        assert_eq!(doc.messages.len(), 5);
+        assert_eq!(doc.title, None, "\"New Session\" is a placeholder");
     }
 }
