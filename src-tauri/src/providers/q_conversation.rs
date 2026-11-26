@@ -293,7 +293,7 @@ fn canonical_tool(name: &str, args: Value) -> (String, Value) {
                 None => &args,
             };
             match (op.get("mode").and_then(Value::as_str), path(op)) {
-                (Some("Line"), Some(_)) => ("Read".into(), op.clone()),
+                (Some("Line"), Some(_)) => ("Read".into(), with_read_range(op.clone())),
                 _ => (name.into(), args),
             }
         }
@@ -326,6 +326,23 @@ fn canonical_tool(name: &str, args: Value) -> (String, Value) {
         "web_fetch" => ("WebFetch".into(), args),
         _ => (name.into(), args),
     }
+}
+
+/// A `Line` read's 1-based `start_line`/`end_line` as the Read card's
+/// `offset`/`limit`, when both are positive (`end_line: -1` means the end of
+/// the file, which has no length to show).
+fn with_read_range(mut op: Value) -> Value {
+    let line = |key: &str| op.get(key).and_then(Value::as_i64).filter(|n| *n >= 1);
+    let (start, end) = (line("start_line"), line("end_line"));
+    if let Some(map) = op.as_object_mut() {
+        if let Some(start) = start {
+            map.insert("offset".into(), start.into());
+            if let Some(end) = end.filter(|end| *end >= start) {
+                map.insert("limit".into(), (end - start + 1).into());
+            }
+        }
+    }
+    op
 }
 
 #[cfg(test)]
@@ -458,6 +475,9 @@ mod tests {
         let read = call("r1");
         assert_eq!(read["name"], "Read");
         assert_eq!(read["input"]["path"], "/repo/a.rs");
+        // Lines 1–20 as the Read card's range.
+        assert_eq!(read["input"]["offset"], 1);
+        assert_eq!(read["input"]["limit"], 20);
         // A directory listing is not a file read.
         assert_eq!(call("r2")["name"], "fs_read");
         assert_eq!(
