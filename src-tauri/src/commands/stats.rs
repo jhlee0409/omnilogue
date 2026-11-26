@@ -9007,20 +9007,20 @@ mod tests {
 
     /// Kilo Code is wired into per-project/session stats but was missing from
     /// `get_global_stats_summary`'s per-provider collection, so a Kilo-only
-    /// store produced an empty global summary (PR #580 review). `KILO_HOME`
+    /// store produced an empty global summary (PR #580 review). `KILO_DB`
     /// points the provider at a fixture `kilo.db`.
     #[tokio::test]
     #[serial]
     async fn test_global_summary_includes_kilo_store() {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let kilo_home = temp_dir.path().join("kilo");
-        fs::create_dir_all(&kilo_home).expect("create KILO_HOME");
+        fs::create_dir_all(&kilo_home).expect("create the Kilo store");
         {
             let conn = providers::kilo::test_support::create_test_db(&kilo_home);
             providers::kilo::test_support::seed(&conn);
             providers::kilo::test_support::seed_assistant_usage(&conn, 100, 50);
         }
-        let _kilo_home = EnvVarGuard::set("KILO_HOME", &kilo_home);
+        let _kilo_db = EnvVarGuard::set("KILO_DB", &kilo_home.join("kilo.db"));
 
         // claude_path is required but the Claude projects subtree is empty —
         // only the Kilo branch of the global summary is exercised.
@@ -9058,7 +9058,7 @@ mod tests {
         let _home = crate::test_utils::SandboxHome::new();
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let kilo_home = temp_dir.path().join("kilo");
-        fs::create_dir_all(&kilo_home).expect("create KILO_HOME");
+        fs::create_dir_all(&kilo_home).expect("create the Kilo store");
         {
             let conn = providers::kilo::test_support::create_test_db(&kilo_home);
             providers::kilo::test_support::seed(&conn);
@@ -9080,7 +9080,7 @@ mod tests {
             )
             .unwrap();
         }
-        let _kilo_home = EnvVarGuard::set("KILO_HOME", &kilo_home);
+        let _kilo_db = EnvVarGuard::set("KILO_DB", &kilo_home.join("kilo.db"));
         let session_path = "kilo://proj1/ses_001".to_string();
 
         let billing = get_session_token_stats(

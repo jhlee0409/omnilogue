@@ -25,6 +25,29 @@ const EXTENSIONS: &[(&str, &str)] = &[
     ("kilocode.kilo-code", "Kilo Code"),
 ];
 
+/// Kilo Code's own legacy CLI ran the extension against a mock VS Code whose
+/// global storage is `~/.kilocode/cli/global` (`Kilo-Org/kilocode-legacy`
+/// `packages/agent-runtime/src/utils/paths.ts` `getGlobalStorageDir`): the
+/// same `tasks/<id>/` files, with the extension's globalState in
+/// `global-state.json` instead of `state.vscdb`.
+const KILO_CLI_GLOBAL: &str = ".kilocode/cli/global";
+
+/// Kilo Code's legacy CLI store, when it is a real directory.
+fn kilo_cli_base(report: &ScanReport) -> Option<PathBuf> {
+    let home = crate::utils::home_dir()?;
+    let kilocode = home.join(".kilocode");
+    let cli = kilocode.join("cli");
+    let global = cli.join("global");
+    let real = [&kilocode, &cli, &global]
+        .iter()
+        .all(|dir| !is_symlink(dir));
+    (real && report.is_dir(&global)).then_some(global)
+}
+
+fn is_kilo_cli_base(base_path: &Path) -> bool {
+    base_path.ends_with(KILO_CLI_GLOBAL)
+}
+
 /// Detect Cline/Roo Code installations
 pub fn detect() -> Option<ProviderInfo> {
     let paths = get_all_base_paths();
@@ -485,10 +508,14 @@ fn get_all_base_paths() -> Vec<(PathBuf, String)> {
 
 /// [`get_all_base_paths`], recording in `report` what it could not look at.
 fn get_all_base_paths_reporting(report: &ScanReport) -> Vec<(PathBuf, String)> {
-    editor_data_roots()
+    let mut paths: Vec<(PathBuf, String)> = editor_data_roots()
         .iter()
         .flat_map(|root| collect_base_paths_under(root, report))
-        .collect()
+        .collect();
+    if let Some(base) = kilo_cli_base(report) {
+        paths.push((base, "Kilo Code (CLI)".to_string()));
+    }
+    paths
 }
 
 /// A task's working directory. Cline names this `cwdOnTaskInitialization`; the
@@ -538,6 +565,27 @@ fn truncate_chars(text: &str, max_chars: usize, suffix: &str) -> String {
 /// cannot be read is recorded in `report`; one that does not parse is not
 /// an index.
 fn load_task_history(base_path: &Path, report: &ScanReport) -> Vec<Value> {
+    let history = read_task_history(base_path, report);
+    // Kilo's extension copies a legacy task into its own store and keeps the
+    // original; the copy is the one Kilo shows, so it is read there
+    // (`providers::kilo`), not twice.
+    if base_path.ends_with("kilocode.kilo-code") && !history.is_empty() {
+        let migrated = crate::providers::kilo::migrated_task_ids();
+        if !migrated.is_empty() {
+            return history
+                .into_iter()
+                .filter(|item| {
+                    item.get("id")
+                        .and_then(Value::as_str)
+                        .is_none_or(|id| !migrated.contains(id))
+                })
+                .collect();
+        }
+    }
+    history
+}
+
+fn read_task_history(base_path: &Path, report: &ScanReport) -> Vec<Value> {
     // Cline format: state/taskHistory.json
     let cline_path = base_path.join("state/taskHistory.json");
     if report.is_file(&cline_path) {
@@ -562,6 +610,16 @@ fn load_task_history(base_path: &Path, report: &ScanReport) -> Vec<Value> {
                 }
             }
         }
+    }
+
+    // Kilo's legacy CLI keeps the extension's globalState in a JSON file.
+    if is_kilo_cli_base(base_path) {
+        let memento = base_path.join("global-state.json");
+        return report
+            .read_to_string(&memento)
+            .and_then(|data| serde_json::from_str::<Value>(&data).ok())
+            .and_then(|state| state.get("taskHistory")?.as_array().cloned())
+            .unwrap_or_default();
     }
 
     // Kilo Code (and modern Cline/Roo before they flush to disk) keep the task
@@ -639,6 +697,7 @@ fn parse_base_and_tail(path: &str) -> Result<(PathBuf, String), String> {
             EXTENSIONS
                 .iter()
                 .any(|(ext_id, _)| rest[..i].ends_with(ext_id))
+                || is_kilo_cli_base(Path::new(&rest[..i]))
         })
         .map(|i| (PathBuf::from(&rest[..i]), rest[i + 1..].to_string()));
     at_extension
@@ -1201,9 +1260,12 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_load_task_history_from_kilo_global_state() {
         use rusqlite::params;
 
+        // Loading a Kilo index also looks for tasks Kilo copied into kilo.db.
+        let _home = crate::test_utils::SandboxHome::new();
         let tmp = tempfile::TempDir::new().unwrap();
         let global_storage = tmp.path().join("globalStorage");
         let ext_dir = global_storage.join("kilocode.kilo-code");
@@ -1245,6 +1307,91 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(task_cwd(&history[0]), Some("/Users/jack/proj"));
         assert_eq!(history[0]["task"], "Implement Kilo");
+    }
+
+    /// Kilo's extension copies a legacy task into `kilo.db` as
+    /// `ses_migrated_…` (slug = task id) and keeps the original: the copy is
+    /// Kilo's, so the legacy reader lists only tasks that were not copied.
+    #[test]
+    #[serial_test::serial]
+    fn kilo_tasks_copied_into_kilo_db_are_left_to_the_kilo_reader() {
+        let home = crate::test_utils::SandboxHome::new();
+        let ext_dir = crate::utils::config_dir()
+            .unwrap()
+            .join("Code/User/globalStorage/kilocode.kilo-code");
+        fs::create_dir_all(&ext_dir).unwrap();
+        let conn = Connection::open(ext_dir.parent().unwrap().join("state.vscdb")).unwrap();
+        conn.execute(
+            "CREATE TABLE ItemTable (key TEXT UNIQUE ON CONFLICT REPLACE, value BLOB)",
+            [],
+        )
+        .unwrap();
+        let history = json!({"taskHistory": [
+            {"id": "copied", "ts": 1, "task": "a", "workspace": "/w"},
+            {"id": "kept", "ts": 2, "task": "b", "workspace": "/w"}
+        ]});
+        conn.execute(
+            "INSERT INTO ItemTable (key, value) VALUES ('kilocode.kilo-code', ?1)",
+            [history.to_string()],
+        )
+        .unwrap();
+
+        let kilo = home.path().join(".local/share/kilo");
+        fs::create_dir_all(&kilo).unwrap();
+        let db = crate::providers::kilo::test_support::create_test_db(&kilo);
+        db.execute(
+            "INSERT INTO session (id, project_id, slug, title, time_created, time_updated)
+             VALUES ('ses_migrated_abc', 'p', 'copied', 'a', 1, 1)",
+            [],
+        )
+        .unwrap();
+
+        let ids = || -> Vec<String> {
+            load_task_history(&ext_dir, &ScanReport::default())
+                .iter()
+                .map(|item| item["id"].as_str().unwrap().to_string())
+                .collect()
+        };
+        assert_eq!(ids(), ["kept"]);
+
+        // A symlinked `storage` makes the Kilo scan list nothing, so the
+        // legacy entry must stay visible.
+        #[cfg(unix)]
+        {
+            let elsewhere = home.path().join("elsewhere");
+            fs::create_dir_all(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, kilo.join("storage")).unwrap();
+            assert_eq!(ids(), ["copied", "kept"]);
+        }
+    }
+
+    /// Kilo's legacy CLI: `~/.kilocode/cli/global/tasks/<id>/` with the task
+    /// index in `global-state.json`.
+    #[test]
+    #[serial_test::serial]
+    fn kilo_legacy_cli_tasks_are_listed_and_loaded() {
+        let home = crate::test_utils::SandboxHome::new();
+        let base = home.path().join(".kilocode/cli/global");
+        write_task(&base, "1700000000000");
+        fs::write(
+            base.join("global-state.json"),
+            json!({"taskHistory": [{
+                "id": "1700000000000", "ts": 1_700_000_000_000u64,
+                "task": "fix the build", "workspace": "/work/cli-app"
+            }]})
+            .to_string(),
+        )
+        .unwrap();
+
+        let project = scan_projects()
+            .unwrap()
+            .into_iter()
+            .find(|p| p.actual_path == "/work/cli-app")
+            .expect("the CLI store is scanned");
+        let sessions = load_sessions(&project.path, false).unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].summary.as_deref(), Some("fix the build"));
+        assert!(!load_messages(&sessions[0].session_id).unwrap().is_empty());
     }
 
     #[test]

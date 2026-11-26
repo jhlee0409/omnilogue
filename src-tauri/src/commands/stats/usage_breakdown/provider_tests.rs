@@ -560,9 +560,11 @@ async fn opencode_core_subagent_runs_roll_up_into_their_session_everywhere() {
     use crate::commands::stats::get_session_comparison;
     use crate::providers::kilo::test_support as store;
 
-    for (provider, home_var, db_file) in [
-        ("kilo", "KILO_HOME", "kilo.db"),
-        ("opencode", "OPENCODE_HOME", "opencode.db"),
+    // `env_is_db`: Kilo's variable names the database file, OpenCode's the
+    // store directory.
+    for (provider, store_var, env_is_db, db_file) in [
+        ("kilo", "KILO_DB", true, "kilo.db"),
+        ("opencode", "OPENCODE_HOME", false, "opencode.db"),
     ] {
         let home = SandboxHome::new();
         let store_root = home.path().join(provider);
@@ -575,7 +577,12 @@ async fn opencode_core_subagent_runs_roll_up_into_their_session_everywhere() {
             store::seed_subagent_run(&conn, "ses_grandchild", "ses_child", 2, 1); // 3
             store::seed_subagent_run(&conn, "ses_orphan", "ses_gone", 5, 5); // 10
         }
-        let _store = EnvGuard::set(home_var, &store_root);
+        let store_env = if env_is_db {
+            store_root.join(db_file)
+        } else {
+            store_root.clone()
+        };
+        let _store = EnvGuard::set(store_var, &store_env);
         let project_path = format!("{provider}://proj1");
         let session_path = format!("{provider}://proj1/ses_001");
 

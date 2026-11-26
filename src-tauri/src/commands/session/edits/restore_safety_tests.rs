@@ -186,21 +186,26 @@ async fn codex_delete_file_restore_does_not_recreate_the_file_as_patch_text() {
 // OpenCode and Kilo share one SQLite loader (`opencode::load_messages_at`).
 // ---------------------------------------------------------------------------
 
-/// Where a store lives and how its project paths are spelled.
+/// Where a store lives and how its project paths are spelled. `env` names
+/// the store directory (`OPENCODE_HOME`) or, with `env_is_db`, the database
+/// file itself (`KILO_DB`).
 struct SqliteStore {
-    home_env: &'static str,
+    env: &'static str,
+    env_is_db: bool,
     db_file: &'static str,
     scheme: &'static str,
 }
 
 const OPENCODE: SqliteStore = SqliteStore {
-    home_env: "OPENCODE_HOME",
+    env: "OPENCODE_HOME",
+    env_is_db: false,
     db_file: "opencode.db",
     scheme: "opencode",
 };
 
 const KILO: SqliteStore = SqliteStore {
-    home_env: "KILO_HOME",
+    env: "KILO_DB",
+    env_is_db: true,
     db_file: "kilo.db",
     scheme: "kilo",
 };
@@ -267,7 +272,12 @@ async fn restore_store_tool_call(
 ) -> Result<(), String> {
     let home = SandboxHome::new();
     let base = home.path().join(".local").join("share").join(store.scheme);
-    let _g = EnvVarGuard::set(store.home_env, &base);
+    let env_value = if store.env_is_db {
+        base.join(store.db_file)
+    } else {
+        base.clone()
+    };
+    let _g = EnvVarGuard::set(store.env, &env_value);
     let project = home.path().join("work").join("repo");
     fs::create_dir_all(project.join("src")).unwrap();
     let target = project.join("src").join("lib.rs");

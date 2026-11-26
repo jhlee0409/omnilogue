@@ -310,14 +310,12 @@ pub(crate) fn opencode_fixture(
         ),
     );
     std::fs::create_dir_all(&root).unwrap();
-    let env = StoreEnv::set(
-        if provider == "kilo" {
-            "KILO_HOME"
-        } else {
-            "OPENCODE_HOME"
-        },
-        &root,
-    );
+    // Kilo is pointed at its database file, OpenCode at its directory.
+    let env = if provider == "kilo" {
+        StoreEnv::set("KILO_DB", &root.join("kilo.db"))
+    } else {
+        StoreEnv::set("OPENCODE_HOME", &root)
+    };
     let parts: Value = serde_json::from_str(include_str!(
         "../../tests/fixtures/tool-result-evidence-opencode.json"
     ))
