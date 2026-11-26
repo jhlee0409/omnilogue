@@ -95,7 +95,8 @@ fn is_safe_session_id(id: &str) -> bool {
 
 /// What deleting one Cursor Agent CLI session removes.
 pub(super) struct CursorAgentTargets {
-    /// The `<projects>/<project>/agent-transcripts/<id>/` folder.
+    /// The `<projects>/<project>/agent-transcripts/<id>/` folder, or the
+    /// older flat `agent-transcripts/<id>.jsonl` file.
     pub session_dir: PathBuf,
     /// The `<project>` folder name the transcript sits in.
     pub project: String,
@@ -104,11 +105,12 @@ pub(super) struct CursorAgentTargets {
 }
 
 /// Cursor Agent CLI session: `<projects>/<project>/agent-transcripts/<id>/<id>.jsonl`
-/// plus the CLI's chat metadata at `<chats>/<workspace-hash>/<id>/`.
+/// (or the older flat `agent-transcripts/<id>.jsonl`) plus the CLI's chat
+/// metadata at `<chats>/<workspace-hash>/<id>/`.
 ///
 /// The delete target is resolved here from the transcript path and must be the
-/// `<id>/` transcript folder strictly inside `projects_root`; the metadata
-/// folders must be strictly inside `chats_root`.
+/// `<id>/` transcript folder (the flat file itself) strictly inside
+/// `projects_root`; the metadata folders must be strictly inside `chats_root`.
 pub(super) fn resolve_cursor_agent_targets(
     projects_root: &Path,
     chats_root: Option<&Path>,
@@ -121,23 +123,33 @@ pub(super) fn resolve_cursor_agent_targets(
     }
 
     let (root, parts) = components_inside(projects_root, transcript)?;
-    let [project, transcripts, id, file] = parts.as_slice() else {
-        return Err("Not a Cursor Agent transcript path".to_string());
+    let (project, transcripts, id, session_dir) = match parts.as_slice() {
+        [project, transcripts, id, file] if *file == format!("{id}.jsonl") => (
+            project,
+            transcripts,
+            id.clone(),
+            root.join(project).join(transcripts).join(id),
+        ),
+        [project, transcripts, file] => (
+            project,
+            transcripts,
+            file.strip_suffix(".jsonl").unwrap_or_default().to_string(),
+            root.join(project).join(transcripts).join(file),
+        ),
+        _ => return Err("Not a Cursor Agent transcript path".to_string()),
     };
     if transcripts != "agent-transcripts"
-        || !is_safe_session_id(id)
-        || *file != format!("{id}.jsonl")
+        || !is_safe_session_id(&id)
         || !crate::utils::is_safe_storage_id(project)
     {
         return Err("Not a Cursor Agent transcript path".to_string());
     }
-    let session_dir = root.join(project).join(transcripts).join(id);
 
     let metadata_dirs: Vec<PathBuf> = match chats_root.map(Path::canonicalize) {
         Some(Ok(chats)) => fs::read_dir(&chats)
             .map_err(|e| format!("Failed to read Cursor Agent chats: {e}"))?
             .filter_map(Result::ok)
-            .map(|workspace| workspace.path().join(id))
+            .map(|workspace| workspace.path().join(&id))
             .filter(|dir| {
                 fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
             })
@@ -432,6 +444,24 @@ mod tests {
         assert!(other_dir.exists());
         assert!(other_meta.exists());
         assert!(session_dir.parent().unwrap().is_dir());
+    }
+
+    /// The older flat `agent-transcripts/<id>.jsonl` is the session itself.
+    #[tokio::test]
+    #[serial]
+    async fn cursor_agent_delete_trashes_a_legacy_flat_transcript() {
+        let home = crate::test_utils::SandboxHome::new();
+        let id = "flat-1";
+        let (_, current_dir, _) = cursor_agent_session(home.path(), "keep-me");
+        let flat = current_dir.parent().unwrap().join(format!("{id}.jsonl"));
+        fs::write(&flat, "{}\n").unwrap();
+        let meta_dir = home.path().join(".cursor/chats/0123abcd").join(id);
+        fs::create_dir_all(&meta_dir).unwrap();
+
+        delete_session(flat.to_string_lossy().into()).await.unwrap();
+        assert!(!flat.exists());
+        assert!(!meta_dir.exists());
+        assert!(current_dir.exists());
     }
 
     /// Only `<id>/<id>.jsonl` names a Cursor Agent session; any other path
