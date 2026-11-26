@@ -2330,6 +2330,27 @@ fn zed_subagents(session_path: &str) -> Result<Vec<SubagentSession>, String> {
         .collect())
 }
 
+/// Subagent rows for a Copilot CLI / Desktop `events.jsonl`: the `task` runs
+/// Copilot writes into the same file, tagged with an `agentId` (#853). Each
+/// opens as `<events.jsonl>#agent=<agentId>` through the Copilot reader and
+/// is linked to the `task` call that started it.
+fn copilot_subagents(session_path: &str) -> Result<Vec<SubagentSession>, String> {
+    Ok(crate::providers::copilot_cli::load_subagents(session_path)?
+        .into_iter()
+        .map(|run| SubagentSession {
+            file_path: run.file_path,
+            tool_use_id: run.tool_call_id,
+            agent_id: run.agent_id,
+            message_count: run.message_count,
+            file_size: 0,
+            first_message_time: run.first_message_time,
+            last_message_time: run.last_message_time,
+            summary: run.title,
+            workflow_run_id: None,
+        })
+        .collect())
+}
+
 /// Returns subagent sessions for a given parent session file.
 #[tauri::command]
 pub async fn get_session_subagents(session_path: String) -> Result<Vec<SubagentSession>, String> {
@@ -2354,6 +2375,10 @@ pub async fn get_session_subagents(session_path: String) -> Result<Vec<SubagentS
 
     if session_path.starts_with("zed://") {
         return zed_subagents(&session_path);
+    }
+
+    if crate::providers::copilot_cli::is_session_path(&session_path) {
+        return copilot_subagents(&session_path);
     }
 
     // Other providers' files, and prompt-history sessions (#764): only the
