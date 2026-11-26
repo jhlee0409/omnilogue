@@ -2,14 +2,19 @@
 //!
 //! VS Code stores Copilot Chat conversations per workspace, under
 //! `<UserData>/workspaceStorage/<hash>/chatSessions/<sessionUuid>.jsonl`.
-//! Each `.jsonl` file is *not* a stream of messages — it's an append-only
-//! patch log on top of an initial snapshot:
+//! A window without a folder writes to
+//! `<UserData>/globalStorage/emptyWindowChatSessions/` instead (older builds
+//! used `workspaceStorage/no-workspace/chatSessions/`); those sessions form one
+//! project. Each `.jsonl` file is *not* a stream of messages — it's an
+//! append-only patch log on top of an initial snapshot
+//! (`objectMutationLog.ts`):
 //!
 //! * line 1, `kind: 0`: full session snapshot
 //!   (`requests[]`, `sessionId`, `creationDate`, `inputState`, …)
-//! * subsequent `kind: 1`: set value at `k: ["a", "b", 2, …]` to `v`
-//! * subsequent `kind: 2`: append every item of `v` (an array) to the
-//!   array at path `k`
+//! * `kind: 1`: set value at `k: ["a", "b", 2, …]` to `v`
+//! * `kind: 2`: truncate the array at `k` to `i` when given, then append
+//!   every item of `v` when given
+//! * `kind: 3`: unset the value at `k` (an array keeps the slot)
 //!
 //! We replay the log into an in-memory `serde_json::Value` to recover the
 //! final session state, then iterate `requests[]` to emit user/assistant
@@ -43,9 +48,9 @@ struct UserDataRoot {
 pub fn detect() -> Option<ProviderInfo> {
     let roots = get_user_data_roots();
     let base = roots.first()?.path.clone();
-    let is_available = roots
-        .iter()
-        .any(|root| root.path.join("workspaceStorage").is_dir());
+    let is_available = roots.iter().any(|root| {
+        root.path.join("workspaceStorage").is_dir() || empty_window_dir(&root.path).is_dir()
+    });
     Some(ProviderInfo {
         id: PROVIDER_ID.to_string(),
         display_name: "VS Code".to_string(),
@@ -128,16 +133,13 @@ fn user_data_roots(report: &ScanReport) -> Vec<UserDataRoot> {
         .collect()
 }
 
-fn get_workspace_storage_roots() -> Result<Vec<PathBuf>, String> {
-    let roots = get_base_paths()
+/// The dirs chat sessions may be read from: every `workspaceStorage` and
+/// empty-window session dir.
+fn get_storage_roots() -> Vec<PathBuf> {
+    get_base_paths()
         .into_iter()
-        .map(|base| base.join("workspaceStorage"))
-        .collect::<Vec<_>>();
-    if roots.is_empty() {
-        Err("VS Code user data directory not found".to_string())
-    } else {
-        Ok(roots)
-    }
+        .flat_map(|base| [base.join("workspaceStorage"), empty_window_dir(&base)])
+        .collect()
 }
 
 fn is_wsl_unc_path(path: &Path) -> bool {
@@ -161,24 +163,28 @@ fn is_within_any_root(canonical: &Path, roots: &[PathBuf]) -> bool {
     false
 }
 
-fn is_wsl_workspace_storage_path(path: &Path) -> bool {
+fn is_wsl_chat_storage_path(path: &Path) -> bool {
     if !is_wsl_unc_path(path) {
         return false;
     }
     let path = path.to_string_lossy().replace('/', "\\");
     [
-        r"\.vscode-server\data\User\workspaceStorage\",
-        r"\.vscode-server-insiders\data\User\workspaceStorage\",
-        r"\.vscodium-server\data\User\workspaceStorage\",
+        r"\.vscode-server\data\User\",
+        r"\.vscode-server-insiders\data\User\",
+        r"\.vscodium-server\data\User\",
     ]
     .iter()
-    .any(|segment| path.contains(segment))
+    .any(|user_data| {
+        [
+            r"workspaceStorage\",
+            r"globalStorage\emptyWindowChatSessions",
+        ]
+        .iter()
+        .any(|dir| path.contains(&format!("{user_data}{dir}")))
+    })
 }
 
-fn validate_workspace_path_in(
-    raw: &str,
-    workspace_storage_roots: &[PathBuf],
-) -> Result<PathBuf, String> {
+fn validate_workspace_path_in(raw: &str, storage_roots: &[PathBuf]) -> Result<PathBuf, String> {
     let ws_path = raw.strip_prefix("vscode://").unwrap_or(raw);
     let path = PathBuf::from(ws_path);
     if !path.is_absolute() {
@@ -189,19 +195,14 @@ fn validate_workspace_path_in(
         .canonicalize()
         .map_err(|e| format!("Failed to resolve VS Code workspace path: {e}"))?;
 
-    if !is_within_any_root(&canonical, workspace_storage_roots)
-        && !is_wsl_workspace_storage_path(&canonical)
-    {
-        return Err("VS Code workspace path is outside workspaceStorage".to_string());
+    if !is_within_any_root(&canonical, storage_roots) && !is_wsl_chat_storage_path(&canonical) {
+        return Err("VS Code workspace path is outside the chat session storage".to_string());
     }
 
     Ok(canonical)
 }
 
-fn validate_session_path_in(
-    raw: &str,
-    workspace_storage_roots: &[PathBuf],
-) -> Result<PathBuf, String> {
+fn validate_session_path_in(raw: &str, storage_roots: &[PathBuf]) -> Result<PathBuf, String> {
     let path = PathBuf::from(raw);
     if !path.is_absolute() {
         return Err("VS Code session path must be absolute".to_string());
@@ -212,30 +213,28 @@ fn validate_session_path_in(
     if is_symlink(&path) {
         return Err("VS Code session path must not be a symlink".to_string());
     }
-    if path
-        .parent()
-        .and_then(Path::file_name)
-        .and_then(|n| n.to_str())
-        != Some("chatSessions")
-    {
-        return Err("VS Code session path must be inside a chatSessions directory".to_string());
+    if !matches!(
+        path.parent()
+            .and_then(Path::file_name)
+            .and_then(|n| n.to_str()),
+        Some("chatSessions" | EMPTY_WINDOW_DIR)
+    ) {
+        return Err("VS Code session path must be inside a chat sessions directory".to_string());
     }
 
     let canonical = path
         .canonicalize()
         .map_err(|e| format!("Failed to resolve VS Code session path: {e}"))?;
 
-    if !is_within_any_root(&canonical, workspace_storage_roots)
-        && !is_wsl_workspace_storage_path(&canonical)
-    {
-        return Err("VS Code session path is outside workspaceStorage".to_string());
+    if !is_within_any_root(&canonical, storage_roots) && !is_wsl_chat_storage_path(&canonical) {
+        return Err("VS Code session path is outside the chat session storage".to_string());
     }
 
     Ok(canonical)
 }
 
 fn validate_session_path(session_path: &str) -> Result<PathBuf, String> {
-    let roots = get_workspace_storage_roots().unwrap_or_default();
+    let roots = get_storage_roots();
     validate_session_path_in(session_path, &roots)
 }
 
@@ -327,6 +326,7 @@ pub(crate) fn scan_projects_reporting(report: &ScanReport) -> Result<Vec<ClaudeP
             label,
             report,
         )?);
+        projects.extend(scan_empty_window(&root.path, label, report)?);
     }
     projects.sort_by(|a, b| b.last_modified.cmp(&a.last_modified));
     Ok(projects)
@@ -336,11 +336,18 @@ pub fn scan_projects_from_user_data_path(
     user_data_path: &Path,
     custom_directory_label: Option<&str>,
 ) -> Result<Vec<ClaudeProject>, String> {
-    scan_projects_in(
+    let report = ScanReport::default();
+    let mut projects = scan_projects_in(
         &user_data_path.join("workspaceStorage"),
         custom_directory_label,
-        &ScanReport::default(),
-    )
+        &report,
+    )?;
+    projects.extend(scan_empty_window(
+        user_data_path,
+        custom_directory_label,
+        &report,
+    )?);
+    Ok(projects)
 }
 
 fn scan_projects_in(
@@ -393,6 +400,57 @@ fn project_name_for(folder: &str) -> String {
         .unwrap_or_else(|| folder.to_string())
 }
 
+/// Sessions of windows without a folder (`chatSessionStore.ts`).
+const EMPTY_WINDOW_DIR: &str = "emptyWindowChatSessions";
+/// The workspace-storage dir empty windows used before `EMPTY_WINDOW_DIR`;
+/// VS Code still reads sessions from it.
+const LEGACY_EMPTY_WINDOW_WORKSPACE: &str = "no-workspace";
+
+fn empty_window_dir(user_data: &Path) -> PathBuf {
+    user_data.join("globalStorage").join(EMPTY_WINDOW_DIR)
+}
+
+/// Where a project dir keeps its session files: a workspace dir in
+/// `chatSessions/`, the empty-window dir in itself.
+fn chat_dir_of(project_dir: &Path) -> PathBuf {
+    if project_dir.file_name().and_then(|n| n.to_str()) == Some(EMPTY_WINDOW_DIR) {
+        project_dir.to_path_buf()
+    } else {
+        project_dir.join("chatSessions")
+    }
+}
+
+/// The folder a project dir's sessions belong to. Empty-window sessions, in
+/// either location, all belong to the empty-window dir itself, so the two
+/// locations merge into one project.
+fn project_folder_of(project_dir: &Path, report: &ScanReport) -> Option<String> {
+    let name = project_dir.file_name().and_then(|n| n.to_str());
+    if name == Some(EMPTY_WINDOW_DIR) {
+        return Some(project_dir.to_string_lossy().into_owned());
+    }
+    read_workspace_folder(&project_dir.join("workspace.json"), report).or_else(|| {
+        // `<UserData>/workspaceStorage/no-workspace`
+        (name == Some(LEGACY_EMPTY_WINDOW_WORKSPACE))
+            .then(|| project_dir.parent()?.parent().map(empty_window_dir))
+            .flatten()
+            .map(|dir| dir.to_string_lossy().into_owned())
+    })
+}
+
+/// The sessions of windows without a folder → one project.
+fn scan_empty_window(
+    user_data: &Path,
+    custom_directory_label: Option<&str>,
+    report: &ScanReport,
+) -> Result<Option<ClaudeProject>, String> {
+    let dir = empty_window_dir(user_data);
+    if is_symlink(&dir) || !report.is_dir(&dir) {
+        return Ok(None);
+    }
+    let folder = dir.to_string_lossy().into_owned();
+    project_from_sessions(&dir, &dir, folder, custom_directory_label, report)
+}
+
 /// One workspace dir → one project (`Ok(None)` = no usable chat sessions,
 /// `Err` = the chatSessions dir exists but cannot be read).
 fn scan_workspace(
@@ -404,20 +462,31 @@ fn scan_workspace(
         return Ok(None);
     }
 
-    let Some(folder) = read_workspace_folder(&ws_path.join("workspace.json"), report) else {
+    let Some(folder) = project_folder_of(ws_path, report) else {
         return Ok(None);
     };
 
-    let chat_dir = ws_path.join("chatSessions");
+    let chat_dir = chat_dir_of(ws_path);
     if !report.is_dir(&chat_dir) {
         return Ok(None);
     }
+    project_from_sessions(ws_path, &chat_dir, folder, custom_directory_label, report)
+}
 
+/// The project of `project_dir` whose sessions are in `chat_dir`
+/// (`Ok(None)` = no usable chat sessions, `Err` = `chat_dir` cannot be read).
+fn project_from_sessions(
+    project_dir: &Path,
+    chat_dir: &Path,
+    folder: String,
+    custom_directory_label: Option<&str>,
+    report: &ScanReport,
+) -> Result<Option<ClaudeProject>, String> {
     let mut session_count = 0usize;
     let mut last_modified_ms: u64 = 0;
     let mut message_count = 0usize;
 
-    for session_path in chat_session_files(&chat_dir, report)? {
+    for session_path in chat_session_files(chat_dir, report)? {
         let info = match probe_session_metadata(&session_path, report) {
             Some(i) => i,
             None => continue,
@@ -442,7 +511,7 @@ fn scan_workspace(
 
     Ok(Some(ClaudeProject {
         name,
-        path: project_path_for(ws_path),
+        path: project_path_for(project_dir),
         actual_path: folder,
         session_count,
         message_count,
@@ -468,30 +537,24 @@ pub(crate) fn load_sessions_reporting(
     project_path: &str,
     report: &ScanReport,
 ) -> Result<Vec<ClaudeSession>, String> {
-    let roots = get_workspace_storage_roots().unwrap_or_default();
+    let roots = get_storage_roots();
     load_sessions_in(project_path, &roots, report)
 }
 
 fn load_sessions_in(
     project_path: &str,
-    workspace_storage_roots: &[PathBuf],
+    storage_roots: &[PathBuf],
     report: &ScanReport,
 ) -> Result<Vec<ClaudeSession>, String> {
-    let ws_path_buf = validate_workspace_path_in(project_path, workspace_storage_roots)?;
+    let ws_path_buf = validate_workspace_path_in(project_path, storage_roots)?;
 
-    let chat_dir = ws_path_buf.join("chatSessions");
+    let chat_dir = chat_dir_of(&ws_path_buf);
     if !report.is_dir(&chat_dir) {
         return Ok(Vec::new());
     }
 
-    let folder = read_workspace_folder(&ws_path_buf.join("workspace.json"), report);
-    let project_name = folder
-        .as_deref()
-        .and_then(|f| {
-            PathBuf::from(f)
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-        })
+    let project_name = project_folder_of(&ws_path_buf, report)
+        .map(|folder| project_name_for(&folder))
         .unwrap_or_else(|| "VS Code".to_string());
 
     let mut sessions = Vec::new();
@@ -518,7 +581,7 @@ fn load_sessions_in(
             has_tool_use: info.has_tool_use,
             has_errors: false,
             summary: info.summary,
-            is_renamed: false,
+            is_renamed: info.is_renamed,
             provider: Some(PROVIDER_ID.to_string()),
             storage_type: None,
             entrypoint: Some(ENTRYPOINT.to_string()),
@@ -542,12 +605,7 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<ClaudeMessage>, String> {
     let mut results = Vec::new();
     let query_lower = query.to_lowercase();
     for root in get_user_data_roots() {
-        search_workspace_storage(
-            &root.path.join("workspaceStorage"),
-            &query_lower,
-            limit,
-            &mut results,
-        )?;
+        search_user_data(&root.path, &query_lower, limit, &mut results)?;
         if results.len() >= limit {
             break;
         }
@@ -562,38 +620,36 @@ pub fn search_from_user_data_path(
 ) -> Result<Vec<ClaudeMessage>, String> {
     let query_lower = query.to_lowercase();
     let mut results = Vec::new();
-    search_workspace_storage(
-        &user_data_path.join("workspaceStorage"),
-        &query_lower,
-        limit,
-        &mut results,
-    )?;
+    search_user_data(user_data_path, &query_lower, limit, &mut results)?;
     Ok(results)
 }
 
-fn search_workspace_storage(
-    ws_root: &Path,
+fn search_user_data(
+    user_data: &Path,
     query_lower: &str,
     limit: usize,
     results: &mut Vec<ClaudeMessage>,
 ) -> Result<(), String> {
-    if !ws_root.is_dir() {
-        return Ok(());
+    let ws_root = user_data.join("workspaceStorage");
+    let mut project_dirs = Vec::new();
+    if ws_root.is_dir() {
+        for ws_entry in fs::read_dir(&ws_root).map_err(|e| e.to_string())?.flatten() {
+            project_dirs.push(ws_entry.path());
+        }
     }
+    project_dirs.push(empty_window_dir(user_data));
 
-    for ws_entry in fs::read_dir(ws_root).map_err(|e| e.to_string())?.flatten() {
-        let ws_path = ws_entry.path();
+    for ws_path in project_dirs {
         if is_symlink(&ws_path) || !ws_path.is_dir() {
             continue;
         }
-        let chat_dir = ws_path.join("chatSessions");
+        let chat_dir = chat_dir_of(&ws_path);
         if !chat_dir.is_dir() {
             continue;
         }
         // The scan skips a workspace without a folder, so its hits belong to
         // no scanned project and keep `project_path: None`.
-        let workspace_json = ws_path.join("workspace.json");
-        let project = read_workspace_folder(&workspace_json, &ScanReport::default())
+        let project = project_folder_of(&ws_path, &ScanReport::default())
             .map(|folder| (project_name_for(&folder), project_path_for(&ws_path)));
 
         // One unreadable workspace must not discard the hits already found.
@@ -666,12 +722,20 @@ fn replay_session(raw: &str) -> Result<Value, String> {
                     let _ = set_at_path(&mut state, &path, value);
                 }
             }
+            // kind 2 Push: `i` truncates the array to that length first
+            // (the writer shortened it, e.g. a retried response); `v`, when
+            // present, is appended after.
             2 => {
-                if let Some(items) = entry.get("v").and_then(Value::as_array) {
-                    let _ = append_at_path(&mut state, &path, items);
-                }
+                let start = entry.get("i").and_then(Value::as_u64);
+                let items = entry
+                    .get("v")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default();
+                let _ = push_at_path(&mut state, &path, start, items);
             }
-            // kind 3: delete the value at `k` (carries no `v`).
+            // kind 3 Delete: the writer sets the value to `undefined`, which
+            // keeps an array slot (so later indices do not shift).
             3 => {
                 let _ = delete_at_path(&mut state, &path);
             }
@@ -715,7 +779,8 @@ fn set_at_path(state: &mut Value, path: &[Value], value: Value) -> Result<(), ()
     }
 }
 
-/// Remove the value at `path` (object key removal / array element removal).
+/// Unset the value at `path`: an object key goes away (`undefined` is not
+/// serialized); an array element becomes `null`, keeping its slot.
 fn delete_at_path(state: &mut Value, path: &[Value]) -> Result<(), ()> {
     let (last, parents) = path.split_last().ok_or(())?;
     let parent = traverse_mut(state, parents)?;
@@ -726,8 +791,8 @@ fn delete_at_path(state: &mut Value, path: &[Value]) -> Result<(), ()> {
         }
         (Value::Array(arr), Value::Number(n)) => {
             let idx = n.as_u64().ok_or(())? as usize;
-            if idx < arr.len() {
-                arr.remove(idx);
+            if let Some(slot) = arr.get_mut(idx) {
+                *slot = Value::Null;
             }
             Ok(())
         }
@@ -735,13 +800,27 @@ fn delete_at_path(state: &mut Value, path: &[Value]) -> Result<(), ()> {
     }
 }
 
-/// Append every item to the array at `path` (creating arrays/maps as needed).
-fn append_at_path(state: &mut Value, path: &[Value], items: &[Value]) -> Result<(), ()> {
+/// Truncate the array at `path` to `start` (when given), then append every
+/// item (creating arrays/maps as needed).
+fn push_at_path(
+    state: &mut Value,
+    path: &[Value],
+    start: Option<u64>,
+    items: &[Value],
+) -> Result<(), ()> {
     let target = traverse_mut(state, path)?;
-    if let Value::Null = target {
+    if !target.is_array() {
         *target = Value::Array(Vec::new());
     }
     let arr = target.as_array_mut().ok_or(())?;
+    if let Some(start) = start {
+        let start = usize::try_from(start).map_err(|_| ())?;
+        if start > MAX_REPLAY_ARRAY_INDEX {
+            return Err(());
+        }
+        // `arr.length = i` also grows the array with holes.
+        arr.resize(start, Value::Null);
+    }
     arr.extend(items.iter().cloned());
     Ok(())
 }
@@ -880,7 +959,7 @@ fn build_assistant_message(
                 }
             }
             Some("thinking") => {
-                let text = part.get("value").and_then(Value::as_str).unwrap_or("");
+                let text = thinking_text(part);
                 // Skip empty/encrypted-only thinking blobs; render visible text only.
                 if !text.is_empty() {
                     blocks.push(serde_json::json!({
@@ -904,45 +983,32 @@ fn build_assistant_message(
                         *counter += 1;
                         format!("vscode-tool-{idx}-{counter}")
                     });
-                let invocation_text = part
-                    .get("invocationMessage")
-                    .and_then(|m| m.get("value"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
-                let past_text = part
-                    .get("pastTenseMessage")
-                    .and_then(|m| m.get("value"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
                 let is_complete = part
                     .get("isComplete")
                     .and_then(Value::as_bool)
                     .unwrap_or(false);
 
-                let mut input = serde_json::Map::new();
-                if !invocation_text.is_empty() {
-                    input.insert(
-                        "message".to_string(),
-                        Value::String(invocation_text.to_string()),
-                    );
-                }
                 let tool_use = serde_json::json!({
                     "type": "tool_use",
                     "id": call_id,
                     "name": tool_id,
-                    "input": Value::Object(input),
+                    "input": tool_input(part),
                 });
                 if tool_use_block.is_none() {
                     tool_use_block = Some(tool_use.clone());
                 }
                 blocks.push(tool_use);
 
-                if is_complete && !past_text.is_empty() {
-                    blocks.push(serde_json::json!({
+                if let Some(result) = is_complete.then(|| tool_result(part)).flatten() {
+                    let mut block = serde_json::json!({
                         "type": "tool_result",
                         "tool_use_id": call_id,
-                        "content": past_text,
-                    }));
+                        "content": result.text,
+                    });
+                    if result.is_error {
+                        block["is_error"] = Value::Bool(true);
+                    }
+                    blocks.push(block);
                 }
             }
             Some("progressTaskSerialized") => {
@@ -1004,6 +1070,181 @@ fn build_assistant_message(
     Some(msg)
 }
 
+/// Text of a `string | IMarkdownString` field, when not empty.
+fn markdown_text(value: Option<&Value>) -> Option<&str> {
+    let value = value?;
+    value
+        .as_str()
+        .or_else(|| value.get("value").and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+}
+
+/// `IChatThinkingPart.value`: a string, or chunks VS Code joins with `''`.
+fn thinking_text(part: &Value) -> String {
+    match part.get("value") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(chunks)) => chunks.iter().filter_map(Value::as_str).collect(),
+        _ => String::new(),
+    }
+}
+
+/// Arguments of a serialized tool call. The `invocationMessage` sentence
+/// ("Running `ls`") is only a fallback: the command a terminal call ran is
+/// in `toolSpecificData.commandLine`, other tools keep `rawInput`, and an
+/// MCP call's input is in `resultDetails.input`.
+fn tool_input(part: &Value) -> Value {
+    let data = part.get("toolSpecificData");
+    let kind = data.and_then(|d| d.get("kind")).and_then(Value::as_str);
+    let mut input = serde_json::Map::new();
+    match (kind, data) {
+        (Some("terminal"), Some(data)) => {
+            // The order VS Code shows the command in (runInTerminalTool.ts).
+            let line = data.get("commandLine");
+            if let Some(command) = ["forDisplay", "userEdited", "toolEdited", "original"]
+                .iter()
+                .find_map(|key| line.and_then(|l| l.get(*key)).and_then(Value::as_str))
+            {
+                input.insert("command".into(), Value::String(command.to_string()));
+            }
+        }
+        (Some("input"), Some(data)) => match data.get("rawInput") {
+            Some(Value::Object(raw)) => return Value::Object(raw.clone()),
+            Some(Value::Null) | None => {}
+            Some(raw) => {
+                input.insert("input".into(), raw.clone());
+            }
+        },
+        (Some("simpleToolInvocation"), Some(data)) => {
+            if let Some(text) = data.get("input").and_then(Value::as_str) {
+                input.insert("input".into(), Value::String(text.to_string()));
+            }
+        }
+        (Some("subagent"), Some(data)) => {
+            for key in ["agentName", "description", "prompt"] {
+                if let Some(text) = data.get(key).and_then(Value::as_str) {
+                    input.insert(key.into(), Value::String(text.to_string()));
+                }
+            }
+        }
+        _ => {}
+    }
+    if input.is_empty() {
+        if let Some(Value::Object(raw)) = part
+            .get("resultDetails")
+            .and_then(|d| d.get("input"))
+            .and_then(Value::as_str)
+            .and_then(|text| serde_json::from_str(text).ok())
+        {
+            return Value::Object(raw);
+        }
+    }
+    if input.is_empty() {
+        if let Some(text) = markdown_text(part.get("invocationMessage")) {
+            input.insert("message".into(), Value::String(text.to_string()));
+        }
+    }
+    Value::Object(input)
+}
+
+struct ToolResult {
+    text: String,
+    is_error: bool,
+}
+
+/// Output of a serialized tool call: the terminal output, the tool's own
+/// output or result details, else the `pastTenseMessage` sentence. A
+/// `resultError`, a failed MCP call or a non-zero exit code marks it failed.
+fn tool_result(part: &Value) -> Option<ToolResult> {
+    let data = part.get("toolSpecificData");
+    let kind = data.and_then(|d| d.get("kind")).and_then(Value::as_str);
+    let details = part.get("resultDetails");
+    let error = part.get("resultError");
+    let error_text = error.and_then(Value::as_str).filter(|e| !e.is_empty());
+    let mut is_error = error_text.is_some() || error.and_then(Value::as_bool) == Some(true);
+
+    let mut text = match (kind, data) {
+        (Some("terminal"), Some(data)) => {
+            let exit_code = data
+                .get("terminalCommandState")
+                .and_then(|s| s.get("exitCode"))
+                .and_then(Value::as_i64);
+            is_error |= exit_code.is_some_and(|code| code != 0);
+            data.get("terminalCommandOutput")
+                .and_then(|o| o.get("text"))
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        }
+        (Some("simpleToolInvocation"), Some(data)) => {
+            data.get("output").and_then(Value::as_str).map(String::from)
+        }
+        (Some("subagent"), Some(data)) => {
+            is_error |= data.get("isError").and_then(Value::as_bool) == Some(true);
+            data.get("result").and_then(Value::as_str).map(String::from)
+        }
+        _ => None,
+    }
+    .filter(|text| !text.is_empty());
+
+    if text.is_none() {
+        text = match details {
+            // IToolResultInputOutputDetails (MCP and extension tools).
+            Some(Value::Object(d)) if d.get("output").is_some_and(Value::is_array) => {
+                is_error |= d.get("isError").and_then(Value::as_bool) == Some(true);
+                let parts: Vec<String> = d["output"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(input_output_text)
+                    .collect();
+                Some(parts.join("\n"))
+            }
+            // The files and locations a tool read or found.
+            Some(Value::Array(items)) => {
+                let paths: Vec<&str> = items.iter().filter_map(resource_path).collect();
+                let mut lines: Vec<&str> = markdown_text(part.get("pastTenseMessage"))
+                    .into_iter()
+                    .collect();
+                lines.extend(paths);
+                Some(lines.join("\n"))
+            }
+            _ => None,
+        }
+        .filter(|text| !text.is_empty());
+    }
+
+    let text = text
+        .or_else(|| error_text.map(String::from))
+        .or_else(|| markdown_text(part.get("pastTenseMessage")).map(String::from))?;
+    Some(ToolResult { text, is_error })
+}
+
+/// One `ToolInputOutputEmbedded` / `ToolInputOutputReference` as text.
+fn input_output_text(item: &Value) -> Option<String> {
+    match item.get("type").and_then(Value::as_str)? {
+        "embed" if item.get("isText").and_then(Value::as_bool) == Some(true) => {
+            item.get("value").and_then(Value::as_str).map(String::from)
+        }
+        // Base64 data (an image, a binary file) is not text to show.
+        "embed" => Some(format!(
+            "[{} data]",
+            item.get("mimeType")
+                .and_then(Value::as_str)
+                .unwrap_or("binary")
+        )),
+        "ref" => item.get("uri").and_then(resource_path).map(String::from),
+        _ => None,
+    }
+}
+
+/// Path of a serialized `URI` or `Location` (`{ uri, range }`).
+fn resource_path(value: &Value) -> Option<&str> {
+    let uri = value.get("uri").unwrap_or(value);
+    uri.get("fsPath")
+        .or_else(|| uri.get("path"))
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+}
+
 // ============================================================================
 // Helpers shared with cursor.rs (kept private to avoid a cross-cutting refactor)
 // ============================================================================
@@ -1056,6 +1297,8 @@ struct SessionMetadata {
     last_modified_ms: u64,
     has_tool_use: bool,
     summary: Option<String>,
+    /// The user renamed the chat; `summary` is that name.
+    is_renamed: bool,
 }
 
 /// Cheap metadata probe — replays the patch log and walks the final state
@@ -1081,7 +1324,13 @@ fn probe_session_metadata(session_path: &Path, report: &ScanReport) -> Option<Se
 
     let mut message_count = 0usize;
     let mut has_tool_use = false;
-    let mut summary: Option<String> = None;
+    // A renamed chat stores its name as `customTitle` (`hasCustomTitle`).
+    let custom_title = state
+        .get("customTitle")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty());
+    let mut summary: Option<String> = custom_title.map(String::from);
 
     if let Some(requests) = state.get("requests").and_then(Value::as_array) {
         for req in requests {
@@ -1100,11 +1349,7 @@ fn probe_session_metadata(session_path: &Path, report: &ScanReport) -> Option<Se
                             .and_then(Value::as_str)
                             .map(|s| !s.is_empty())
                             .unwrap_or(false),
-                        Some("thinking") => part
-                            .get("value")
-                            .and_then(Value::as_str)
-                            .map(|s| !s.is_empty())
-                            .unwrap_or(false),
+                        Some("thinking") => !thinking_text(part).is_empty(),
                         Some("toolInvocationSerialized") => {
                             has_tool_use = true;
                             true
@@ -1132,6 +1377,7 @@ fn probe_session_metadata(session_path: &Path, report: &ScanReport) -> Option<Se
         last_modified_ms: last_message_ms.max(creation_ms),
         has_tool_use,
         summary,
+        is_renamed: custom_title.is_some(),
     })
 }
 
@@ -1704,7 +1950,7 @@ mod tests {
     }
 
     #[test]
-    fn replay_applies_delete_patches() {
+    fn replay_delete_keeps_array_slots_so_later_indices_hold() {
         let log = build_log(
             json!({"sessionId": "abc", "customTitle": "temp", "requests": [
                 {"message": {"text": "a"}, "response": []},
@@ -1713,12 +1959,232 @@ mod tests {
             &[
                 json!({"kind": 3, "k": ["customTitle"]}),
                 json!({"kind": 3, "k": ["requests", 0]}),
+                // Written against the writer's state, where "b" is still 1.
+                json!({"kind": 1, "k": ["requests", 1, "message", "text"], "v": "b2"}),
             ],
         );
         let state = replay_session(&log).unwrap();
         assert!(state.get("customTitle").is_none());
         let requests = state["requests"].as_array().unwrap();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0]["message"]["text"], "b");
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].is_null());
+        assert_eq!(requests[1]["message"]["text"], "b2");
+
+        let msgs = messages_from_state(&state);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].content.as_ref().unwrap()[0]["text"], "b2");
+    }
+
+    #[test]
+    fn replay_push_with_index_drops_the_replaced_tail() {
+        let log = build_log(
+            json!({"sessionId": "abc", "requests": [{
+                "message": {"text": "q"},
+                "response": [{"value": "first try"}, {"value": "stale"}]
+            }]}),
+            // The response was redone from part 0.
+            &[json!({"kind": 2, "k": ["requests", 0, "response"], "i": 0,
+                "v": [{"value": "second try"}]})],
+        );
+        let state = replay_session(&log).unwrap();
+        assert_eq!(
+            state["requests"][0]["response"],
+            json!([{"value": "second try"}])
+        );
+
+        // A truncation alone carries no `v`.
+        let log = build_log(
+            json!({"sessionId": "abc", "requests": [
+                {"message": {"text": "kept"}, "response": []},
+                {"message": {"text": "removed"}, "response": []}
+            ]}),
+            &[json!({"kind": 2, "k": ["requests"], "i": 1})],
+        );
+        let state = replay_session(&log).unwrap();
+        assert_eq!(state["requests"].as_array().unwrap().len(), 1);
+        assert_eq!(state["requests"][0]["message"]["text"], "kept");
+    }
+
+    /// Tool parts as `ChatToolInvocation.toJSON()` writes them.
+    fn tool_session() -> Value {
+        json!({
+            "sessionId": "sess-tools",
+            "creationDate": 1700000000000u64,
+            "requests": [{
+                "requestId": "req-1",
+                "message": {"text": "run things"},
+                "response": [
+                    {"kind": "thinking", "value": ["Plan: ", "count, then fail."]},
+                    {"kind": "toolInvocationSerialized", "toolId": "run_in_terminal",
+                        "toolCallId": "t-seq", "isComplete": true,
+                        "invocationMessage": "Running `seq 1 3`",
+                        "pastTenseMessage": "Ran `seq 1 3`",
+                        "toolSpecificData": {"kind": "terminal", "language": "sh",
+                            "commandLine": {"original": "seq 1 3"},
+                            "terminalCommandOutput": {"text": "1\n2\n3", "lineCount": 3},
+                            "terminalCommandState": {"exitCode": 0}}},
+                    {"kind": "toolInvocationSerialized", "toolId": "run_in_terminal",
+                        "toolCallId": "t-fail", "isComplete": true,
+                        "invocationMessage": {"value": "Running `exit 3`"},
+                        "pastTenseMessage": {"value": "Ran `exit 3`"},
+                        "toolSpecificData": {"kind": "terminal", "language": "sh",
+                            "commandLine": {"original": "exit 3", "userEdited": "echo boom; exit 3"},
+                            "terminalCommandOutput": {"text": "boom"},
+                            "terminalCommandState": {"exitCode": 3}}},
+                    {"kind": "toolInvocationSerialized", "toolId": "mcp_cchv_echo",
+                        "toolCallId": "t-mcp", "isComplete": true,
+                        "invocationMessage": {"value": "Running echo"},
+                        "pastTenseMessage": {"value": "Ran echo"},
+                        "resultDetails": {"input": "{\"text\":\"hi\"}", "output": [
+                            {"type": "embed", "isText": true, "value": "echo: hi"},
+                            {"type": "embed", "mimeType": "image/png", "value": "iVBORw0K"}
+                        ]}},
+                    {"kind": "toolInvocationSerialized", "toolId": "mcp_cchv_fail",
+                        "toolCallId": "t-mcp-fail", "isComplete": true,
+                        "invocationMessage": {"value": "Running fail"},
+                        "pastTenseMessage": {"value": "Ran fail"},
+                        "resultDetails": {"input": "{}", "isError": true, "output": [
+                            {"type": "embed", "isText": true, "value": "it broke"}
+                        ]}},
+                    {"kind": "toolInvocationSerialized", "toolId": "copilot_findFiles",
+                        "toolCallId": "t-find", "isComplete": true,
+                        "invocationMessage": {"value": "Searching for `*.rs`"},
+                        "pastTenseMessage": {"value": "Searched for `*.rs`, 2 results"},
+                        "toolSpecificData": {"kind": "input", "rawInput": {"query": "*.rs"}},
+                        "resultDetails": [
+                            {"$mid": 1, "scheme": "file", "path": "/repo/a.rs", "fsPath": "/repo/a.rs"},
+                            {"uri": {"$mid": 1, "scheme": "file", "path": "/repo/b.rs"},
+                                "range": {"startLineNumber": 1}}
+                        ]},
+                    {"kind": "toolInvocationSerialized", "toolId": "copilot_readFile",
+                        "toolCallId": "t-denied", "isComplete": true,
+                        "invocationMessage": {"value": "Reading secret"},
+                        "pastTenseMessage": {"value": "Read secret"},
+                        "resultError": "The user cancelled the tool call."}
+                ]
+            }]
+        })
+    }
+
+    #[test]
+    fn tools_show_their_commands_arguments_and_real_output() {
+        let msgs = messages_from_state(&tool_session());
+        let blocks = msgs[1].content.as_ref().unwrap().as_array().unwrap();
+        let block = |kind: &str, id: &str| {
+            blocks
+                .iter()
+                .find(|b| b["type"] == kind && (b["id"] == id || b["tool_use_id"] == id))
+                .unwrap_or_else(|| panic!("no {kind} for {id}"))
+                .clone()
+        };
+
+        assert_eq!(blocks[0]["thinking"], "Plan: count, then fail.");
+
+        assert_eq!(
+            block("tool_use", "t-seq")["input"],
+            json!({"command": "seq 1 3"})
+        );
+        let seq = block("tool_result", "t-seq");
+        assert_eq!(seq["content"], "1\n2\n3");
+        assert!(seq.get("is_error").is_none());
+
+        // What the user ran after editing the command, and its failure.
+        assert_eq!(
+            block("tool_use", "t-fail")["input"],
+            json!({"command": "echo boom; exit 3"})
+        );
+        let fail = block("tool_result", "t-fail");
+        assert_eq!(fail["content"], "boom");
+        assert_eq!(fail["is_error"], true);
+
+        assert_eq!(block("tool_use", "t-mcp")["input"], json!({"text": "hi"}));
+        assert_eq!(
+            block("tool_result", "t-mcp")["content"],
+            "echo: hi\n[image/png data]"
+        );
+        let mcp_fail = block("tool_result", "t-mcp-fail");
+        assert_eq!(mcp_fail["content"], "it broke");
+        assert_eq!(mcp_fail["is_error"], true);
+
+        assert_eq!(
+            block("tool_use", "t-find")["input"],
+            json!({"query": "*.rs"})
+        );
+        assert_eq!(
+            block("tool_result", "t-find")["content"],
+            "Searched for `*.rs`, 2 results\n/repo/a.rs\n/repo/b.rs"
+        );
+
+        // No arguments recorded: the sentence stays the input.
+        assert_eq!(
+            block("tool_use", "t-denied")["input"],
+            json!({"message": "Reading secret"})
+        );
+        let denied = block("tool_result", "t-denied");
+        assert_eq!(denied["content"], "The user cancelled the tool call.");
+        assert_eq!(denied["is_error"], true);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn renamed_chat_is_titled_by_its_name() {
+        let home = crate::test_utils::SandboxHome::new();
+        let ws_root = native_user_data(home.path()).join("workspaceStorage");
+        write_workspace(&ws_root, "hash-a", "/work/app", "first prompt");
+        let chat = ws_root.join("hash-a").join("chatSessions");
+        let session = fs::read_dir(&chat).unwrap().next().unwrap().unwrap().path();
+        let mut log = fs::read_to_string(&session).unwrap();
+        log.push('\n');
+        log.push_str(&json!({"kind": 1, "k": ["customTitle"], "v": "Release plan"}).to_string());
+        fs::write(&session, log).unwrap();
+
+        let project = scan_projects().unwrap().remove(0);
+        let sessions = load_sessions(&project.path, false).unwrap();
+        assert_eq!(sessions[0].summary.as_deref(), Some("Release plan"));
+        assert!(sessions[0].is_renamed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn empty_window_sessions_form_one_project() {
+        let home = crate::test_utils::SandboxHome::new();
+        let user_data = native_user_data(home.path());
+        let session = |id: &str, text: &str| {
+            json!({"kind": 0, "v": {
+                "sessionId": id,
+                "creationDate": 1779490058917u64,
+                "requests": [{ "message": {"text": text}, "response": [{"value": "ok"}] }]
+            }})
+            .to_string()
+        };
+        let empty_dir = user_data.join("globalStorage").join(EMPTY_WINDOW_DIR);
+        fs::create_dir_all(&empty_dir).unwrap();
+        fs::write(empty_dir.join("e1.jsonl"), session("e1", "needle new")).unwrap();
+        // The location older builds used.
+        let legacy = user_data.join("workspaceStorage/no-workspace/chatSessions");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("e0.json"), {
+            let v: Value = serde_json::from_str(&session("e0", "needle old")).unwrap();
+            v["v"].to_string()
+        })
+        .unwrap();
+
+        let merged = crate::providers::copilot::scan_projects().unwrap();
+        assert_eq!(merged.len(), 1, "both locations are one project");
+        assert_eq!(merged[0].actual_path, empty_dir.to_string_lossy());
+        assert_eq!(merged[0].session_count, 2);
+
+        let sessions = crate::providers::copilot::load_sessions(&merged[0].path, false).unwrap();
+        assert_eq!(sessions.len(), 2);
+        for s in &sessions {
+            let messages = crate::providers::copilot::load_messages(&s.file_path).unwrap();
+            assert_eq!(messages.len(), 2, "{}", s.file_path);
+        }
+
+        let hits = crate::providers::copilot::search("needle", 10).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert!(hits
+            .iter()
+            .all(|h| h.project_path.as_ref() == Some(&merged[0].path)));
     }
 }

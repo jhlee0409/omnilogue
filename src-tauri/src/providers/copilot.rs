@@ -325,10 +325,16 @@ fn load_sessions_fallback(project_path: &str, exclude: bool) -> Vec<ClaudeSessio
     sessions
 }
 
-/// Heuristic: does this look like a VS Code chat session file path?
-fn is_vscode_session_path(session_path: &str) -> bool {
-    (session_path.contains("/workspaceStorage/") || session_path.contains("\\workspaceStorage\\"))
-        && (session_path.contains("/chatSessions/") || session_path.contains("\\chatSessions\\"))
+/// Heuristic: does this look like a VS Code chat session file path? A
+/// window without a folder keeps its sessions in
+/// `globalStorage/emptyWindowChatSessions/`.
+pub(crate) fn is_vscode_session_path(session_path: &str) -> bool {
+    let in_workspace = (session_path.contains("/workspaceStorage/")
+        || session_path.contains("\\workspaceStorage\\"))
+        && (session_path.contains("/chatSessions/") || session_path.contains("\\chatSessions\\"));
+    in_workspace
+        || session_path.contains("/globalStorage/emptyWindowChatSessions/")
+        || session_path.contains("\\globalStorage\\emptyWindowChatSessions\\")
 }
 
 /// Re-key sub-provider hits onto the merged project identity (#672). Each
@@ -573,6 +579,9 @@ mod tests {
         ));
         assert!(is_vscode_session_path(
             r"C:\Users\me\AppData\Roaming\Code\User\workspaceStorage\abc\chatSessions\x.jsonl"
+        ));
+        assert!(is_vscode_session_path(
+            "/Users/me/Library/Application Support/Code/User/globalStorage/emptyWindowChatSessions/x.jsonl"
         ));
         assert!(!is_vscode_session_path(
             "/Users/me/.copilot/session-state/abc/events.jsonl"

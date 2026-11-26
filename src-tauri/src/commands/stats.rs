@@ -639,9 +639,7 @@ fn detect_session_provider(session_path: &str) -> StatsProvider {
     {
         return StatsProvider::Copilot;
     }
-    if (session_path.contains("/workspaceStorage/")
-        || session_path.contains("\\workspaceStorage\\"))
-        && (session_path.contains("/chatSessions/") || session_path.contains("\\chatSessions\\"))
+    if providers::copilot::is_vscode_session_path(session_path)
         && PathBuf::from(session_path)
             .extension()
             .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
