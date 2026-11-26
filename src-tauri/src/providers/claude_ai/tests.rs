@@ -584,3 +584,24 @@ fn a_recorded_leaf_still_wins_over_the_latest_branch() {
         vec!["first prompt", "old reply"]
     );
 }
+
+/// Links that are neither a known uuid nor the root sentinel, and repeated
+/// uuids, leave the export's order as it is.
+#[test]
+fn malformed_links_keep_the_export_order() {
+    let all = vec![
+        "first prompt",
+        "old reply",
+        "new reply",
+        "follow-up",
+        "answer",
+    ];
+    for (index, field, value) in [(2, "parent_message_uuid", "unknown"), (1, "uuid", "m2-new")] {
+        let mut conversation = regenerated_conversation();
+        conversation["chat_messages"][index][field] = json!(value);
+        let Ok(conversation) = Conversation::from_value(conversation) else {
+            panic!("conversation rejected");
+        };
+        assert_eq!(shown_texts(&conversation), all, "{field} = {value}");
+    }
+}

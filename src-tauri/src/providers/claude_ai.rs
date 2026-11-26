@@ -930,15 +930,20 @@ fn active_branch(raw: Vec<RawMessage>, leaf: Option<&str>) -> Vec<RawMessage> {
 /// latest-created child at each fork (ties by uuid), the heuristic export
 /// readers use since the export has no active-branch marker. It matches
 /// claude.ai unless the user switched back to an older branch. `None` when
-/// there is no fork to choose at, or when the parent links do not form a tree.
+/// there is no fork to choose at, when the parent links do not form a tree,
+/// or when two messages share a uuid.
 fn latest_leaf(raw: &[RawMessage]) -> Option<String> {
     let ids: HashSet<&str> = raw.iter().filter_map(|m| m.uuid.as_deref()).collect();
+    if ids.len() != raw.len() {
+        // A message without a uuid, or a repeated one: a picked uuid could
+        // name a different message than the one picked.
+        return None;
+    }
     // Parent uuid → children; the root's parent (the sentinel) is "".
     let mut children: HashMap<&str, Vec<&RawMessage>> = HashMap::new();
     for message in raw {
-        message.uuid.as_deref()?;
         let parent = message.parent.as_deref()?;
-        let parent = if is_root_sentinel(parent) {
+        let parent = if parent.trim().is_empty() || is_root_sentinel(parent) {
             ""
         } else if ids.contains(parent) {
             parent
@@ -975,13 +980,12 @@ fn latest_leaf(raw: &[RawMessage]) -> Option<String> {
 }
 
 fn is_root_sentinel(uuid: &str) -> bool {
-    // `00000000-0000-4000-8000-000000000000`: zero apart from the version
-    // and variant digits.
-    uuid.chars()
-        .filter(char::is_ascii_hexdigit)
-        .filter(|c| !matches!(c, '0' | '4' | '8'))
-        .count()
-        == 0
+    // The root's parent: the nil uuid, or zero apart from the version and
+    // variant digits.
+    matches!(
+        uuid.trim(),
+        "00000000-0000-4000-8000-000000000000" | "00000000-0000-0000-0000-000000000000"
+    )
 }
 
 /// Collapse whitespace and clip to the summary length with an ellipsis.
