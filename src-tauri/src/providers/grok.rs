@@ -350,7 +350,8 @@ fn user_prompt(value: &Value) -> Option<Value> {
                 .get("text")
                 .and_then(Value::as_str)
                 .and_then(|text| text.split_once("<user_query>"))
-                .and_then(|(_, rest)| rest.split_once("</user_query>"))
+                // The last closing tag: a prompt may quote the tag itself.
+                .and_then(|(_, rest)| rest.rsplit_once("</user_query>"))
                 .map(|(inner, _)| inner.trim());
             match inner {
                 Some(inner) => json!({"type": "text", "text": inner}),
@@ -1340,5 +1341,15 @@ mod tests {
         assert!(!content_is_empty(&image));
         assert!(content_is_empty(&json!([{"type": "text", "text": "  "}])));
         assert!(content_is_empty(&json!([])));
+    }
+
+    #[test]
+    fn a_prompt_quoting_the_wrapper_tag_keeps_its_text() {
+        let record = json!({"type": "user", "content":
+            "<user_query>Explain <user_query>x</user_query> literally.</user_query>"});
+        assert_eq!(
+            user_prompt(&record).unwrap()[0]["text"],
+            "Explain <user_query>x</user_query> literally."
+        );
     }
 }
