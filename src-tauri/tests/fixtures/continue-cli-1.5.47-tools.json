@@ -1,0 +1,260 @@
+{
+  "sessionId": "299e2376-d12c-49f8-a990-864f6fb3db29",
+  "title": "Untitled Session",
+  "workspaceDirectory": "/work/app",
+  "history": [
+    {
+      "message": {
+        "role": "user",
+        "content": "RUN-T please run the steps"
+      },
+      "contextItems": [],
+      "editorState": "RUN-T please run the steps"
+    },
+    {
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "toolCalls": [
+          {
+            "id": "call_0f72f585",
+            "type": "function",
+            "function": {
+              "name": "Bash",
+              "arguments": "{\"command\":\"seq 1 5\"}"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 100,
+          "completion_tokens": 20,
+          "total_tokens": 120,
+          "model": "qwen2.5-coder:7b",
+          "cost_cents": 0
+        }
+      },
+      "contextItems": [],
+      "toolCallStates": [
+        {
+          "toolCallId": "call_0f72f585",
+          "toolCall": {
+            "id": "call_0f72f585",
+            "type": "function",
+            "function": {
+              "name": "Bash",
+              "arguments": "{\"command\":\"seq 1 5\"}"
+            }
+          },
+          "status": "done",
+          "parsedArgs": {
+            "command": "seq 1 5"
+          },
+          "output": [
+            {
+              "content": "1\n2\n3\n4\n5\n",
+              "name": "Tool Result",
+              "description": "Tool execution result"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "toolCalls": [
+          {
+            "id": "call_8725465f",
+            "type": "function",
+            "function": {
+              "name": "Bash",
+              "arguments": "{\"command\":\"echo boom >&2; exit 3\"}"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 100,
+          "completion_tokens": 20,
+          "total_tokens": 120,
+          "model": "qwen2.5-coder:7b",
+          "cost_cents": 0
+        }
+      },
+      "contextItems": [],
+      "toolCallStates": [
+        {
+          "toolCallId": "call_8725465f",
+          "toolCall": {
+            "id": "call_8725465f",
+            "type": "function",
+            "function": {
+              "name": "Bash",
+              "arguments": "{\"command\":\"echo boom >&2; exit 3\"}"
+            }
+          },
+          "status": "errored",
+          "parsedArgs": {
+            "command": "echo boom >&2; exit 3"
+          },
+          "output": [
+            {
+              "content": "Error executing tool Bash: Error (exit code 3): boom\n",
+              "name": "Tool Result",
+              "description": "Tool execution result"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "toolCalls": [
+          {
+            "id": "call_59029cf0",
+            "type": "function",
+            "function": {
+              "name": "Read",
+              "arguments": "{\"filepath\":\"/nonexistent/file.txt\"}"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 100,
+          "completion_tokens": 20,
+          "total_tokens": 120,
+          "model": "qwen2.5-coder:7b",
+          "cost_cents": 0
+        }
+      },
+      "contextItems": [],
+      "toolCallStates": [
+        {
+          "toolCallId": "call_59029cf0",
+          "toolCall": {
+            "id": "call_59029cf0",
+            "type": "function",
+            "function": {
+              "name": "Read",
+              "arguments": "{\"filepath\":\"/nonexistent/file.txt\"}"
+            }
+          },
+          "status": "errored",
+          "parsedArgs": {
+            "filepath": "/nonexistent/file.txt"
+          },
+          "output": [
+            {
+              "content": "Error executing tool Read: File does not exist: /nonexistent/file.txt",
+              "name": "Tool Result",
+              "description": "Tool execution result"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "toolCalls": [
+          {
+            "id": "call_5fb6c260",
+            "type": "function",
+            "function": {
+              "name": "List",
+              "arguments": "{\"dirpath\":\".\"}"
+            }
+          },
+          {
+            "id": "call_1865a106",
+            "type": "function",
+            "function": {
+              "name": "Search",
+              "arguments": "{\"pattern\":\"hello\"}"
+            }
+          }
+        ],
+        "usage": {
+          "prompt_tokens": 100,
+          "completion_tokens": 20,
+          "total_tokens": 120,
+          "model": "qwen2.5-coder:7b",
+          "cost_cents": 0
+        }
+      },
+      "contextItems": [],
+      "toolCallStates": [
+        {
+          "toolCallId": "call_5fb6c260",
+          "toolCall": {
+            "id": "call_5fb6c260",
+            "type": "function",
+            "function": {
+              "name": "List",
+              "arguments": "{\"dirpath\":\".\"}"
+            }
+          },
+          "status": "done",
+          "parsedArgs": {
+            "dirpath": "."
+          },
+          "output": [
+            {
+              "content": "Files in /work/app:\na.txt (file, 6 bytes)",
+              "name": "Tool Result",
+              "description": "Tool execution result"
+            }
+          ]
+        },
+        {
+          "toolCallId": "call_1865a106",
+          "toolCall": {
+            "id": "call_1865a106",
+            "type": "function",
+            "function": {
+              "name": "Search",
+              "arguments": "{\"pattern\":\"hello\"}"
+            }
+          },
+          "status": "done",
+          "parsedArgs": {
+            "pattern": "hello"
+          },
+          "output": [
+            {
+              "content": "Search results for pattern \"hello\":\n\n/work/app/a.txt:1:hello\n",
+              "name": "Tool Result",
+              "description": "Tool execution result"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "message": {
+        "role": "assistant",
+        "content": "All steps done.",
+        "usage": {
+          "prompt_tokens": 100,
+          "completion_tokens": 20,
+          "total_tokens": 120,
+          "model": "qwen2.5-coder:7b",
+          "cost_cents": 0
+        }
+      },
+      "contextItems": []
+    }
+  ],
+  "usage": {
+    "totalCost": 0.0006999999999999999,
+    "promptTokens": 500,
+    "completionTokens": 100,
+    "promptTokensDetails": {
+      "cachedTokens": 0,
+      "cacheWriteTokens": 0
+    }
+  }
+}
