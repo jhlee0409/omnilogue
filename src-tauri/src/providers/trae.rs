@@ -1,20 +1,27 @@
 //! Trae IDE provider (`ByteDance` VS Code fork) — BEST-EFFORT / reverse-engineered.
 //!
-//! Trae stores chat/agent history in the per-workspace VS Code key-value DB
-//! `<UserData>/Trae/User/workspaceStorage/<hash>/state.vscdb` (`SQLite`,
-//! `ItemTable(key, value)`). The conversation lives under `ByteDance` "icube"
+//! Trae and Trae CN keep a per-workspace VS Code key-value DB
+//! `<UserData>/{Trae,Trae CN}/User/workspaceStorage/<hash>/state.vscdb` (`SQLite`,
+//! `ItemTable(key, value)`). Chat state lives under `ByteDance` "icube"
 //! keys; we query (in precedence order):
 //!   `memento/icube-ai-agent-storage` (primary; value = `{ "list": [Session] }`),
 //!   `ChatStore`, `chat.ChatSessionStore.index`, and the install-suffixed
 //!   `memento/icube-ai-chat-storage-<n>` / `memento/icube-ai-ng-chat-storage-<n>`
 //!   (matched by prefix since `<n>` is account-specific).
 //!
-//! ⚠️ Unlike the other providers, this schema is NOT from official source — it is
-//! reverse-engineered from the `trae-chats-exporter` community tool, the keys are
-//! install-specific, and the Agent/SOLO-mode content is deeply nested. It has not
-//! been verified against a real Trae install. Parsing is therefore defensive
-//! (multiple field-name fallbacks) and renders text content; structured tool
-//! calls in Agent mode are flattened to text. Treat as provisional.
+//! On Trae CN, `memento/icube-ai-agent-storage` is only the session list
+//! (`list[].sessionId`, …): the messages are in
+//! `ModularData/ai-agent/database.db`, which is encrypted (measured: no
+//! `SQLite format 3` header, 8.000 bits/byte entropy; `trae-cn-usage-tracker`
+//! `docs/maintenance/trae-cn-format.md`). Such a session is listed with a
+//! notice saying so; the database is not read.
+//!
+//! ⚠️ The message shapes are NOT from official source — they come from the
+//! `trae-chats-exporter` community tool, the keys are install-specific, and the
+//! Agent/SOLO-mode content is deeply nested. They have not been verified
+//! against a real Trae install. Parsing is therefore defensive (multiple
+//! field-name fallbacks) and renders text content; structured tool calls in
+//! Agent mode are flattened to text. Treat as provisional.
 
 use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession};
 use crate::providers::ProviderInfo;
@@ -29,6 +36,28 @@ const SCHEME: &str = "trae://";
 const SESSION_SEP: char = '#';
 const SUMMARY_MAX_CHARS: usize = 80;
 
+/// A Trae edition: its data directory under the config dir, and the prefix
+/// its project paths carry after `trae://` — one folder opened in both
+/// editions has the same workspace hash in each.
+struct Edition {
+    dir: &'static str,
+    prefix: &'static str,
+}
+
+const EDITIONS: [Edition; 2] = [
+    Edition {
+        dir: "Trae",
+        prefix: "",
+    },
+    Edition {
+        dir: "Trae CN",
+        prefix: "cn/",
+    },
+];
+
+/// Shown in a session whose messages Trae did not keep in `state.vscdb`.
+const ENCRYPTED_NOTICE: &str = "Trae keeps this conversation's messages in its agent database (ModularData/ai-agent/database.db), which is encrypted, so they cannot be shown.";
+
 /// Exact icube keys to try, in precedence order.
 const EXACT_KEYS: &[&str] = &[
     "memento/icube-ai-agent-storage",
@@ -41,35 +70,59 @@ const KEY_PREFIXES: &[&str] = &[
     "memento/icube-ai-chat-storage-",
 ];
 
-/// `<UserData>/Trae/User/workspaceStorage` (`dirs::config_dir()` resolves to
+/// `<UserData>/<edition>/User/workspaceStorage` (`dirs::config_dir()` resolves to
 /// `~/Library/Application Support` on macOS, `~/.config` on Linux, `%APPDATA%`
-/// on Windows — matching VS Code-family layout).
-fn workspace_storage() -> Option<PathBuf> {
-    let dir = dirs::config_dir()?
-        .join("Trae")
-        .join("User")
-        .join("workspaceStorage");
-    if dir.is_dir() {
-        Some(dir)
-    } else {
-        None
-    }
+/// on Windows — matching VS Code-family layout), for each edition installed.
+fn storages() -> Vec<(&'static str, PathBuf)> {
+    let Some(config) = dirs::config_dir() else {
+        return Vec::new();
+    };
+    EDITIONS
+        .iter()
+        .map(|e| {
+            (
+                e.prefix,
+                config.join(e.dir).join("User").join("workspaceStorage"),
+            )
+        })
+        .filter(|(_, dir)| dir.is_dir())
+        .collect()
 }
 
 /// Detect a Trae installation (any workspace with a `state.vscdb`).
 pub fn detect() -> Option<ProviderInfo> {
-    let storage = workspace_storage()?;
+    let storages = storages();
+    let (_, first) = storages.first()?;
     Some(ProviderInfo {
         id: PROVIDER.to_string(),
         display_name: "Trae".to_string(),
-        is_available: !workspace_dbs(&storage).is_empty(),
-        base_path: storage.to_string_lossy().to_string(),
+        is_available: storages
+            .iter()
+            .any(|(_, storage)| !workspace_dbs(storage).is_empty()),
+        base_path: first.to_string_lossy().to_string(),
     })
 }
 
-/// Base path (`…/Trae/User/workspaceStorage`), for the file watcher.
-pub fn get_base_path() -> Option<String> {
-    workspace_storage().map(|p| p.to_string_lossy().to_string())
+/// Each installed edition's `…/User/workspaceStorage`, for the file watcher
+/// and the session-path allowlist.
+pub fn base_paths() -> Vec<PathBuf> {
+    storages().into_iter().map(|(_, dir)| dir).collect()
+}
+
+/// The workspace `state.vscdb` a project key `[cn/]<hash>` names, with the
+/// key's project path; `None` for a malformed hash or a missing DB.
+fn workspace_db(key: &str) -> Option<(String, PathBuf)> {
+    let key = key.strip_prefix(SCHEME).unwrap_or(key);
+    let (prefix, hash) = match key.strip_prefix("cn/") {
+        Some(hash) => ("cn/", hash),
+        None => ("", key),
+    };
+    if !valid_hash(hash) {
+        return None;
+    }
+    let (_, storage) = storages().into_iter().find(|(p, _)| *p == prefix)?;
+    let db = storage.join(hash).join("state.vscdb");
+    db.is_file().then(|| (project_path_for(prefix, hash), db))
 }
 
 /// `(hash, state.vscdb path)` for each workspace that has a DB.
@@ -107,17 +160,16 @@ fn open_db(path: &Path) -> Result<Connection, String> {
     Ok(conn)
 }
 
-/// Read the first present icube conversation value from a workspace DB.
+/// The icube value to read a workspace's sessions from: the first, in key
+/// precedence, whose sessions carry messages; else the first that lists
+/// sessions at all (a Trae CN session list).
 fn read_icube_value(conn: &Connection) -> Option<Value> {
+    let mut values = Vec::new();
     for key in EXACT_KEYS {
         if let Ok(raw) = conn.query_row("SELECT value FROM ItemTable WHERE key = ?1", [key], |r| {
             r.get::<_, String>(0)
         }) {
-            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-                if !extract_sessions(&v).is_empty() {
-                    return Some(v);
-                }
-            }
+            values.extend(serde_json::from_str::<Value>(&raw).ok());
         }
     }
     for prefix in KEY_PREFIXES {
@@ -127,14 +179,14 @@ fn read_icube_value(conn: &Connection) -> Option<Value> {
             [&like],
             |r| r.get::<_, String>(0),
         ) {
-            if let Ok(v) = serde_json::from_str::<Value>(&raw) {
-                if !extract_sessions(&v).is_empty() {
-                    return Some(v);
-                }
-            }
+            values.extend(serde_json::from_str::<Value>(&raw).ok());
         }
     }
-    None
+    let position = values
+        .iter()
+        .position(|v| extract_sessions(v).iter().any(|s| !s.messages.is_empty()))
+        .or_else(|| values.iter().position(|v| !extract_sessions(v).is_empty()))?;
+    Some(values.swap_remove(position))
 }
 
 /// The workspace folder path from `workspace.json` (folder URI), for display.
@@ -147,10 +199,10 @@ fn workspace_folder(db_path: &Path) -> Option<String> {
     Some(folder.strip_prefix("file://").unwrap_or(folder).to_string())
 }
 
-/// Project identity for a workspace `<hash>` — shared by scan and search so
-/// search hits group under the scanned project (#672).
-fn project_path_for(hash: &str) -> String {
-    format!("{SCHEME}{hash}")
+/// Project identity for an edition's workspace `<hash>` — shared by scan and
+/// search so search hits group under the scanned project (#672).
+fn project_path_for(prefix: &str, hash: &str) -> String {
+    format!("{SCHEME}{prefix}{hash}")
 }
 
 /// Display name for a workspace folder (or hash fallback): its leaf, else
@@ -163,20 +215,20 @@ fn project_name_for(folder: &str) -> String {
         .unwrap_or_else(|| folder.to_string())
 }
 
-/// Scan Trae projects — one per workspace that has parseable chat sessions.
+/// Scan Trae projects — one per workspace that lists chat sessions.
 pub fn scan_projects() -> Result<Vec<ClaudeProject>, String> {
-    let Some(storage) = workspace_storage() else {
-        return Ok(vec![]);
-    };
-    Ok(scan_projects_in(&storage))
+    Ok(storages()
+        .into_iter()
+        .flat_map(|(prefix, storage)| scan_projects_in(prefix, &storage))
+        .collect())
 }
 
-fn scan_projects_in(storage: &Path) -> Vec<ClaudeProject> {
+fn scan_projects_in(prefix: &str, storage: &Path) -> Vec<ClaudeProject> {
     // One state.vscdb open per workspace (5s busy_timeout when locked) — with
     // many workspaces the sequential loop dominated startup. Bounded parallel
     // map, input order preserved; a broken workspace DB just yields None.
     crate::utils::par_map_bounded(workspace_dbs(storage), |(hash, db_path)| {
-        scan_workspace(&hash, &db_path)
+        scan_workspace(&project_path_for(prefix, &hash), &hash, &db_path)
     })
     .into_iter()
     .flatten()
@@ -184,8 +236,8 @@ fn scan_projects_in(storage: &Path) -> Vec<ClaudeProject> {
 }
 
 /// One workspace `(hash, state.vscdb)` → one project, or `None` when the DB is
-/// unreadable or has no parseable chat sessions.
-fn scan_workspace(hash: &str, db_path: &Path) -> Option<ClaudeProject> {
+/// unreadable or lists no chat sessions.
+fn scan_workspace(project_path: &str, hash: &str, db_path: &Path) -> Option<ClaudeProject> {
     let conn = open_db(db_path).ok()?;
     let value = read_icube_value(&conn)?;
     let sessions = extract_sessions(&value);
@@ -194,10 +246,10 @@ fn scan_workspace(hash: &str, db_path: &Path) -> Option<ClaudeProject> {
     }
     let folder = workspace_folder(db_path).unwrap_or_else(|| hash.to_string());
     let name = project_name_for(&folder);
-    let message_count: usize = sessions.iter().map(|s| s.messages.len()).sum();
+    let message_count: usize = sessions.iter().map(|s| s.to_messages().len()).sum();
     Some(ClaudeProject {
         name,
-        path: project_path_for(hash),
+        path: project_path.to_string(),
         actual_path: folder,
         session_count: sessions.len(),
         message_count,
@@ -209,27 +261,19 @@ fn scan_workspace(hash: &str, db_path: &Path) -> Option<ClaudeProject> {
     })
 }
 
-/// Load the chat sessions for one Trae workspace (`trae://<hash>`).
+/// Load the chat sessions for one Trae workspace (`trae://[cn/]<hash>`).
 pub fn load_sessions(
     project_path: &str,
     _exclude_sidechain: bool,
 ) -> Result<Vec<ClaudeSession>, String> {
-    let hash = project_path.strip_prefix(SCHEME).unwrap_or(project_path);
-    if !valid_hash(hash) {
-        return Ok(vec![]);
-    }
-    let Some(storage) = workspace_storage() else {
+    let Some((project_path, db_path)) = workspace_db(project_path) else {
         return Ok(vec![]);
     };
-    let db_path = storage.join(hash).join("state.vscdb");
-    if !db_path.is_file() {
-        return Ok(vec![]);
-    }
     let conn = open_db(&db_path)?;
     let Some(value) = read_icube_value(&conn) else {
         return Ok(vec![]);
     };
-    let folder = workspace_folder(&db_path).unwrap_or_else(|| hash.to_string());
+    let folder = workspace_folder(&db_path).unwrap_or_default();
     let project_name = Path::new(&folder)
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -244,15 +288,16 @@ pub fn load_sessions(
                 .filter(|t| !t.trim().is_empty())
                 .or_else(|| s.first_user_text().map(|t| summarize(&t)))
                 .or_else(|| Some(s.id.clone()));
+            let created = created_at(&s.id).unwrap_or_default();
             ClaudeSession {
-                session_id: format!("{SCHEME}{hash}{SESSION_SEP}{}", s.id),
+                session_id: format!("{project_path}{SESSION_SEP}{}", s.id),
                 actual_session_id: s.id.clone(),
-                file_path: format!("{SCHEME}{hash}{SESSION_SEP}{}", s.id),
+                file_path: format!("{project_path}{SESSION_SEP}{}", s.id),
                 project_name: project_name.clone(),
-                message_count: s.messages.len(),
-                first_message_time: String::new(),
-                last_message_time: String::new(),
-                last_modified: String::new(),
+                message_count: s.to_messages().len(),
+                first_message_time: created.clone(),
+                last_message_time: created.clone(),
+                last_modified: created,
                 has_tool_use: false,
                 has_errors: false,
                 summary,
@@ -266,19 +311,12 @@ pub fn load_sessions(
     Ok(sessions)
 }
 
-/// Load messages for one Trae session (`trae://<hash>#<sessionId>`).
+/// Load messages for one Trae session (`trae://[cn/]<hash>#<sessionId>`).
 pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
-    let (hash, session_id) = parse_session_path(session_path)?;
-    if !valid_hash(&hash) {
-        return Ok(vec![]);
-    }
-    let Some(storage) = workspace_storage() else {
+    let (key, session_id) = parse_session_path(session_path)?;
+    let Some((_, db_path)) = workspace_db(&key) else {
         return Ok(vec![]);
     };
-    let db_path = storage.join(&hash).join("state.vscdb");
-    if !db_path.is_file() {
-        return Ok(vec![]);
-    }
     let conn = open_db(&db_path)?;
     let Some(value) = read_icube_value(&conn) else {
         return Ok(vec![]);
@@ -294,29 +332,39 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
 
 /// Search across all Trae sessions.
 pub fn search(query: &str, limit: usize) -> Result<Vec<ClaudeMessage>, String> {
-    let Some(storage) = workspace_storage() else {
-        return Ok(vec![]);
-    };
-    Ok(search_in(&storage, query, limit))
+    let mut results = Vec::new();
+    for (prefix, storage) in storages() {
+        search_in(prefix, &storage, query, limit, &mut results);
+    }
+    Ok(results)
 }
 
-fn search_in(storage: &Path, query: &str, limit: usize) -> Vec<ClaudeMessage> {
+fn search_in(
+    prefix: &str,
+    storage: &Path,
+    query: &str,
+    limit: usize,
+    results: &mut Vec<ClaudeMessage>,
+) {
     let query_lower = query.to_lowercase();
-    let mut results = Vec::new();
     for (hash, db_path) in workspace_dbs(storage) {
         let folder = workspace_folder(&db_path).unwrap_or_else(|| hash.clone());
         let project_name = project_name_for(&folder);
-        let project_path = project_path_for(&hash);
+        let project_path = project_path_for(prefix, &hash);
         let Ok(conn) = open_db(&db_path) else {
             continue;
         };
         let Some(value) = read_icube_value(&conn) else {
             continue;
         };
-        for session in extract_sessions(&value) {
+        // A session without messages shows only the notice; nothing to find.
+        for session in extract_sessions(&value)
+            .into_iter()
+            .filter(|s| !s.messages.is_empty())
+        {
             for mut msg in session.to_messages() {
                 if results.len() >= limit {
-                    return results;
+                    return;
                 }
                 let matched = msg
                     .content
@@ -331,7 +379,21 @@ fn search_in(storage: &Path, query: &str, limit: usize) -> Vec<ClaudeMessage> {
             }
         }
     }
-    results
+}
+
+/// A session's creation time from its id: on Trae CN the first four hex
+/// bytes of a session id are its creation second (measured against each
+/// session's first turn: median 0 s, worst 144 s, never later). `None` for an
+/// id that does not start with eight hex digits naming a plausible time.
+fn created_at(id: &str) -> Option<String> {
+    let head = id.get(..8)?;
+    let seconds = i64::from_str_radix(head, 16).ok()?;
+    // 2020-01-01 .. 2100-01-01: anything else is not a timestamp prefix.
+    if !(1_577_836_800..4_102_444_800).contains(&seconds) {
+        return None;
+    }
+    chrono::DateTime::from_timestamp(seconds, 0)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
 }
 
 // ============================================================================
@@ -355,7 +417,21 @@ impl TraeSession {
         })
     }
 
+    /// The session's messages; a session Trae listed without any shows the
+    /// [`ENCRYPTED_NOTICE`] instead.
     fn to_messages(&self) -> Vec<ClaudeMessage> {
+        if self.messages.is_empty() {
+            return vec![build_provider_message(
+                PROVIDER,
+                format!("{}-notice", self.id),
+                &self.id,
+                created_at(&self.id).unwrap_or_default(),
+                "system",
+                None,
+                Some(Value::String(ENCRYPTED_NOTICE.to_string())),
+                None,
+            )];
+        }
         let mut out = Vec::new();
         for (idx, m) in self.messages.iter().enumerate() {
             let Some(role) = role_of(m) else {
@@ -426,9 +502,6 @@ fn extract_sessions(value: &Value) -> Vec<TraeSession> {
                 .iter()
                 .find_map(|k| s.get(*k).and_then(Value::as_array).cloned())
                 .unwrap_or_default();
-            if messages.is_empty() {
-                return None;
-            }
             Some(TraeSession {
                 id,
                 title,
@@ -551,7 +624,9 @@ mod tests {
             ]
         });
         let sessions = extract_sessions(&value);
-        assert_eq!(sessions.len(), 1); // empty skipped
+        // A listed session without messages is kept (it shows the notice).
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[1].messages.len(), 0);
         assert_eq!(sessions[0].id, "sess-a");
         assert_eq!(sessions[0].title.as_deref(), Some("Fix LOGIN"));
         let msgs = sessions[0].to_messages();
@@ -663,7 +738,7 @@ mod tests {
         std::fs::create_dir_all(&bad_ws).unwrap();
         std::fs::write(bad_ws.join("state.vscdb"), b"this is not a sqlite database").unwrap();
 
-        let projects = scan_projects_in(tmp.path());
+        let projects = scan_projects_in("", tmp.path());
         assert_eq!(projects.len(), 1, "only the valid workspace: {projects:?}");
         assert_eq!(projects[0].name, "ok-proj");
         assert_eq!(projects[0].session_count, 1);
@@ -696,7 +771,7 @@ mod tests {
             .unwrap();
         }
 
-        let projects = scan_projects_in(tmp.path());
+        let projects = scan_projects_in("", tmp.path());
         let path_of = |folder: &str| {
             projects
                 .iter()
@@ -708,7 +783,8 @@ mod tests {
         let b = path_of("/work/client-b/app");
         assert_ne!(a, b);
 
-        let hits = search_in(tmp.path(), "needle", 10);
+        let mut hits = Vec::new();
+        search_in("", tmp.path(), "needle", 10, &mut hits);
         assert_eq!(hits.len(), 2);
         for hit in &hits {
             // Each fixture session id is its workspace hash.
@@ -716,5 +792,85 @@ mod tests {
             assert_eq!(hit.project_path.as_ref(), Some(expected));
             assert_eq!(hit.project_name.as_deref(), Some("app"));
         }
+    }
+
+    /// A Trae CN workspace: `memento/icube-ai-agent-storage` lists sessions
+    /// (`list[].sessionId`) and holds no messages — they are in the encrypted
+    /// agent database. Each session is still listed, under a `cn/` project
+    /// path, dated by its id, with one notice in place of the messages.
+    #[test]
+    fn trae_cn_session_list_is_shown_with_the_encrypted_notice() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let ws = tmp.path().join("hash-cn");
+        std::fs::create_dir_all(&ws).unwrap();
+        let conn = Connection::open(ws.join("state.vscdb")).unwrap();
+        conn.execute("CREATE TABLE ItemTable (key TEXT, value TEXT)", [])
+            .unwrap();
+        let value = json!({ "list": [
+            { "sessionId": "68e4f0a1c2d3e4f5a6b7c8d9", "agent_id": "builder", "modelId": "m" }
+        ] })
+        .to_string();
+        conn.execute(
+            "INSERT INTO ItemTable VALUES ('memento/icube-ai-agent-storage', ?1)",
+            [&value],
+        )
+        .unwrap();
+        drop(conn);
+
+        let projects = scan_projects_in("cn/", tmp.path());
+        assert_eq!(projects.len(), 1);
+        assert_eq!(projects[0].path, "trae://cn/hash-cn");
+        assert_eq!(projects[0].session_count, 1);
+        assert_eq!(projects[0].message_count, 1, "the notice");
+
+        let conn = open_db(&ws.join("state.vscdb")).unwrap();
+        let sessions = extract_sessions(&read_icube_value(&conn).unwrap());
+        let messages = sessions[0].to_messages();
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].message_type, "system");
+        assert_eq!(messages[0].content, Some(json!(ENCRYPTED_NOTICE)));
+        // 0x68e4f0a1 seconds.
+        assert_eq!(messages[0].timestamp, "2025-10-07T10:51:13Z");
+
+        let mut hits = Vec::new();
+        search_in("cn/", tmp.path(), "encrypted", 10, &mut hits);
+        assert!(hits.is_empty(), "the notice is not conversation text");
+    }
+
+    #[test]
+    fn created_at_reads_only_a_plausible_hex_second_prefix() {
+        assert_eq!(
+            created_at("68e4f0a1-rest").as_deref(),
+            Some("2025-10-07T10:51:13Z")
+        );
+        assert_eq!(created_at("sess-1"), None);
+        assert_eq!(created_at("00000001abc"), None, "1970 is not a session");
+    }
+
+    /// A value whose sessions carry messages wins over an earlier key that
+    /// only lists sessions.
+    #[test]
+    fn read_icube_value_prefers_sessions_with_messages() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE ItemTable (key TEXT, value TEXT)", [])
+            .unwrap();
+        for (key, value) in [
+            (
+                "memento/icube-ai-agent-storage",
+                json!({ "list": [{ "sessionId": "s1" }] }),
+            ),
+            (
+                "ChatStore",
+                json!({ "list": [{ "id": "s1", "messages": [{ "role": "user", "content": "hi" }] }] }),
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO ItemTable VALUES (?1, ?2)",
+                [key, &value.to_string()],
+            )
+            .unwrap();
+        }
+        let sessions = extract_sessions(&read_icube_value(&conn).unwrap());
+        assert_eq!(sessions[0].messages.len(), 1);
     }
 }
