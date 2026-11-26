@@ -472,6 +472,10 @@ fn convert_content_array(content: Option<&Value>, is_user: bool) -> Option<Value
             .strip_prefix("<user_query>")
             .and_then(|rest| rest.trim_end().strip_suffix("</user_query>"))
             .map_or(text, str::trim);
+        // `<user_query> </user_query>` is as empty as blank text.
+        if text.trim().is_empty() {
+            return None;
+        }
         Some(serde_json::json!({"type": "text", "text": text}))
     };
     let items: Vec<Value> = match content? {
@@ -1447,6 +1451,7 @@ mod tests {
                 "<task-notification><task-id>t1</task-id></task-notification>",
                 json!({}),
             ),
+            user("<user_query> \n </user_query>", json!({})),
             json!({"type": "topic", "topic": "Build fix"}),
             json!({"type": "ai-title", "aiTitle": "Fixing the build"}),
             json!({"type": "custom-title", "customTitle": "My rename"}),
