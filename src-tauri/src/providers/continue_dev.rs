@@ -455,6 +455,22 @@ fn parse_session_doc(
     // Results already shown from a call's `toolCallStates`, so a separate
     // `role: "tool"` item for the same call is not shown twice.
     let mut shown_results: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // Calls that failed without output whose `role: "tool"` item is shown
+    // instead of the fallback text, marked failed.
+    let mut failed_calls: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let tool_items: std::collections::HashSet<String> = history
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item.get("message"))
+        .filter(|m| m.get("role").and_then(Value::as_str) == Some("tool"))
+        .filter_map(|m| m.get("toolCallId").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect();
+    let mut results = ToolResults {
+        shown: &mut shown_results,
+        failed: &mut failed_calls,
+        tool_items: &tool_items,
+    };
     let mut idx = 0u64;
 
     if let Some(history) = history {
@@ -475,7 +491,7 @@ fn parse_session_doc(
                     (role, content)
                 }
                 "assistant" => {
-                    let blocks = assistant_blocks(item, message, &mut shown_results);
+                    let blocks = assistant_blocks(item, message, &mut results);
                     has_tool_use |= blocks.iter().any(|b| b["type"] == "tool_use");
                     has_errors |= blocks.iter().any(|b| b["is_error"] == true);
                     if blocks.is_empty() {
@@ -484,32 +500,46 @@ fn parse_session_doc(
                     (role, Some(Value::Array(blocks)))
                 }
                 "thinking" => {
-                    let Some(text) = message.get("content").and_then(extract_text) else {
+                    // Continue's `ThinkingChatMessage` may carry `toolCalls`
+                    // too: its text is reasoning, its calls are calls.
+                    let mut blocks: Vec<Value> = message
+                        .get("content")
+                        .and_then(extract_text)
+                        .map(|text| serde_json::json!({"type": "thinking", "thinking": text}))
+                        .into_iter()
+                        .collect();
+                    let mut calls_only = message.clone();
+                    if let Some(obj) = calls_only.as_object_mut() {
+                        obj.remove("content");
+                    }
+                    blocks.extend(assistant_blocks(item, &calls_only, &mut results));
+                    has_tool_use |= blocks.iter().any(|b| b["type"] == "tool_use");
+                    has_errors |= blocks.iter().any(|b| b["is_error"] == true);
+                    if blocks.is_empty() {
                         continue;
-                    };
-                    (
-                        "assistant",
-                        Some(serde_json::json!([{"type": "thinking", "thinking": text}])),
-                    )
+                    }
+                    ("assistant", Some(Value::Array(blocks)))
                 }
                 "tool" => {
                     let id = message
                         .get("toolCallId")
                         .and_then(Value::as_str)
                         .unwrap_or_default();
-                    if shown_results.contains(id) {
+                    if results.shown.contains(id) {
                         continue;
                     }
                     let text = message
                         .get("content")
                         .and_then(extract_text)
                         .unwrap_or_default();
-                    (
-                        "user",
-                        Some(serde_json::json!([
-                            {"type": "tool_result", "tool_use_id": id, "content": text}
-                        ])),
-                    )
+                    let mut result = serde_json::json!(
+                        {"type": "tool_result", "tool_use_id": id, "content": text}
+                    );
+                    if results.failed.contains(id) {
+                        result["is_error"] = Value::Bool(true);
+                        has_errors = true;
+                    }
+                    ("user", Some(serde_json::json!([result])))
                 }
                 _ => continue,
             };
@@ -539,6 +569,16 @@ fn parse_session_doc(
     })
 }
 
+/// What [`assistant_blocks`] knows of results across the history.
+struct ToolResults<'a> {
+    /// Calls whose result a `toolCallStates` entry already showed.
+    shown: &'a mut std::collections::HashSet<String>,
+    /// Calls that failed without output, left to their `role: "tool"` item.
+    failed: &'a mut std::collections::HashSet<String>,
+    /// Calls the history answers with a `role: "tool"` item.
+    tool_items: &'a std::collections::HashSet<String>,
+}
+
 /// An assistant history item as content blocks: its reasoning, its text,
 /// then each tool call with its result.
 ///
@@ -546,12 +586,9 @@ fn parse_session_doc(
 /// (`ToolCallState {toolCallId, toolCall: {function: {name, arguments}},
 /// status, parsedArgs, output?: ContextItem[]}`); a call the message lists in
 /// `toolCalls` without a state is shown without a result. A call whose
-/// status is `errored` or `canceled` is a failure.
-fn assistant_blocks(
-    item: &Value,
-    message: &Value,
-    shown_results: &mut std::collections::HashSet<String>,
-) -> Vec<Value> {
+/// status is `errored` or `canceled` is a failure; with no output, its
+/// `role: "tool"` item is its result, else a sentence saying it failed.
+fn assistant_blocks(item: &Value, message: &Value, results: &mut ToolResults<'_>) -> Vec<Value> {
     let mut blocks = Vec::new();
     if let Some(text) = item
         .get("reasoning")
@@ -625,6 +662,11 @@ fn assistant_blocks(
                 .filter_map(|ctx| ctx.get("content").and_then(Value::as_str))
                 .collect::<Vec<_>>()
                 .join("\n");
+            if text.is_empty() && failed && results.tool_items.contains(id) {
+                // The `role: "tool"` item holds what went wrong.
+                results.failed.insert(id.to_string());
+                continue;
+            }
             let text = match (text.is_empty(), status) {
                 (true, Some(status)) if failed => format!("The tool call {status}."),
                 _ => text,
@@ -638,7 +680,7 @@ fn assistant_blocks(
                 result["is_error"] = Value::Bool(true);
             }
             blocks.push(result);
-            shown_results.insert(id.to_string());
+            results.shown.insert(id.to_string());
         }
     }
     for call in listed {
@@ -1110,6 +1152,41 @@ mod tests {
         assert_eq!(call[1]["type"], "tool_result");
         assert_eq!(call[1]["is_error"], true);
         assert_eq!(call[1]["content"], "The tool call canceled.");
+        assert!(doc.has_errors);
+    }
+
+    /// An errored call without output whose `role: "tool"` item says what
+    /// went wrong shows that text, failed; and calls on a `thinking` item
+    /// are shown with their results.
+    #[test]
+    fn a_failed_calls_tool_item_wins_and_thinking_items_keep_their_calls() {
+        let call = |id: &str| {
+            serde_json::json!({"id": id, "type": "function",
+                "function": {"name": "Read", "arguments": "{\"path\":\"/w/a\"}"}})
+        };
+        let data = serde_json::json!({"sessionId": "s", "history": [
+            {"message": {"role": "assistant", "content": "", "toolCalls": [call("c1")]},
+             "toolCallStates": [{"toolCallId": "c1", "toolCall": call("c1"), "status": "errored"}]},
+            {"message": {"role": "tool", "toolCallId": "c1", "content": "Permission denied: /w/a"}},
+            {"message": {"role": "thinking", "content": "", "toolCalls": [call("c2")]}},
+            {"message": {"role": "tool", "toolCallId": "c2", "content": "file text"}}
+        ]})
+        .to_string();
+        let doc = parse_session_doc(&data, "continue", "s", "").unwrap();
+        let blocks: Vec<Value> = doc
+            .messages
+            .iter()
+            .flat_map(|m| m.content.clone().unwrap().as_array().unwrap().clone())
+            .collect();
+        let kinds: Vec<&str> = blocks.iter().map(|b| b["type"].as_str().unwrap()).collect();
+        assert_eq!(
+            kinds,
+            ["tool_use", "tool_result", "tool_use", "tool_result"]
+        );
+        assert_eq!(blocks[1]["content"], "Permission denied: /w/a");
+        assert_eq!(blocks[1]["is_error"], true);
+        assert_eq!(blocks[2]["id"], "c2");
+        assert_eq!(blocks[3]["tool_use_id"], "c2");
         assert!(doc.has_errors);
     }
 }
