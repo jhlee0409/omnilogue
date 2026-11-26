@@ -85,8 +85,18 @@ fn storages() -> Vec<(&'static str, PathBuf)> {
                 config.join(e.dir).join("User").join("workspaceStorage"),
             )
         })
-        .filter(|(_, dir)| dir.is_dir())
+        // A symlinked root could name another edition's storage (or any
+        // folder); it is not read.
+        .filter(|(_, dir)| is_real_dir(dir))
         .collect()
+}
+
+fn is_real_dir(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_dir())
+}
+
+fn is_real_file(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_file())
 }
 
 /// Detect a Trae installation (any workspace with a `state.vscdb`).
@@ -110,8 +120,13 @@ pub fn base_paths() -> Vec<PathBuf> {
 }
 
 /// The workspace `state.vscdb` a project key `[cn/]<hash>` names, with the
-/// key's project path; `None` for a malformed hash or a missing DB.
+/// key's project path; `None` for a malformed hash, a missing DB, or a
+/// symlinked workspace or DB (as [`workspace_dbs`] skips them).
 fn workspace_db(key: &str) -> Option<(String, PathBuf)> {
+    workspace_db_in(key, &storages())
+}
+
+fn workspace_db_in(key: &str, storages: &[(&str, PathBuf)]) -> Option<(String, PathBuf)> {
     let key = key.strip_prefix(SCHEME).unwrap_or(key);
     let (prefix, hash) = match key.strip_prefix("cn/") {
         Some(hash) => ("cn/", hash),
@@ -120,9 +135,35 @@ fn workspace_db(key: &str) -> Option<(String, PathBuf)> {
     if !valid_hash(hash) {
         return None;
     }
-    let (_, storage) = storages().into_iter().find(|(p, _)| *p == prefix)?;
-    let db = storage.join(hash).join("state.vscdb");
-    db.is_file().then(|| (project_path_for(prefix, hash), db))
+    let (_, storage) = storages.iter().find(|(p, _)| *p == prefix)?;
+    let workspace = storage.join(hash);
+    let db = workspace.join("state.vscdb");
+    (is_real_dir(&workspace) && is_real_file(&db)).then(|| (project_path_for(prefix, hash), db))
+}
+
+/// The project a changed file belongs to, for the file watcher: a file of
+/// workspace `<hash>` (`state.vscdb` or its journal) in an edition's storage
+/// refreshes that workspace's project. Returned as `(project, project)`: the
+/// change can be any of its sessions.
+pub fn watch_event(path: &Path) -> Option<(String, String)> {
+    watch_event_in(path, &storages())
+}
+
+fn watch_event_in(path: &Path, storages: &[(&str, PathBuf)]) -> Option<(String, String)> {
+    let file = path.file_name()?.to_str()?;
+    if !file.starts_with("state.vscdb") {
+        return None;
+    }
+    let workspace = path.parent()?;
+    let hash = workspace.file_name()?.to_str()?;
+    let (prefix, _) = storages
+        .iter()
+        .find(|(_, storage)| workspace.parent() == Some(storage.as_path()))?;
+    if !valid_hash(hash) {
+        return None;
+    }
+    let project = project_path_for(prefix, hash);
+    Some((project.clone(), project))
 }
 
 /// `(hash, state.vscdb path)` for each workspace that has a DB.
@@ -136,7 +177,7 @@ fn workspace_dbs(storage: &Path) -> Vec<(String, PathBuf)> {
         .filter(|e| e.file_type().is_dir())
         .filter_map(|e| {
             let db = e.path().join("state.vscdb");
-            if db.is_file() {
+            if is_real_file(&db) {
                 Some((e.file_name().to_string_lossy().to_string(), db))
             } else {
                 None
@@ -872,5 +913,60 @@ mod tests {
         }
         let sessions = extract_sessions(&read_icube_value(&conn).unwrap());
         assert_eq!(sessions[0].messages.len(), 1);
+    }
+
+    fn workspace(storage: &Path, hash: &str) -> PathBuf {
+        let ws = storage.join(hash);
+        std::fs::create_dir_all(&ws).unwrap();
+        std::fs::write(ws.join("state.vscdb"), b"").unwrap();
+        ws
+    }
+
+    #[test]
+    fn a_workspace_db_change_refreshes_its_editions_project() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let trae = tmp.path().join("Trae/User/workspaceStorage");
+        let cn = tmp.path().join("Trae CN/User/workspaceStorage");
+        let storages = [("", trae.clone()), ("cn/", cn.clone())];
+        let project = |p: &str| Some((p.to_string(), p.to_string()));
+
+        assert_eq!(
+            watch_event_in(&cn.join("abc/state.vscdb"), &storages),
+            project("trae://cn/abc")
+        );
+        assert_eq!(
+            watch_event_in(&trae.join("abc/state.vscdb-journal"), &storages),
+            project("trae://abc")
+        );
+        assert_eq!(
+            watch_event_in(&cn.join("abc/workspace.json"), &storages),
+            None
+        );
+        assert_eq!(
+            watch_event_in(&cn.join("abc/deeper/state.vscdb"), &storages),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_workspaces_and_dbs_are_not_opened_by_key() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::TempDir::new().unwrap();
+        let storage = tmp.path().join("storage");
+        let outside = workspace(&tmp.path().join("outside"), "real");
+        workspace(&storage, "ok");
+        symlink(&outside, storage.join("linked-ws")).unwrap();
+        std::fs::create_dir_all(storage.join("linked-db")).unwrap();
+        symlink(
+            outside.join("state.vscdb"),
+            storage.join("linked-db/state.vscdb"),
+        )
+        .unwrap();
+        let storages = [("", storage)];
+
+        assert!(workspace_db_in("trae://ok", &storages).is_some());
+        assert!(workspace_db_in("trae://linked-ws", &storages).is_none());
+        assert!(workspace_db_in("trae://linked-db", &storages).is_none());
     }
 }

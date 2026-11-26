@@ -528,6 +528,10 @@ fn extract_provider_paths(path: &Path) -> Option<(String, String)> {
     if let Some(change) = classify_antigravity_path(path) {
         return Some(resolve_antigravity_change(change));
     }
+    // Trae / Trae CN workspace databases (`state.vscdb` and its journal).
+    if let Some(paths) = providers::trae::watch_event(path) {
+        return Some(paths);
+    }
     let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
         // Vibe's unified store points at the current generation through an
         // extensionless `CURRENT` file.
