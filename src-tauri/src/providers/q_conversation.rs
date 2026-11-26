@@ -10,9 +10,16 @@
 //! `value` JSON: `{ "history": [ { "user": {...}, "assistant": {...} }, ... ] }`
 //! with externally-tagged enums:
 //! - `user.content`: `Prompt{prompt}` | `ToolUseResults{tool_use_results}` |
-//!   `CancelledToolUses{prompt?, tool_use_results}`
+//!   `CancelledToolUses{prompt?, tool_use_results}`; each result is
+//!   `{tool_use_id, content: [{Text} | {Json}], status: Success | Error}`
 //! - `assistant`: `Response{message_id?, content}` |
 //!   `ToolUse{message_id?, content, tool_uses[]{id,name,args}}`
+//!
+//! Source: `aws/amazon-q-developer-cli` `crates/chat-cli/src/cli/chat/`
+//! (`message.rs`, `conversation.rs`, `tools/`) at `15cc8f3c`. While the CLI is
+//! in tangent mode, `history` is the main conversation followed by the
+//! tangent's turns (`tangent_state.main_history` is that prefix), so the
+//! saved row still holds the whole main conversation.
 
 use crate::models::ClaudeMessage;
 use crate::utils::build_provider_message;
@@ -94,6 +101,20 @@ pub(crate) fn message_count(value_json: &str) -> usize {
     parse_history("", value_json, "count").len()
 }
 
+/// `(has_tool_use, has_errors)` of parsed messages: any tool call, and any
+/// tool result recorded with `status: "Error"`.
+pub(crate) fn session_flags(messages: &[ClaudeMessage]) -> (bool, bool) {
+    let blocks = || {
+        messages
+            .iter()
+            .filter_map(|m| m.content.as_ref()?.as_array())
+            .flatten()
+    };
+    let has_tool_use = blocks().any(|b| b.get("type").and_then(Value::as_str) == Some("tool_use"));
+    let has_errors = blocks().any(|b| b.get("is_error").and_then(Value::as_bool) == Some(true));
+    (has_tool_use, has_errors)
+}
+
 pub(crate) fn convert_user_message(
     provider: &str,
     user: &Value,
@@ -144,6 +165,11 @@ pub(crate) fn convert_user_message(
 }
 
 /// Append `tool_result` blocks from an object holding `tool_use_results[]`.
+///
+/// A result's `content` is a list of `{"Text": string}` / `{"Json": value}`
+/// blocks (`ToolUseResultBlock`); all of them are shown, a `Json` one as its
+/// JSON text, as the CLI itself sends them on. `status: "Error"` (a failed or
+/// cancelled call) marks the result as an error.
 fn push_tool_results(blocks: &mut Vec<Value>, holder: &Value) {
     let Some(results) = holder.get("tool_use_results").and_then(Value::as_array) else {
         return;
@@ -153,14 +179,24 @@ fn push_tool_results(blocks: &mut Vec<Value>, holder: &Value) {
         let text = tr
             .get("content")
             .and_then(Value::as_array)
-            .and_then(|arr| arr.first())
-            .and_then(|c| c.get("Text").and_then(Value::as_str))
-            .unwrap_or("");
-        blocks.push(json!({
+            .into_iter()
+            .flatten()
+            .filter_map(|block| match (block.get("Text"), block.get("Json")) {
+                (Some(Value::String(text)), _) => Some(text.clone()),
+                (_, Some(json)) => Some(json.to_string()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut block = json!({
             "type": "tool_result",
             "tool_use_id": tool_use_id,
             "content": text
-        }));
+        });
+        if tr.get("status").and_then(Value::as_str) == Some("Error") {
+            block["is_error"] = Value::Bool(true);
+        }
+        blocks.push(block);
     }
 }
 
@@ -199,11 +235,12 @@ pub(crate) fn convert_assistant_message(
                     .get("args")
                     .cloned()
                     .unwrap_or(Value::Object(serde_json::Map::default()));
+                let (name, input) = canonical_tool(name, args);
                 blocks.push(json!({
                     "type": "tool_use",
                     "id": id,
-                    "name": map_tool_name(name),
-                    "input": args
+                    "name": name,
+                    "input": input
                 }));
             }
         }
@@ -236,18 +273,76 @@ pub(crate) fn convert_assistant_message(
     ))
 }
 
-/// Map Amazon Q / Kiro tool names to the canonical names the viewer renders.
-fn map_tool_name(name: &str) -> &str {
+/// A tool call as the viewer's card for the same primitive reads it: the
+/// canonical name, with the input in that card's shape. A call keeps its own
+/// name and arguments when no card takes the same input.
+///
+/// Native tools (`tools/mod.rs` `NATIVE_TOOLS`): `execute_bash`
+/// (`execute_cmd` on Windows) `{command, summary?}`; `fs_read`
+/// `{operations: [{mode, path, …}], summary?}` (older builds: one operation's
+/// fields at the top level); `fs_write` `{command, path, …}`.
+fn canonical_tool(name: &str, args: Value) -> (String, Value) {
+    let path = |op: &Value| op.get("path").and_then(Value::as_str).map(String::from);
     match name {
-        "execute_bash" => "Bash",
-        "read_file" | "file_read" => "Read",
-        "write_file" | "file_write" | "create_file" => "Write",
-        "list_directory" => "Glob",
-        "search_files" | "grep" => "Grep",
-        "web_search" => "WebSearch",
-        "web_fetch" => "WebFetch",
-        _ => name,
+        "execute_bash" | "execute_cmd" => ("Bash".into(), args),
+        // One line-range read of one file is the Read card.
+        "fs_read" => {
+            let op = match args.get("operations").and_then(Value::as_array) {
+                Some(ops) if ops.len() == 1 => &ops[0],
+                Some(_) => return (name.into(), args),
+                None => &args,
+            };
+            match (op.get("mode").and_then(Value::as_str), path(op)) {
+                (Some("Line"), Some(_)) => ("Read".into(), with_read_range(op.clone())),
+                _ => (name.into(), args),
+            }
+        }
+        "fs_write" => {
+            let Some(file) = path(&args) else {
+                return (name.into(), args);
+            };
+            let text = |key: &str| args.get(key).and_then(Value::as_str);
+            match args.get("command").and_then(Value::as_str) {
+                // The CLI takes `new_str` when the model leaves out `file_text`.
+                Some("create") => match text("file_text").or_else(|| text("new_str")) {
+                    Some(content) => ("Write".into(), json!({"path": file, "content": content})),
+                    None => (name.into(), args),
+                },
+                Some("str_replace") => match (text("old_str"), text("new_str")) {
+                    (Some(old), Some(new)) => (
+                        "Edit".into(),
+                        json!({"path": file, "old_string": old, "new_string": new}),
+                    ),
+                    _ => (name.into(), args),
+                },
+                _ => (name.into(), args),
+            }
+        }
+        "read_file" | "file_read" => ("Read".into(), args),
+        "write_file" | "file_write" | "create_file" => ("Write".into(), args),
+        "list_directory" => ("Glob".into(), args),
+        "search_files" | "grep" => ("Grep".into(), args),
+        "web_search" => ("WebSearch".into(), args),
+        "web_fetch" => ("WebFetch".into(), args),
+        _ => (name.into(), args),
     }
+}
+
+/// A `Line` read's 1-based `start_line`/`end_line` as the Read card's
+/// `offset`/`limit`, when both are positive (`end_line: -1` means the end of
+/// the file, which has no length to show).
+fn with_read_range(mut op: Value) -> Value {
+    let line = |key: &str| op.get(key).and_then(Value::as_i64).filter(|n| *n >= 1);
+    let (start, end) = (line("start_line"), line("end_line"));
+    if let Some(map) = op.as_object_mut() {
+        if let Some(start) = start {
+            map.insert("offset".into(), start.into());
+            if let Some(end) = end.filter(|end| *end >= start) {
+                map.insert("limit".into(), (end - start + 1).into());
+            }
+        }
+    }
+    op
 }
 
 #[cfg(test)]
@@ -347,10 +442,68 @@ mod tests {
         assert_eq!(first_prompt_summary(&value, 80).as_deref(), Some("hi"));
     }
 
+    /// A `history` entry pair as `serde_json::to_string(&ConversationState)`
+    /// writes them (`message.rs`, `tools/fs_read.rs`, `tools/fs_write.rs`).
+    fn tool_history() -> String {
+        json!({"history": [
+            {
+                "user": {"content": {"Prompt": {"prompt": "fix it"}}, "timestamp": "2025-10-08T10:00:00Z"},
+                "assistant": {"ToolUse": {"message_id": "m1", "content": "", "tool_uses": [
+                    {"id": "r1", "name": "fs_read", "args": {"operations": [{"mode": "Line", "path": "/repo/a.rs", "start_line": 1, "end_line": 20}]}},
+                    {"id": "r2", "name": "fs_read", "args": {"operations": [{"mode": "Directory", "path": "/repo"}]}},
+                    {"id": "w1", "name": "fs_write", "args": {"command": "create", "path": "/repo/b.rs", "file_text": "fn main() {}"}},
+                    {"id": "e1", "name": "fs_write", "args": {"command": "str_replace", "path": "/repo/a.rs", "old_str": "a", "new_str": "b"}},
+                    {"id": "x1", "name": "use_aws", "args": {"service_name": "s3", "operation_name": "list-buckets"}}
+                ]}}
+            },
+            {
+                "user": {"content": {"ToolUseResults": {"tool_use_results": [
+                    {"tool_use_id": "x1", "content": [{"Json": {"exit_status": "0", "stdout": "bucket-a"}}, {"Text": "done"}], "status": "Success"},
+                    {"tool_use_id": "w1", "content": [{"Text": "permission denied"}], "status": "Error"}
+                ]}}, "timestamp": "2025-10-08T10:01:00Z"}
+            }
+        ]})
+        .to_string()
+    }
+
     #[test]
-    fn map_tool_names() {
-        assert_eq!(map_tool_name("execute_bash"), "Bash");
-        assert_eq!(map_tool_name("read_file"), "Read");
-        assert_eq!(map_tool_name("unknown_thing"), "unknown_thing");
+    fn native_tools_reach_their_cards_and_keep_their_own_shape_otherwise() {
+        let msgs = parse_history("amazonq", &tool_history(), "s");
+        let calls = msgs[1].content.as_ref().unwrap().as_array().unwrap();
+        let call = |id: &str| calls.iter().find(|c| c["id"] == id).unwrap().clone();
+
+        let read = call("r1");
+        assert_eq!(read["name"], "Read");
+        assert_eq!(read["input"]["path"], "/repo/a.rs");
+        // Lines 1–20 as the Read card's range.
+        assert_eq!(read["input"]["offset"], 1);
+        assert_eq!(read["input"]["limit"], 20);
+        // A directory listing is not a file read.
+        assert_eq!(call("r2")["name"], "fs_read");
+        assert_eq!(
+            call("w1")["input"],
+            json!({"path": "/repo/b.rs", "content": "fn main() {}"})
+        );
+        assert_eq!(call("w1")["name"], "Write");
+        assert_eq!(
+            call("e1")["input"],
+            json!({"path": "/repo/a.rs", "old_string": "a", "new_string": "b"})
+        );
+        assert_eq!(call("e1")["name"], "Edit");
+        assert_eq!(call("x1")["name"], "use_aws");
+    }
+
+    #[test]
+    fn tool_results_keep_every_block_and_their_status() {
+        let msgs = parse_history("amazonq", &tool_history(), "s");
+        let results = msgs[2].content.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(
+            results[0]["content"],
+            "{\"exit_status\":\"0\",\"stdout\":\"bucket-a\"}\ndone"
+        );
+        assert!(results[0].get("is_error").is_none());
+        assert_eq!(results[1]["content"], "permission denied");
+        assert_eq!(results[1]["is_error"], true);
+        assert_eq!(session_flags(&msgs), (true, true));
     }
 }
