@@ -288,7 +288,7 @@ pub const STORE_ENV: [&str; 25] = [
     "CLINE_DIR",
     "CLINE_SESSION_DATA_DIR",
     "CODEX_HOME",
-    "COPILOT_CLI_HOME",
+    "COPILOT_HOME",
     "CURSOR_USER_DIR",
     "FORGE_CONFIG",
     "GEMINI_HOME",

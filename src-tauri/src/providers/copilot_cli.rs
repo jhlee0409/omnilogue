@@ -11,13 +11,22 @@
 //! * `user.message` — user prompt; `data.content` is the literal input,
 //!   `data.transformedContent` is the wrapped version sent to the model
 //!   (we skip it because it duplicates the prompt and bloats the view).
+//!   Only messages Copilot's own timeline shows as prompts are kept (see
+//!   `is_shown_prompt`); skill injections and autopilot continuations are
+//!   not the user's.
 //! * `assistant.message` — assistant text plus `data.toolRequests[]`, each
-//!   describing a tool call with `toolCallId`, `name`, `arguments`.
+//!   describing a tool call with `toolCallId`, `name`, `arguments`, and
+//!   `data.reasoningText`.
 //! * `tool.execution_start` — informational; we let the assistant message's
 //!   `tool_use` block represent the call.
 //! * `tool.execution_complete` — emitted as a `tool_result` block which is
 //!   merged into the assistant message that owns the matching `toolCallId`
 //!   (same trick as the Codex provider).
+//!
+//! Sub-agent runs (the `task` tool) write their events into the same file,
+//! each tagged with a top-level `agentId`. The transcript leaves them out, as
+//! Copilot's timeline does; the `SubAgent` panel lists each run
+//! ([`load_subagents`]) and opens it as `<events.jsonl>#agent=<agentId>`.
 //!
 //! Projects are virtual groupings keyed by `cwd`, mirroring the Codex
 //! provider (`copilot-cli://<cwd>`).
@@ -110,10 +119,11 @@ pub fn detect_desktop() -> Option<ProviderInfo> {
 
 /// Resolve the Copilot CLI base directory.
 ///
-/// Honours `$COPILOT_CLI_HOME` if it points to an existing directory,
-/// otherwise falls back to `~/.copilot`.
+/// Honours `$COPILOT_HOME` if it points to an existing directory, otherwise
+/// falls back to `~/.copilot`, as Copilot does (`process.env.COPILOT_HOME ??
+/// join(homedir(), ".copilot")` in the 1.0.116 bundle).
 pub fn get_base_path() -> Option<String> {
-    if let Ok(env) = std::env::var("COPILOT_CLI_HOME") {
+    if let Ok(env) = std::env::var("COPILOT_HOME") {
         let path = PathBuf::from(&env);
         if path.is_dir() {
             return Some(env);
@@ -541,15 +551,59 @@ pub(crate) fn load_sessions_reporting(
     Ok(sessions)
 }
 
-/// Stream messages out of `events.jsonl`.
+/// Marker between an `events.jsonl` path and a sub-agent id in the session
+/// path the `SubAgent` panel opens (`<events.jsonl>#agent=<agentId>`).
+const AGENT_FRAGMENT: &str = "#agent=";
+
+/// Split a session path into the `events.jsonl` path and, for a sub-agent
+/// run, its `agentId`.
+fn split_agent_path(session_path: &str) -> (&str, Option<&str>) {
+    match session_path.rsplit_once(AGENT_FRAGMENT) {
+        Some((events, agent)) if !agent.is_empty() => (events, Some(agent)),
+        _ => (session_path, None),
+    }
+}
+
+/// The sub-agent run an event belongs to. Copilot tags every event of a run
+/// with a top-level `agentId` (and reads `data.agentId` the same way); main
+/// conversation events carry neither.
+fn event_agent_id(event: &Value) -> Option<&str> {
+    event
+        .get("agentId")
+        .or_else(|| event.get("data").and_then(|data| data.get("agentId")))
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+}
+
+/// Whether a `user.message` is a prompt, by Copilot's own timeline rule
+/// (1.0.116 `cli-main.js`): no `source`, `source: "user"`, or a source
+/// starting with `command-`, `schedule-` or `autopilot-`. Others (`skill-*`
+/// injections, the `autopilot` continuation nudge) are the CLI's, not the
+/// user's. In a sub-agent run, the prompt its parent sent (`agent-<id>`) is
+/// that run's prompt.
+fn is_shown_prompt(data: &Value, in_sub_agent: bool) -> bool {
+    match data.get("source").and_then(Value::as_str) {
+        None | Some("user") => true,
+        Some(source) => {
+            ["command-", "schedule-", "autopilot-"]
+                .iter()
+                .any(|prefix| source.starts_with(prefix))
+                || (in_sub_agent && source.starts_with("agent-"))
+        }
+    }
+}
+
+/// Stream messages out of `events.jsonl`: the main conversation, or with a
+/// `#agent=<agentId>` suffix one sub-agent run.
 #[allow(unsafe_code)] // Required for mmap performance optimization
 pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
-    let path = Path::new(session_path);
+    let (events_path, agent) = split_agent_path(session_path);
+    let path = Path::new(events_path);
     if !path.exists() {
         return Err(format!("Session file not found: {session_path}"));
     }
-    let canonical = validate_session_path(path, session_path)
-        .or_else(|_| validate_wsl_session_path(path, session_path))?;
+    let canonical = validate_session_path(path, events_path)
+        .or_else(|_| validate_wsl_session_path(path, events_path))?;
 
     let client = classify_client(&read_workspace_metadata(&canonical));
 
@@ -581,19 +635,30 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
             None => continue,
         };
 
+        if (event_type == "session.start" || event_type == "session.resume")
+            && session_id.is_empty()
+        {
+            if let Some(id) = data.get("sessionId").and_then(Value::as_str) {
+                session_id = id.to_string();
+            }
+        }
+        if event_agent_id(&val) != agent {
+            continue;
+        }
+
         match event_type {
             "session.start" | "session.resume" => {
-                if session_id.is_empty() {
-                    if let Some(id) = data.get("sessionId").and_then(Value::as_str) {
-                        session_id = id.to_string();
-                    }
-                }
                 if let Some(model) = data.get("selectedModel").and_then(Value::as_str) {
                     current_model = Some(model.to_string());
                 }
             }
             "session.model_change" => {
                 if let Some(model) = data.get("newModel").and_then(Value::as_str) {
+                    current_model = Some(model.to_string());
+                }
+            }
+            "subagent.started" => {
+                if let Some(model) = data.get("model").and_then(Value::as_str) {
                     current_model = Some(model.to_string());
                 }
             }
@@ -605,6 +670,9 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
                 }
             }
             "user.message" => {
+                if !is_shown_prompt(data, agent.is_some()) {
+                    continue;
+                }
                 if let Some(msg) = convert_user_message(
                     data,
                     val.get("id").and_then(Value::as_str),
@@ -639,6 +707,95 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
     }
 
     Ok(messages)
+}
+
+/// One sub-agent run in a session, for the `SubAgent` panel.
+pub struct CopilotSubagent {
+    pub agent_id: String,
+    /// `<events.jsonl>#agent=<agentId>`, read by [`load_messages`].
+    pub file_path: String,
+    /// The `task` call that started the run (`subagent.started.toolCallId`).
+    pub tool_call_id: Option<String>,
+    /// The task's description, else the agent's name.
+    pub title: Option<String>,
+    pub message_count: usize,
+    pub first_message_time: Option<String>,
+    pub last_message_time: Option<String>,
+}
+
+/// The sub-agent runs recorded in a session's `events.jsonl`, in the order
+/// they started. A sub-agent path (`#agent=`) lists none.
+#[allow(unsafe_code)] // mmap, as in `load_messages`
+pub fn load_subagents(session_path: &str) -> Result<Vec<CopilotSubagent>, String> {
+    if split_agent_path(session_path).1.is_some() {
+        return Ok(Vec::new());
+    }
+    let path = Path::new(session_path);
+    let canonical = validate_session_path(path, session_path)
+        .or_else(|_| validate_wsl_session_path(path, session_path))?;
+    let file = File::open(&canonical).map_err(|e| e.to_string())?;
+    // SAFETY: file is opened read-only and we only read the mapping.
+    let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
+
+    let mut runs: Vec<CopilotSubagent> = Vec::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
+    for (start, end) in find_line_ranges(&mmap) {
+        let mut buf = mmap[start..end].to_vec();
+        let Ok(val) = simd_json::from_slice::<Value>(&mut buf) else {
+            continue;
+        };
+        let Some(agent_id) = event_agent_id(&val) else {
+            continue;
+        };
+        let ix = *index.entry(agent_id.to_string()).or_insert_with(|| {
+            runs.push(CopilotSubagent {
+                agent_id: agent_id.to_string(),
+                file_path: format!("{session_path}{AGENT_FRAGMENT}{agent_id}"),
+                tool_call_id: None,
+                title: None,
+                message_count: 0,
+                first_message_time: None,
+                last_message_time: None,
+            });
+            runs.len() - 1
+        });
+        let run = &mut runs[ix];
+        let event_type = val.get("type").and_then(Value::as_str).unwrap_or("");
+        let data = val.get("data");
+        if event_type == "subagent.started" {
+            let text = |key: &str| {
+                data.and_then(|d| d.get(key))
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string)
+            };
+            run.tool_call_id = text("toolCallId");
+            run.title = text("agentDescription")
+                .or_else(|| text("agentDisplayName"))
+                .or_else(|| text("agentName"));
+        }
+        let shown = is_renderable_message_event(event_type, data)
+            && (event_type != "user.message" || data.is_some_and(|d| is_shown_prompt(d, true)));
+        if shown {
+            run.message_count += 1;
+            if let Some(ts) = val.get("timestamp").and_then(Value::as_str) {
+                run.first_message_time.get_or_insert_with(|| ts.to_string());
+                run.last_message_time = Some(ts.to_string());
+            }
+        }
+    }
+    Ok(runs)
+}
+
+/// Whether `session_path` is a Copilot session (`events.jsonl` under the
+/// session root, or a WSL one), with or without a `#agent=` suffix.
+pub fn is_session_path(session_path: &str) -> bool {
+    let (events_path, _) = split_agent_path(session_path);
+    let path = Path::new(events_path);
+    is_events_jsonl(path)
+        && validate_session_path(path, events_path)
+            .or_else(|_| validate_wsl_session_path(path, events_path))
+            .is_ok()
 }
 
 /// Naive case-insensitive search across every events.jsonl.
@@ -856,7 +1013,13 @@ fn extract_session_info(events_path: &Path) -> Result<SessionInfo, String> {
                 }
             }
             "user.message" | "assistant.message" | "system.message" => {
-                if !is_renderable_message_event(event_type, data) {
+                // Counted as the transcript shows them: no sub-agent events,
+                // only prompts the user wrote.
+                if !is_renderable_message_event(event_type, data)
+                    || event_agent_id(&val).is_some()
+                    || (event_type == "user.message"
+                        && !data.is_some_and(|d| is_shown_prompt(d, false)))
+                {
                     continue;
                 }
 
@@ -1031,6 +1194,14 @@ fn convert_assistant_message(
 
     let mut blocks: Vec<Value> = Vec::new();
 
+    if let Some(reasoning) = data
+        .get("reasoningText")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+    {
+        blocks.push(serde_json::json!({ "type": "thinking", "thinking": reasoning }));
+    }
+
     if let Some(text) = data.get("content").and_then(Value::as_str) {
         if !text.is_empty() {
             blocks.push(serde_json::json!({ "type": "text", "text": text }));
@@ -1049,10 +1220,7 @@ fn convert_assistant_message(
                 .and_then(Value::as_str)
                 .unwrap_or("tool")
                 .to_string();
-            let input = req
-                .get("arguments")
-                .cloned()
-                .unwrap_or(Value::Object(serde_json::Map::default()));
+            let input = tool_arguments(&name, req.get("arguments"));
             blocks.push(serde_json::json!({
                 "type": "tool_use",
                 "id": id,
@@ -1106,19 +1274,51 @@ fn convert_assistant_message(
     Some(msg)
 }
 
+/// Arguments of a tool request as an object. A `"custom"` (grammar-based)
+/// tool such as `apply_patch` sends its input as a string; like the Codex
+/// provider, a patch becomes `{"patch": …}` and other text that is not a
+/// JSON object `{"input": …}`.
+fn tool_arguments(name: &str, arguments: Option<&Value>) -> Value {
+    match arguments {
+        None | Some(Value::Null) => Value::Object(serde_json::Map::default()),
+        Some(Value::String(text)) => match serde_json::from_str::<Value>(text) {
+            Ok(parsed @ Value::Object(_)) => parsed,
+            _ if name == "apply_patch" => serde_json::json!({ "patch": text }),
+            _ => serde_json::json!({ "input": text }),
+        },
+        Some(other) => other.clone(),
+    }
+}
+
+/// A `tool.execution_complete` event as a `tool_result` block. The text is
+/// `result.detailedContent`, which Copilot keeps for display (an edit's
+/// diff), else the model-facing `result.content`, else the 1.0.45-era
+/// `result.text_result_for_llm`; a call without a result shows
+/// `error.message`. The call failed when `success` is false or the shell
+/// exited non-zero (`shellExecution.exitCode`), which Copilot records as a
+/// success.
 fn build_tool_result_block(data: &Value) -> Option<(String, Value)> {
     let tool_use_id = data
         .get("toolCallId")
         .and_then(Value::as_str)
         .filter(|s| !s.is_empty())?
         .to_string();
-    let success = data.get("success").and_then(Value::as_bool);
-    let content = data
-        .get("result")
-        .and_then(|r| r.get("content"))
-        .or_else(|| data.get("error"))
-        .cloned()
-        .unwrap_or(Value::String(String::new()));
+    let result = data.get("result");
+    let result_text = |key: &str| {
+        result
+            .and_then(|r| r.get(key))
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+    };
+    let content = result_text("detailedContent")
+        .or_else(|| result_text("content"))
+        .or_else(|| result_text("text_result_for_llm"))
+        .or_else(|| {
+            data.get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+        })
+        .unwrap_or_default();
 
     let mut block = serde_json::json!({
         "type": "tool_result",
@@ -1127,7 +1327,14 @@ fn build_tool_result_block(data: &Value) -> Option<(String, Value)> {
     });
     // Copilot SDK pinned schema: success is a boolean, not an absent-field default.
     // https://github.com/github/copilot-sdk/blob/68de1a7afe4bc9e7435d185825043bd9dc9c47cf/nodejs/src/generated/session-events.ts#L9938-L9951
-    if let Some(success) = success {
+    let success = data.get("success").and_then(Value::as_bool);
+    let exit_code = data
+        .get("shellExecution")
+        .and_then(|shell| shell.get("exitCode"))
+        .and_then(Value::as_i64);
+    if exit_code.is_some_and(|code| code != 0) {
+        block["is_error"] = Value::Bool(true);
+    } else if let Some(success) = success {
         block["is_error"] = Value::Bool(!success);
     }
     Some((tool_use_id, block))
@@ -1217,11 +1424,11 @@ mod tests {
 
     #[test]
     #[serial]
-    fn detect_uses_copilot_cli_home_env() {
+    fn detect_uses_copilot_home_env() {
         let tmp = TempDir::new().unwrap();
         fs::create_dir_all(tmp.path().join("session-state")).unwrap();
         let _home_guard = EnvVarGuard::set("HOME", tmp.path());
-        let _env_guard = EnvVarGuard::set("COPILOT_CLI_HOME", tmp.path());
+        let _env_guard = EnvVarGuard::set("COPILOT_HOME", tmp.path());
 
         let info = detect().expect("provider detected");
         assert_eq!(info.id, "copilot");
@@ -1233,7 +1440,7 @@ mod tests {
     #[serial]
     fn scan_groups_sessions_by_cwd() {
         let tmp = TempDir::new().unwrap();
-        let _env_guard = EnvVarGuard::set("COPILOT_CLI_HOME", tmp.path());
+        let _env_guard = EnvVarGuard::set("COPILOT_HOME", tmp.path());
 
         write_session(
             tmp.path(),
@@ -1308,7 +1515,7 @@ mod tests {
     #[serial]
     fn search_hits_carry_scanned_project_path_for_same_named_cwds() {
         let tmp = TempDir::new().unwrap();
-        let _env_guard = EnvVarGuard::set("COPILOT_CLI_HOME", tmp.path());
+        let _env_guard = EnvVarGuard::set("COPILOT_HOME", tmp.path());
         for (id, cwd) in [("sa", "/work/client-a/app"), ("sb", "/work/client-b/app")] {
             write_session(
                 tmp.path(),
@@ -1360,7 +1567,7 @@ mod tests {
     #[serial]
     fn scan_and_load_skip_empty_sessions() {
         let tmp = TempDir::new().unwrap();
-        let _env_guard = EnvVarGuard::set("COPILOT_CLI_HOME", tmp.path());
+        let _env_guard = EnvVarGuard::set("COPILOT_HOME", tmp.path());
 
         // session with no renderable messages; Copilot CLI often writes
         // startup-only logs that would otherwise spam the session list.
@@ -1426,7 +1633,7 @@ mod tests {
     #[serial]
     fn load_messages_pairs_tool_use_and_result() {
         let tmp = TempDir::new().unwrap();
-        let _env_guard = EnvVarGuard::set("COPILOT_CLI_HOME", tmp.path());
+        let _env_guard = EnvVarGuard::set("COPILOT_HOME", tmp.path());
 
         let session_path = write_session(
             tmp.path(),
@@ -1497,11 +1704,154 @@ mod tests {
         assert_eq!(assistant.message_id.as_deref(), Some("asst-1"));
     }
 
+    /// Events as Copilot CLI 1.0.116 writes them (BYOK run, `bash` / `view` /
+    /// `edit` / `task` calls), trimmed to the fields the reader uses.
+    fn recorded_session(root: &Path) -> PathBuf {
+        write_session(
+            root,
+            "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            &[
+                json!({"type": "session.start", "timestamp": "2026-11-26T09:00:00.000Z",
+                    "data": {"sessionId": "cccccccc-cccc-cccc-cccc-cccccccccccc", "selectedModel": "gpt-4o", "context": {"cwd": "/repo"}}}),
+                json!({"type": "user.message", "timestamp": "2026-11-26T09:00:01.000Z",
+                    "data": {"content": "run the steps", "parentAgentTaskId": "6c52", "transformedContent": "<current_datetime>…</current_datetime>\n\nrun the steps"}}),
+                json!({"type": "user.message", "timestamp": "2026-11-26T09:00:01.500Z",
+                    "data": {"content": "# PDF skill\nUse pdftotext.", "source": "skill-pdf"}}),
+                json!({"type": "assistant.message", "timestamp": "2026-11-26T09:00:02.000Z",
+                "data": {"messageId": "m1", "content": "", "reasoningText": "Plan: run it.", "toolRequests": [
+                    {"toolCallId": "c1", "name": "bash", "arguments": {"command": "exit 3"}, "type": "function"},
+                    {"toolCallId": "c2", "name": "view", "arguments": {"path": "/nope"}, "type": "function"},
+                    {"toolCallId": "c3", "name": "edit", "arguments": {"path": "a.md"}, "type": "function"},
+                    {"toolCallId": "c4", "name": "apply_patch", "arguments": "*** Begin Patch", "type": "custom"},
+                    {"toolCallId": "c5", "name": "task", "arguments": {"name": "lister", "prompt": "list files"}, "type": "function"}
+                ]}}),
+                json!({"type": "tool.execution_complete", "timestamp": "2026-11-26T09:00:03.000Z",
+                    "data": {"toolCallId": "c1", "success": true, "shellExecution": {"exitCode": 3},
+                        "result": {"content": "boom\n<shellId: 1 completed with exit code 3>"}}}),
+                json!({"type": "tool.execution_complete", "timestamp": "2026-11-26T09:00:03.100Z",
+                    "data": {"toolCallId": "c2", "success": false, "result": null,
+                        "error": {"message": "Permission denied because no interactive user response was available.", "code": "denied"}}}),
+                json!({"type": "tool.execution_complete", "timestamp": "2026-11-26T09:00:03.200Z",
+                    "data": {"toolCallId": "c3", "success": true,
+                        "result": {"content": "File a.md updated with changes.", "detailedContent": "\ndiff --git a/a.md b/a.md\n-two\n+2"}}}),
+                json!({"type": "subagent.started", "agentId": "agent-7", "timestamp": "2026-11-26T09:00:04.000Z",
+                    "data": {"toolCallId": "c5", "agentName": "explore", "agentDisplayName": "lister", "agentDescription": "List files", "model": "gpt-4o-mini"}}),
+                json!({"type": "user.message", "agentId": "agent-7", "timestamp": "2026-11-26T09:00:04.100Z",
+                    "data": {"content": "list files", "source": "agent-cccccccc-cccc-cccc-cccc-cccccccccccc"}}),
+                json!({"type": "assistant.message", "agentId": "agent-7", "timestamp": "2026-11-26T09:00:04.200Z",
+                    "data": {"messageId": "s1", "content": "a.rs b.rs"}}),
+                json!({"type": "tool.execution_complete", "timestamp": "2026-11-26T09:00:05.000Z",
+                    "data": {"toolCallId": "c5", "success": true, "result": {"content": "a.rs b.rs"}}}),
+                json!({"type": "user.message", "timestamp": "2026-11-26T09:00:06.000Z",
+                    "data": {"content": "", "source": "autopilot", "isAutopilotContinuation": true}}),
+                json!({"type": "user.message", "timestamp": "2026-11-26T09:00:07.000Z",
+                    "data": {"content": "/review", "source": "command-review"}}),
+            ],
+        )
+    }
+
+    #[test]
+    #[serial]
+    fn transcript_keeps_typed_prompts_and_leaves_sub_agent_runs_to_the_panel() {
+        let tmp = TempDir::new().unwrap();
+        let _env_guard = EnvVarGuard::set("COPILOT_HOME", tmp.path());
+        let path = recorded_session(tmp.path()).to_string_lossy().to_string();
+
+        let messages = load_messages(&path).unwrap();
+        let prompts: Vec<String> = messages
+            .iter()
+            .filter(|m| m.message_type == "user")
+            .map(|m| {
+                m.content.as_ref().unwrap()[0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(prompts, ["run the steps", "/review"]);
+        assert_eq!(messages.len(), 3);
+        assert_eq!(
+            extract_session_info(Path::new(&path))
+                .unwrap()
+                .message_count,
+            3
+        );
+
+        let runs = load_subagents(&path).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].agent_id, "agent-7");
+        assert_eq!(runs[0].tool_call_id.as_deref(), Some("c5"));
+        assert_eq!(runs[0].title.as_deref(), Some("List files"));
+        assert_eq!(runs[0].message_count, 2);
+        assert_eq!(runs[0].file_path, format!("{path}#agent=agent-7"));
+
+        let run = load_messages(&runs[0].file_path).unwrap();
+        assert_eq!(run.len(), 2);
+        assert_eq!(run[0].content.as_ref().unwrap()[0]["text"], "list files");
+        assert_eq!(run[1].model.as_deref(), Some("gpt-4o-mini"));
+        assert!(load_subagents(&runs[0].file_path).unwrap().is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn tool_results_show_full_text_errors_and_exit_codes() {
+        let tmp = TempDir::new().unwrap();
+        let _env_guard = EnvVarGuard::set("COPILOT_HOME", tmp.path());
+        let path = recorded_session(tmp.path()).to_string_lossy().to_string();
+
+        let messages = load_messages(&path).unwrap();
+        let blocks = messages[1].content.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(
+            blocks[0],
+            json!({"type": "thinking", "thinking": "Plan: run it."})
+        );
+        let input_of = |id: &str| {
+            blocks
+                .iter()
+                .find(|b| b["type"] == "tool_use" && b["id"] == id)
+                .unwrap()["input"]
+                .clone()
+        };
+        assert_eq!(input_of("c4"), json!({"patch": "*** Begin Patch"}));
+        let result_of = |id: &str| {
+            blocks
+                .iter()
+                .find(|b| b["type"] == "tool_result" && b["tool_use_id"] == id)
+                .unwrap()
+                .clone()
+        };
+        // A shell that exited 3 is a failure though Copilot records success.
+        assert_eq!(result_of("c1")["is_error"], true);
+        assert_eq!(
+            result_of("c2")["content"],
+            "Permission denied because no interactive user response was available."
+        );
+        assert_eq!(result_of("c2")["is_error"], true);
+        assert_eq!(
+            result_of("c3")["content"],
+            "\ndiff --git a/a.md b/a.md\n-two\n+2"
+        );
+        assert_eq!(result_of("c3")["is_error"], false);
+    }
+
+    #[test]
+    fn tool_arguments_become_objects() {
+        assert_eq!(
+            tool_arguments("bash", Some(&json!("{\"command\":\"ls\"}"))),
+            json!({"command": "ls"})
+        );
+        assert_eq!(
+            tool_arguments("grep", Some(&json!("needle"))),
+            json!({"input": "needle"})
+        );
+        assert_eq!(tool_arguments("bash", None), json!({}));
+    }
+
     #[test]
     #[serial]
     fn load_messages_skips_malformed_lines() {
         let tmp = TempDir::new().unwrap();
-        let _env_guard = EnvVarGuard::set("COPILOT_CLI_HOME", tmp.path());
+        let _env_guard = EnvVarGuard::set("COPILOT_HOME", tmp.path());
 
         let session_dir = tmp
             .path()
@@ -1534,7 +1884,7 @@ mod tests {
     #[serial]
     fn load_messages_rejects_path_outside_root() {
         let tmp = TempDir::new().unwrap();
-        let _env_guard = EnvVarGuard::set("COPILOT_CLI_HOME", tmp.path());
+        let _env_guard = EnvVarGuard::set("COPILOT_HOME", tmp.path());
         fs::create_dir_all(tmp.path().join("session-state")).unwrap();
 
         let outside = TempDir::new().unwrap();

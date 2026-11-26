@@ -587,8 +587,8 @@ mod tests {
 
         let home = crate::test_utils::SandboxHome::new();
         let copilot_home = home.path().join(".copilot");
-        let previous = std::env::var_os("COPILOT_CLI_HOME");
-        std::env::set_var("COPILOT_CLI_HOME", &copilot_home);
+        let previous = std::env::var_os("COPILOT_HOME");
+        std::env::set_var("COPILOT_HOME", &copilot_home);
 
         for (id, cwd) in [("ca", "/work/client-a/app"), ("cb", "/work/client-b/app")] {
             let dir = copilot_home.join("session-state").join(id);
@@ -634,8 +634,8 @@ mod tests {
         let projects = scan_projects().unwrap();
         let hits = search("needle", 10).unwrap();
         match previous {
-            Some(v) => std::env::set_var("COPILOT_CLI_HOME", v),
-            None => std::env::remove_var("COPILOT_CLI_HOME"),
+            Some(v) => std::env::set_var("COPILOT_HOME", v),
+            None => std::env::remove_var("COPILOT_HOME"),
         }
 
         let path_of = |actual: &str| {

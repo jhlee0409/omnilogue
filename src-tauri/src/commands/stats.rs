@@ -7035,7 +7035,7 @@ mod tests {
             .join("events.jsonl");
         fs::create_dir_all(events_path.parent().unwrap()).unwrap();
         fs::write(&events_path, "").unwrap();
-        let _env_guard = EnvVarGuard::set("COPILOT_CLI_HOME", tmp.path());
+        let _env_guard = EnvVarGuard::set("COPILOT_HOME", tmp.path());
 
         assert_eq!(
             detect_session_provider(&events_path.to_string_lossy()),
