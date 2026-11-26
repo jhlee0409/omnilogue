@@ -297,7 +297,7 @@ pub const STORE_ENV: [&str; 27] = [
     "GROK_HOME",
     "HERMES_HOME",
     "INTERPRETER_HOME",
-    "KILO_HOME",
+    "KILO_DB",
     "KIMI_CODE_HOME",
     "KIMI_HOME",
     "KIMI_SHARE_DIR",

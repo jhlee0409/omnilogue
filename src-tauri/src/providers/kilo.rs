@@ -1,25 +1,33 @@
 //! Kilo Code (`~/.local/share/kilo`) — OpenCode-core store.
 //!
-//! Kilo Code left the Cline/Roo fork lineage in May 2026 and now runs on the
-//! OpenCode core: sessions live in a drizzle-managed SQLite database
-//! (`kilo.db`) whose schema and `message`/`part` JSON shapes are identical to
-//! OpenCode's. The reader therefore delegates to the OpenCode provider's
-//! store-parameterized functions and rebrands the `opencode://` scheme to
-//! `kilo://` so the two stores can never cross-reference each other's ids.
+//! Kilo Code now runs on the OpenCode core: sessions live in a
+//! drizzle-managed SQLite database (`kilo.db`) whose schema and
+//! `message`/`part` JSON shapes are identical to OpenCode's. The reader
+//! therefore delegates to the OpenCode provider's store-parameterized
+//! functions and rebrands the `opencode://` scheme to `kilo://` so the two
+//! stores can never cross-reference each other's ids.
 //!
-//! The pre-migration Cline-family store (VS Code
-//! `globalStorage/kilocode.kilo-code`, task index in globalState) is still
-//! read by [`crate::providers::cline`] for installations that never ran
-//! Kilo's own legacy migration; migrated installs keep no task index there,
-//! so the two readers do not double-report the same conversations.
+//! The database is `KILO_DB` when set (an absolute path, or a path under the
+//! data directory), else `kilo.db` in `$XDG_DATA_HOME/kilo` or
+//! `~/.local/share/kilo` (`Kilo-Org/kilocode` `packages/core/src/global.ts`,
+//! `database/database.ts` `path()`).
+//!
+//! The pre-migration Cline-family stores (VS Code
+//! `globalStorage/kilocode.kilo-code`, the old CLI's `~/.kilocode/cli/global`)
+//! are read by [`crate::providers::cline`]. Kilo's VS Code extension copies a
+//! legacy task into `kilo.db` as session `ses_migrated_…` with the task id as
+//! its `slug`, and keeps the original; `migrated_task_ids` lets the Cline
+//! reader leave those tasks to this one.
 
 use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession};
 use crate::providers::opencode::{self, ChildSession, SessionTree};
 use crate::providers::scan_report::ScanReport;
 use crate::providers::ProviderInfo;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// `SQLite` database file inside the Kilo store root.
+/// `SQLite` database file inside the Kilo store root, unless `KILO_DB`
+/// names another.
 pub const DB_FILE: &str = "kilo.db";
 
 const SCHEME: &str = "kilo://";
@@ -27,39 +35,61 @@ const OPENCODE_SCHEME: &str = "opencode://";
 const PROVIDER_ID: &str = "kilo";
 const DISPLAY_NAME: &str = "Kilo Code";
 
-/// Get the Kilo store root: `$KILO_HOME`, `$XDG_DATA_HOME/kilo`, or
-/// `~/.local/share/kilo`.
+/// Kilo's data directory: `$XDG_DATA_HOME/kilo`, or `~/.local/share/kilo`
+/// (on every OS, as `xdg-basedir` resolves it).
+fn data_dir() -> Option<PathBuf> {
+    let xdg = std::env::var_os("XDG_DATA_HOME")
+        .filter(|dir| !dir.is_empty())
+        .map(|dir| PathBuf::from(dir).join("kilo"))
+        .filter(|dir| dir.exists());
+    xdg.or_else(|| {
+        Some(
+            crate::utils::home_dir()?
+                .join(".local")
+                .join("share")
+                .join("kilo"),
+        )
+    })
+}
+
+/// The database file: `KILO_DB` (absolute, or relative to the data
+/// directory), else `<data dir>/kilo.db`. `:memory:` has no file.
+fn db_location() -> Option<PathBuf> {
+    match std::env::var_os("KILO_DB").filter(|db| !db.is_empty()) {
+        Some(db) if db == ":memory:" => None,
+        Some(db) if Path::new(&db).is_absolute() => Some(PathBuf::from(db)),
+        Some(db) => Some(data_dir()?.join(db)),
+        None => Some(data_dir()?.join(DB_FILE)),
+    }
+}
+
+/// Get the Kilo store root: the directory holding the database.
 pub fn get_base_path() -> Option<String> {
-    if let Ok(home) = std::env::var("KILO_HOME") {
-        let path = PathBuf::from(&home);
-        if path.exists() {
-            return Some(home);
-        }
-    }
+    let dir = db_location()?.parent()?.to_path_buf();
+    dir.exists().then(|| dir.to_string_lossy().to_string())
+}
 
-    if let Ok(xdg_data) = std::env::var("XDG_DATA_HOME") {
-        let path = PathBuf::from(&xdg_data).join("kilo");
-        if path.exists() {
-            return Some(path.to_string_lossy().to_string());
-        }
-    }
-
-    let home = crate::utils::home_dir()?;
-    let kilo_path = home.join(".local").join("share").join("kilo");
-    if kilo_path.exists() {
-        Some(kilo_path.to_string_lossy().to_string())
-    } else {
-        None
-    }
+/// The database's file name inside [`get_base_path`]: `KILO_DB`'s, else
+/// `kilo.db`.
+pub fn db_file() -> String {
+    std::env::var_os("KILO_DB")
+        .filter(|db| !db.is_empty() && db != ":memory:")
+        .and_then(|db| {
+            Path::new(&db)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| DB_FILE.to_string())
 }
 
 /// Detect a Kilo Code installation (OpenCode-core store).
 ///
 /// Unlike `OpenCode`, Kilo never had a file-backed `storage/` tree — the
-/// database is the only session store — so availability is `kilo.db` alone.
+/// database is the only session store — so availability is the database
+/// alone.
 pub fn detect() -> Option<ProviderInfo> {
     let base_path = get_base_path()?;
-    let db_path = Path::new(&base_path).join(DB_FILE);
+    let db_path = Path::new(&base_path).join(db_file());
 
     Some(ProviderInfo {
         id: PROVIDER_ID.to_string(),
@@ -67,6 +97,29 @@ pub fn detect() -> Option<ProviderInfo> {
         base_path: base_path.clone(),
         is_available: db_path.is_file(),
     })
+}
+
+/// Legacy task ids Kilo's VS Code extension copied into the database
+/// (`legacy-migration/sessions/lib/session.ts`: `id = ses_migrated_<hash>`,
+/// `slug = <task id>`). Empty when there is no database or no such session.
+pub(crate) fn migrated_task_ids() -> HashSet<String> {
+    let Some(db) = db_location().filter(|db| db.is_file()) else {
+        return HashSet::new();
+    };
+    let Ok(conn) = rusqlite::Connection::open_with_flags(
+        &db,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) else {
+        return HashSet::new();
+    };
+    let Ok(mut stmt) =
+        conn.prepare("SELECT slug FROM session WHERE id LIKE 'ses\\_migrated\\_%' ESCAPE '\\'")
+    else {
+        return HashSet::new();
+    };
+    stmt.query_map([], |row| row.get::<_, String>(0))
+        .map(|rows| rows.filter_map(Result::ok).collect())
+        .unwrap_or_default()
 }
 
 /// Rewrite a `kilo://` path into the `opencode://` scheme the shared reader
@@ -127,7 +180,7 @@ fn scan_projects_at_reporting(
     base_path: &str,
     report: &ScanReport,
 ) -> Result<Vec<ClaudeProject>, String> {
-    opencode::scan_projects_from_store_reporting(base_path, DB_FILE, report)
+    opencode::scan_projects_from_store_reporting(base_path, &db_file(), report)
         .map(|projects| projects.into_iter().map(rebrand_project).collect())
         .map_err(rebrand_error)
 }
@@ -164,9 +217,14 @@ fn load_sessions_at_reporting(
     project_path: &str,
     report: &ScanReport,
 ) -> Result<Vec<ClaudeSession>, String> {
-    opencode::load_sessions_at_reporting(base_path, DB_FILE, &to_store_scheme(project_path), report)
-        .map(|sessions| sessions.into_iter().map(rebrand_session).collect())
-        .map_err(rebrand_error)
+    opencode::load_sessions_at_reporting(
+        base_path,
+        &db_file(),
+        &to_store_scheme(project_path),
+        report,
+    )
+    .map(|sessions| sessions.into_iter().map(rebrand_session).collect())
+    .map_err(rebrand_error)
 }
 
 pub(crate) fn load_listed_sessions(
@@ -180,9 +238,12 @@ fn load_listed_sessions_at(
     base: &str,
     project_path: &str,
 ) -> Result<Vec<opencode::sidebar::ListedSession>, String> {
-    let sessions =
-        opencode::sidebar::load_listed_sessions_at(base, DB_FILE, &to_store_scheme(project_path))
-            .map_err(rebrand_error)?;
+    let sessions = opencode::sidebar::load_listed_sessions_at(
+        base,
+        &db_file(),
+        &to_store_scheme(project_path),
+    )
+    .map_err(rebrand_error)?;
     Ok(sessions
         .into_iter()
         .map(|row| opencode::sidebar::ListedSession {
@@ -201,7 +262,7 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
 
 /// [`load_messages`] against an explicit store root.
 pub fn load_messages_at(base_path: &str, session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
-    opencode::load_messages_at(base_path, DB_FILE, &to_store_scheme(session_path))
+    opencode::load_messages_at(base_path, &db_file(), &to_store_scheme(session_path))
         .map(|messages| {
             messages
                 .into_iter()
@@ -222,7 +283,7 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<ClaudeMessage>, String> {
 
 /// [`search`] against an explicit store root.
 pub fn search_at(base_path: &str, query: &str, limit: usize) -> Result<Vec<ClaudeMessage>, String> {
-    opencode::search_at(base_path, DB_FILE, query, limit)
+    opencode::search_at(base_path, &db_file(), query, limit)
         .map(|messages| {
             messages
                 .into_iter()
@@ -250,7 +311,7 @@ pub fn load_child_sessions_at(
     project_id: &str,
     session_id: &str,
 ) -> Vec<ChildSession> {
-    opencode::load_child_sessions_from_db(base_path, DB_FILE, project_id, session_id)
+    opencode::load_child_sessions_from_db(base_path, &db_file(), project_id, session_id)
 }
 
 /// Messages of a Kilo session's descendant sessions (subagent runs), marked
@@ -266,7 +327,7 @@ pub fn load_subagent_messages(session_path: &str) -> Vec<ClaudeMessage> {
 pub fn load_subagent_messages_at(base_path: &str, session_path: &str) -> Vec<ClaudeMessage> {
     rebrand_messages(opencode::load_subagent_messages_at(
         base_path,
-        DB_FILE,
+        &db_file(),
         &to_store_scheme(session_path),
     ))
 }
@@ -277,7 +338,7 @@ pub fn load_session_tree(project_path: &str) -> SessionTree {
     let Some(base_path) = get_base_path() else {
         return SessionTree::default();
     };
-    opencode::load_session_tree_at(&base_path, DB_FILE, &to_store_scheme(project_path))
+    opencode::load_session_tree_at(&base_path, &db_file(), &to_store_scheme(project_path))
 }
 
 /// [`load_subagent_messages`] with the project's [`SessionTree`] already
@@ -288,7 +349,7 @@ pub fn load_tree_subagent_messages(tree: &SessionTree, session_path: &str) -> Ve
     };
     rebrand_messages(opencode::load_tree_subagent_messages_at(
         &base_path,
-        DB_FILE,
+        &db_file(),
         tree,
         &to_store_scheme(session_path),
     ))
@@ -305,7 +366,7 @@ fn rebrand_messages(messages: Vec<ClaudeMessage>) -> Vec<ClaudeMessage> {
 }
 
 /// Fixture helpers for a minimal `kilo.db`, shared with stats tests that need
-/// a Kilo store behind `KILO_HOME`.
+/// a Kilo store behind `KILO_DB`.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::DB_FILE;
@@ -437,7 +498,7 @@ pub(crate) mod test_support {
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{create_test_db, seed};
+    use super::test_support::{create_db, create_test_db, seed};
     use super::*;
 
     #[test]
@@ -626,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "requires a real Kilo store on this machine (KILO_HOME or ~/.local/share/kilo)"]
+    #[ignore = "requires a real Kilo store on this machine (KILO_DB or ~/.local/share/kilo)"]
     fn real_store_smoke_scan_and_load() {
         let Some(base) = get_base_path() else {
             eprintln!("no Kilo store on this machine; nothing to verify");
@@ -647,30 +708,49 @@ mod tests {
         assert_eq!(messages[0].provider.as_deref(), Some("kilo"));
     }
 
+    /// `KILO_DB` names the database file; its directory is the store root
+    /// and its own file name is read, not `kilo.db`.
     #[test]
-    fn detect_uses_kilo_home_override() {
-        struct EnvVarGuard(&'static str);
+    #[serial_test::serial]
+    fn kilo_db_names_the_database() {
+        struct EnvVarGuard(&'static str, Option<std::ffi::OsString>);
         impl EnvVarGuard {
             fn set(key: &'static str, value: &std::ffi::OsStr) -> Self {
+                let previous = std::env::var_os(key);
                 std::env::set_var(key, value);
-                Self(key)
+                Self(key, previous)
             }
         }
         impl Drop for EnvVarGuard {
             fn drop(&mut self) {
-                std::env::remove_var(self.0);
+                match self.1.take() {
+                    Some(value) => std::env::set_var(self.0, value),
+                    None => std::env::remove_var(self.0),
+                }
             }
         }
 
         let tmp = tempfile::tempdir().unwrap();
-        let conn = create_test_db(tmp.path());
+        let db = tmp.path().join("work.db");
+        let conn = create_db(&db);
+        seed(&conn);
+        conn.execute(
+            "INSERT INTO session (id, project_id, slug, title, directory, time_created, time_updated)
+             VALUES ('ses_migrated_0123', 'proj1', 'legacy-task-1', 'old', '/w', 1, 1)",
+            [],
+        )
+        .unwrap();
         drop(conn);
 
-        let _guard = EnvVarGuard::set("KILO_HOME", tmp.path().as_os_str());
-        let info = detect().expect("KILO_HOME store should be detected");
-        assert_eq!(info.id, "kilo");
-        assert_eq!(info.display_name, "Kilo Code");
+        let _guard = EnvVarGuard::set("KILO_DB", db.as_os_str());
+        let info = detect().expect("the KILO_DB store should be detected");
         assert_eq!(info.base_path, tmp.path().to_string_lossy());
         assert!(info.is_available);
+        assert_eq!(db_file(), "work.db");
+        assert!(!scan_projects().unwrap().is_empty());
+        assert_eq!(
+            migrated_task_ids(),
+            HashSet::from(["legacy-task-1".to_string()])
+        );
     }
 }

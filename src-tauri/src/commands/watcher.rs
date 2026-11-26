@@ -297,7 +297,7 @@ pub(crate) fn collect_watch_paths() -> Vec<PathBuf> {
         };
         if is_real(&base, std::fs::FileType::is_dir)
             && is_real(
-                &base.join(providers::kilo::DB_FILE),
+                &base.join(providers::kilo::db_file()),
                 std::fs::FileType::is_file,
             )
         {
