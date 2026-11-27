@@ -605,3 +605,33 @@ fn malformed_links_keep_the_export_order() {
         assert_eq!(shown_texts(&conversation), all, "{field} = {value}");
     }
 }
+
+/// A cycle cut off from the root (`x → y → x`) next to a normal fork: the
+/// links are not a tree, so the export's order is kept.
+#[test]
+fn a_detached_cycle_keeps_the_export_order() {
+    let mut conversation = regenerated_conversation();
+    let messages = conversation["chat_messages"].as_array_mut().unwrap();
+    for (uuid, parent) in [("x", "y"), ("y", "x")] {
+        let mut message = messages[4].clone();
+        message["uuid"] = json!(uuid);
+        message["parent_message_uuid"] = json!(parent);
+        message["content"] = json!([{"type": "text", "text": uuid}]);
+        messages.push(message);
+    }
+    let Ok(conversation) = Conversation::from_value(conversation) else {
+        panic!("conversation rejected");
+    };
+    assert_eq!(
+        shown_texts(&conversation),
+        vec![
+            "first prompt",
+            "old reply",
+            "new reply",
+            "follow-up",
+            "answer",
+            "x",
+            "y"
+        ]
+    );
+}

@@ -955,6 +955,19 @@ fn latest_leaf(raw: &[RawMessage]) -> Option<String> {
     if children.values().all(|kids| kids.len() < 2) {
         return None;
     }
+    // A tree: every message is reached from the root. A detached cycle
+    // (`x → y → x`) has parents that all exist but is not.
+    let mut reached = 0;
+    let mut stack = vec![""];
+    while let Some(parent) = stack.pop() {
+        for kid in children.get(parent).into_iter().flatten() {
+            reached += 1;
+            stack.extend(kid.uuid.as_deref());
+        }
+    }
+    if reached != raw.len() {
+        return None;
+    }
     let latest = |kids: &[&'_ RawMessage]| -> Option<String> {
         kids.iter()
             .max_by_key(|m| {
@@ -968,13 +981,10 @@ fn latest_leaf(raw: &[RawMessage]) -> Option<String> {
             })
             .and_then(|m| m.uuid.clone())
     };
+    // Terminates: the links form a tree.
     let mut current = latest(children.get("")?)?;
-    let mut seen = HashSet::new();
-    while seen.insert(current.clone()) {
-        match children.get(current.as_str()) {
-            Some(kids) => current = latest(kids)?,
-            None => break,
-        }
+    while let Some(kids) = children.get(current.as_str()) {
+        current = latest(kids)?;
     }
     Some(current)
 }
