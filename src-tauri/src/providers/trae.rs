@@ -387,6 +387,9 @@ fn search_in(
     limit: usize,
     results: &mut Vec<ClaudeMessage>,
 ) {
+    if results.len() >= limit {
+        return;
+    }
     let query_lower = query.to_lowercase();
     for (hash, db_path) in workspace_dbs(storage) {
         let folder = workspace_folder(&db_path).unwrap_or_else(|| hash.clone());
@@ -915,6 +918,7 @@ mod tests {
         assert_eq!(sessions[0].messages.len(), 1);
     }
 
+    #[cfg(unix)]
     fn workspace(storage: &Path, hash: &str) -> PathBuf {
         let ws = storage.join(hash);
         std::fs::create_dir_all(&ws).unwrap();
