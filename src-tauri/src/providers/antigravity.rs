@@ -676,119 +676,29 @@ fn extract_session_id_from_session_path(session_path: &str) -> String {
     }
 }
 
-/// Parses a single JSONL transcript line from `.system_generated/logs/{transcript_full.jsonl,transcript.jsonl,overview.txt}`.
-fn parse_desktop_transcript_line(line: &str, session_id: &str) -> Option<ClaudeMessage> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with('{') {
-        return None;
-    }
-    let record: Value = serde_json::from_str(trimmed).ok()?;
-
-    let is_user = record.get("type").and_then(Value::as_str) == Some("USER_INPUT")
-        || record.get("source").and_then(Value::as_str) == Some("USER_EXPLICIT");
-    let is_model = record.get("type").and_then(Value::as_str) == Some("PLANNER_RESPONSE")
-        || record.get("source").and_then(Value::as_str) == Some("MODEL");
-
-    if !is_user && !is_model {
-        return None;
-    }
-
-    let step_index = record
-        .get("step_index")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    let timestamp = record
-        .get("created_at")
-        .and_then(Value::as_str)
-        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
-
-    let content_str = record
-        .get("content")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-
-    if is_user {
-        let text = content_str?;
-        return Some(crate::utils::build_provider_message(
-            "antigravity",
-            format!("{session_id}-step-{step_index}"),
-            session_id,
-            timestamp,
-            "user",
-            Some("user"),
-            Some(Value::String(text.to_string())),
-            None,
-        ));
-    }
-
-    // Assistant (MODEL / PLANNER_RESPONSE)
-    let thinking_str = record
-        .get("thinking")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
-    let tool_calls = record
-        .get("tool_calls")
-        .and_then(Value::as_array)
-        .filter(|arr| !arr.is_empty());
-
-    if content_str.is_none() && thinking_str.is_none() && tool_calls.is_none() {
-        return None;
-    }
-
-    let content_val = if thinking_str.is_some() || tool_calls.is_some() {
-        let mut blocks = Vec::new();
-        if let Some(thinking) = thinking_str {
-            blocks.push(json!({
-                "type": "thinking",
-                "thinking": thinking,
-            }));
-        }
-        if let Some(text) = content_str {
-            blocks.push(json!({
-                "type": "text",
-                "text": text,
-            }));
-        }
-        if let Some(calls) = tool_calls {
-            for (idx, call) in calls.iter().enumerate() {
-                let name = call
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("tool")
-                    .to_string();
-                let id = call
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| format!("{session_id}-step-{step_index}-tool-{idx}"));
-                let input = call.get("args").cloned().unwrap_or_else(|| json!({}));
-                blocks.push(json!({
-                    "type": "tool_use",
-                    "id": id,
-                    "name": name,
-                    "input": input,
-                }));
+/// Parses the JSONL transcript lines from `.system_generated/logs/{transcript_full.jsonl,transcript.jsonl,overview.txt}`,
+/// pairing each tool result with its call
+/// ([`super::antigravity_transcript::StepReader`]).
+fn parse_desktop_transcript(content: &str, session_id: &str) -> Vec<ClaudeMessage> {
+    let mut reader = super::antigravity_transcript::StepReader::new("antigravity", session_id);
+    content
+        .lines()
+        .enumerate()
+        .filter_map(|(line_idx, line)| {
+            let trimmed = line.trim();
+            if !trimmed.starts_with('{') {
+                return None;
             }
-        }
-        Value::Array(blocks)
-    } else {
-        Value::String(content_str.unwrap_or_default().to_string())
-    };
-
-    Some(crate::utils::build_provider_message(
-        "antigravity",
-        format!("{session_id}-step-{step_index}"),
-        session_id,
-        timestamp,
-        "assistant",
-        Some("assistant"),
-        Some(content_val),
-        None,
-    ))
+            let record: Value = serde_json::from_str(trimmed).ok()?;
+            let timestamp = record
+                .get("created_at")
+                .and_then(Value::as_str)
+                .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+                .unwrap_or_else(|| "1970-01-01T00:00:00Z".to_string());
+            reader.step(&record, line_idx as u64, &timestamp)
+        })
+        .collect()
 }
 
 /// Attempts to load messages from `<dir>/.system_generated/logs/{transcript_full.jsonl,transcript.jsonl,overview.txt}`.
@@ -825,10 +735,7 @@ fn try_load_brain_transcript_messages(session_dir: &Path, session_id: &str) -> V
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        let messages: Vec<ClaudeMessage> = content
-            .lines()
-            .filter_map(|line| parse_desktop_transcript_line(line, session_id))
-            .collect();
+        let messages = parse_desktop_transcript(&content, session_id);
         if !messages.is_empty() {
             return messages;
         }
@@ -1674,7 +1581,8 @@ fn message_text_matches(message: &ClaudeMessage, query_lower: &str) -> bool {
     match &message.content {
         Some(Value::String(s)) => s.to_lowercase().contains(query_lower),
         Some(Value::Array(arr)) => arr.iter().any(|block| {
-            ["text", "thinking"].iter().any(|key| {
+            // `content` is a tool result's text.
+            ["text", "thinking", "content"].iter().any(|key| {
                 block
                     .get(key)
                     .and_then(Value::as_str)
@@ -2414,7 +2322,7 @@ mod tests {
         assert_eq!(messages[0].message_type, "user");
         assert_eq!(
             messages[0].content,
-            Some(Value::String("请帮我检查代码".to_string()))
+            Some(json!([{"type": "text", "text": "请帮我检查代码"}]))
         );
         assert_eq!(messages[1].message_type, "assistant");
         let blocks = messages[1].content.as_ref().unwrap().as_array().unwrap();
@@ -2801,8 +2709,8 @@ mod tests {
         assert_eq!(
             texts,
             vec![
-                Some(Value::String("Ship it".to_string())),
-                Some(Value::String("Shipped.".to_string())),
+                Some(json!([{"type": "text", "text": "Ship it"}])),
+                Some(json!([{"type": "text", "text": "Shipped."}])),
             ]
         );
         assert!(resolve_usage_jsonl_path(&session.file_path).is_some());
