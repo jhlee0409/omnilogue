@@ -933,10 +933,15 @@ fn active_branch(raw: Vec<RawMessage>, leaf: Option<&str>) -> Vec<RawMessage> {
 /// there is no fork to choose at, when the parent links do not form a tree,
 /// or when two messages share a uuid.
 fn latest_leaf(raw: &[RawMessage]) -> Option<String> {
-    let ids: HashSet<&str> = raw.iter().filter_map(|m| m.uuid.as_deref()).collect();
+    let ids: HashSet<&str> = raw
+        .iter()
+        .filter_map(|m| m.uuid.as_deref())
+        .filter(|uuid| !uuid.trim().is_empty() && !is_root_sentinel(uuid))
+        .collect();
     if ids.len() != raw.len() {
-        // A message without a uuid, or a repeated one: a picked uuid could
-        // name a different message than the one picked.
+        // A message without a usable uuid (missing, blank, the root
+        // sentinel), or a repeated one: a picked uuid could name a different
+        // message than the one picked, and a blank one is the root's key.
         return None;
     }
     // Parent uuid → children; the root's parent (the sentinel) is "".

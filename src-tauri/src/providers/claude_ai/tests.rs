@@ -606,6 +606,33 @@ fn malformed_links_keep_the_export_order() {
     }
 }
 
+/// A message whose uuid is blank, hanging off the root sentinel, next to a
+/// normal fork: its uuid is the root's own key, so the export's order is
+/// kept (and the walk from the root ends).
+#[test]
+fn a_blank_uuid_keeps_the_export_order() {
+    let mut conversation = regenerated_conversation();
+    let messages = conversation["chat_messages"].as_array_mut().unwrap();
+    let mut blank = messages[0].clone();
+    blank["uuid"] = json!("");
+    blank["content"] = json!([{"type": "text", "text": "blank"}]);
+    messages.push(blank);
+    let Ok(conversation) = Conversation::from_value(conversation) else {
+        panic!("conversation rejected");
+    };
+    assert_eq!(
+        shown_texts(&conversation),
+        vec![
+            "first prompt",
+            "old reply",
+            "new reply",
+            "follow-up",
+            "answer",
+            "blank"
+        ]
+    );
+}
+
 /// A cycle cut off from the root (`x → y → x`) next to a normal fork: the
 /// links are not a tree, so the export's order is kept.
 #[test]
