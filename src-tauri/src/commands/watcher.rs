@@ -307,7 +307,7 @@ pub(crate) fn collect_watch_paths() -> Vec<PathBuf> {
 
     // Providers whose base path is itself the directory to watch. For Pi and
     // oh-my-pi, get_base_path() is already the sessions root.
-    let flat_bases: [BasePathFn; 14] = [
+    let flat_bases: [BasePathFn; 13] = [
         providers::pi::get_base_path,
         providers::ompi::get_base_path,
         providers::codebuddy::get_base_path,
@@ -321,7 +321,6 @@ pub(crate) fn collect_watch_paths() -> Vec<PathBuf> {
         providers::zcode::get_base_path,
         providers::zed::get_base_path,
         providers::openhands::get_base_path,
-        providers::trae::get_base_path,
     ];
     paths.extend(
         flat_bases
@@ -330,6 +329,8 @@ pub(crate) fn collect_watch_paths() -> Vec<PathBuf> {
             .map(PathBuf::from)
             .filter(|dir| dir.is_dir()),
     );
+    // Trae and Trae CN workspace storage (each edition installed).
+    paths.extend(providers::trae::base_paths());
 
     // Providers that keep sessions in sub-directories of their base path.
     let nested_bases: [(BasePathFn, &[&str]); 5] = [
@@ -526,6 +527,10 @@ fn extract_provider_paths(path: &Path) -> Option<(String, String)> {
     // recognised by location rather than by extension alone.
     if let Some(change) = classify_antigravity_path(path) {
         return Some(resolve_antigravity_change(change));
+    }
+    // Trae / Trae CN workspace databases (`state.vscdb` and its journal).
+    if let Some(paths) = providers::trae::watch_event(path) {
+        return Some(paths);
     }
     let Some(ext) = path.extension().and_then(|ext| ext.to_str()) else {
         // Vibe's unified store points at the current generation through an

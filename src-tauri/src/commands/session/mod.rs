@@ -198,9 +198,8 @@ pub(crate) fn is_safe_history_file_path(path: &std::path::Path) -> Result<(), St
     if let Some(oh_base) = crate::providers::openhands::get_base_path() {
         allowed.push(PathBuf::from(oh_base));
     }
-    if let Some(trae_base) = crate::providers::trae::get_base_path() {
-        allowed.push(PathBuf::from(trae_base));
-    }
+    // Trae and Trae CN workspace storage.
+    allowed.extend(crate::providers::trae::base_paths());
     // Qoder's transcript stores (CLI, Qoder CN, the IDE's embedded agent):
     // each `projects/` folder holds only session transcripts, their sidecars
     // and subagent transcripts, never the app's credentials.
