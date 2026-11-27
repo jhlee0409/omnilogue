@@ -148,8 +148,10 @@ pub(crate) fn is_safe_history_file_path(path: &std::path::Path) -> Result<(), St
         home.join(".local").join("share").join("kilo"),
         home.join(".cline").join("tasks"),
         home.join(".cursor"),
-        home.join(".codebuddy").join("projects"),
     ];
+    if let Some(codebuddy_root) = crate::providers::codebuddy::projects_root() {
+        allowed.push(codebuddy_root);
+    }
     if let Some(kimi_base) = crate::providers::kimi::get_base_path() {
         allowed.push(PathBuf::from(kimi_base).join("sessions"));
     }
