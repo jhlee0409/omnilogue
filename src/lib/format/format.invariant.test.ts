@@ -270,11 +270,14 @@ let appMessages: PercentMessages | undefined;
 /** Every message of every locale (`src/i18n/locales/<language>/<namespace>.json`). */
 const appPercentMessages = (): PercentMessages =>
   (appMessages ??= percentMessagesOf(
-    readdirSync(LOCALES).flatMap((language) =>
-      readdirSync(join(LOCALES, language))
-        .filter((name) => name.endsWith(".json"))
-        .map((name) => JSON.parse(readFileSync(join(LOCALES, language, name), "utf8")) as Record<string, unknown>),
-    ),
+    // Folders only: a stray file there (an editor's or tool's note) is no locale.
+    readdirSync(LOCALES, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .flatMap(({ name: language }) =>
+        readdirSync(join(LOCALES, language))
+          .filter((name) => name.endsWith(".json"))
+          .map((name) => JSON.parse(readFileSync(join(LOCALES, language, name), "utf8")) as Record<string, unknown>),
+      ),
   ));
 
 const propertyName = (name: ts.PropertyName) =>
