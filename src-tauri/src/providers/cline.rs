@@ -938,7 +938,12 @@ fn convert_ui_messages(ui_messages: &[Value], session_id: &str) -> Vec<ClaudeMes
     // The id of the tool call whose result record has not come yet.
     let mut open_call: Option<String> = None;
     for (index, msg) in ui_messages.iter().enumerate() {
-        let say = msg.get("say").and_then(Value::as_str).unwrap_or("");
+        // A call's request is a say, or an ask when it needed approval.
+        let say = msg
+            .get("say")
+            .or_else(|| msg.get("ask"))
+            .and_then(Value::as_str)
+            .unwrap_or("");
         let converted = convert_cline_message(msg, session_id, &mut counter, open_call.as_deref());
         match say {
             "use_mcp_server" | "browser_action_launch" | "browser_action" | "use_subagents" => {
@@ -1655,7 +1660,16 @@ fn convert_ask_message(
             let reply = render_ask_reply(text)?;
             Some(assistant_text(reply, uuid, session_id, timestamp))
         }
-        // Skip permission/confirmation prompts
+        // A tool call that was not auto-approved is recorded as an ask in
+        // place of the say of the same name and payload (Cline's
+        // `UseMcpToolHandler`, `BrowserToolHandler` and `SubagentToolHandler`
+        // remove the other record's partial and write one or the other), and
+        // Roo's MCP request is always an ask (`UseMcpToolTool`,
+        // `accessMcpResourceTool`): the same call, the same result after it.
+        "use_mcp_server" | "browser_action_launch" | "use_subagents" => {
+            convert_say_message(ask, text, &Value::Null, uuid, session_id, timestamp, None)
+        }
+        // Skip other permission/confirmation prompts
         _ => None,
     }
 }
@@ -2319,6 +2333,86 @@ mod tests {
             json!({"type": "image",
                    "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}})
         );
+    }
+
+    /// A Cline call that was not auto-approved is an ask, not a say, and is
+    /// the same tool call with the same paired result.
+    #[test]
+    fn unapproved_cline_calls_are_asks_that_pair_like_their_says() {
+        let request = json!({"serverName": "gh", "type": "use_mcp_tool",
+                             "toolName": "create_issue", "arguments": "{\"title\":\"x\"}"});
+        let prompts = json!({"prompts": ["look around"]});
+        let out = convert_ui_messages(
+            &[
+                ask("browser_action_launch", "http://localhost:3000"),
+                say(
+                    "browser_action_result",
+                    r#"{"currentUrl":"http://localhost:3000/"}"#,
+                ),
+                ask("use_mcp_server", &request.to_string()),
+                say("mcp_server_request_started", ""),
+                say("mcp_server_response", "created #1"),
+                ask("use_subagents", &prompts.to_string()),
+                say(
+                    "subagent",
+                    r#"{"status":"completed","total":1,"completed":1,"items":[]}"#,
+                ),
+            ],
+            "t",
+        );
+        assert_eq!(out.len(), 6);
+        let pairs = [
+            (0, 1, "browser_action"),
+            (2, 3, "mcp__gh__create_issue"),
+            (4, 5, "use_subagents"),
+        ];
+        for (call, result, name) in pairs {
+            let call = &blocks(&out[call])[0];
+            assert_eq!(call["type"], "tool_use");
+            assert_eq!(call["name"], name);
+            let result = &blocks(&out[result])[0];
+            assert_eq!(result["type"], "tool_result");
+            assert_eq!(result["tool_use_id"], call["id"]);
+        }
+        assert_eq!(
+            blocks(&out[0])[0]["input"],
+            json!({"action": "launch", "url": "http://localhost:3000"})
+        );
+        assert_eq!(blocks(&out[2])[0]["input"], json!({"title": "x"}));
+        assert_eq!(blocks(&out[3])[0]["content"], "created #1");
+    }
+
+    /// Roo's MCP request is always an ask (its `arguments` is a JSON string
+    /// too), so its `mcp_server_response` is that call's result.
+    #[test]
+    fn roo_mcp_ask_pairs_with_its_response() {
+        let tool = json!({"type": "use_mcp_tool", "serverName": "docs", "toolName": "search",
+                          "arguments": "{\"q\":\"rust\"}"});
+        let resource =
+            json!({"type": "access_mcp_resource", "serverName": "docs", "uri": "doc://a"});
+        let out = convert_ui_messages(
+            &[
+                say("text", "look it up"),
+                say("api_req_started", "{}"),
+                ask("use_mcp_server", &tool.to_string()),
+                say("mcp_server_request_started", ""),
+                say("mcp_server_response", "{\"hits\": 2}"),
+                ask("use_mcp_server", &resource.to_string()),
+                say("mcp_server_response", "body"),
+            ],
+            "t",
+        );
+        assert_eq!(out.len(), 5);
+        assert_eq!(out[0].message_type, "user");
+        let call = &blocks(&out[1])[0];
+        assert_eq!(call["name"], "mcp__docs__search");
+        assert_eq!(call["input"], json!({"q": "rust"}));
+        assert_eq!(out[2].message_type, "user");
+        assert_eq!(blocks(&out[2])[0]["tool_use_id"], call["id"]);
+        assert_eq!(blocks(&out[2])[0]["content"], "{\"hits\": 2}");
+        let read = &blocks(&out[3])[0];
+        assert_eq!(read["name"], "access_mcp_resource");
+        assert_eq!(blocks(&out[4])[0]["tool_use_id"], read["id"]);
     }
 
     fn write_task_files(base: &Path, id: &str, files: &[(&str, String)]) {
