@@ -389,7 +389,7 @@ pub(crate) fn search_with_filters(
                 Err(_) => continue,
             };
 
-            for mut claude_msg in convert_ui_messages(&ui_messages, id) {
+            for mut claude_msg in converted_messages(&ui_messages, id) {
                 if !filters.matches_message(&claude_msg) {
                     continue;
                 }
@@ -610,7 +610,11 @@ fn unindexed_task_items(
         .read_dir(&tasks_dir)
         .into_iter()
         // `DirEntry::file_type` does not follow symlinks.
-        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter(|entry| {
+            report
+                .read(&entry.path(), entry.file_type())
+                .is_some_and(|kind| kind.is_dir())
+        })
         .filter_map(|entry| {
             let id = entry.file_name().to_str()?.to_string();
             if indexed.contains(&id) || validate_task_id(&id).is_err() {
@@ -627,25 +631,37 @@ fn unindexed_task_items(
 /// `ui_messages.json`: Roo's own `history_item.json` when it is there, else an
 /// item read from the messages (and Cline's `task_metadata.json`).
 fn task_dir_item(dir: &Path, id: &str, report: &ScanReport) -> Option<Value> {
+    // A task's files are its own: a symlink could show another task's
+    // transcript here, so a linked transcript is not a task and a linked
+    // sidecar is unavailable.
     let ui_path = dir.join("ui_messages.json");
-    if !report.is_file(&ui_path) {
+    if !is_regular_file(&ui_path, report) {
         return None;
     }
     let history_item = dir.join("history_item.json");
-    if report.is_file(&history_item) {
-        let parsed = report
-            .read_to_string(&history_item)
-            .and_then(|data| serde_json::from_str::<Value>(&data).ok());
-        if let Some(Value::Object(mut item)) = parsed {
-            // The directory name is what the messages are loaded by.
+    let sidecar = is_regular_file(&history_item, report)
+        .then(|| report.read_to_string(&history_item))
+        .flatten()
+        .and_then(|data| match serde_json::from_str::<Value>(&data) {
+            Ok(Value::Object(item)) => Some(item),
+            _ => None,
+        });
+    // The directory name is what the messages are loaded by.
+    if let Some(item) = &sidecar {
+        let has_ts = item.get("ts").is_some_and(Value::is_number);
+        let has_task = item
+            .get("task")
+            .and_then(Value::as_str)
+            .is_some_and(|task| !task.is_empty());
+        if has_ts && has_task {
+            let mut item = item.clone();
             item.insert("id".to_string(), Value::String(id.to_string()));
             return Some(Value::Object(item));
         }
     }
     let messages: Vec<Value> = serde_json::from_str(&report.read_to_string(&ui_path)?).ok()?;
     let metadata = dir.join("task_metadata.json");
-    let model_id = report
-        .is_file(&metadata)
+    let model_id = is_regular_file(&metadata, report)
         .then(|| report.read_to_string(&metadata))
         .flatten()
         .and_then(|data| serde_json::from_str::<Value>(&data).ok())
@@ -656,7 +672,24 @@ fn task_dir_item(dir: &Path, id: &str, report: &ScanReport) -> Option<Value> {
                 .rev()
                 .find_map(|usage| usage.get("model_id")?.as_str().map(str::to_string))
         });
-    Some(item_from_messages(id, &messages, model_id))
+    let mut item = item_from_messages(id, &messages, model_id);
+    // A sidecar without a time or title still tells what the messages do not
+    // (the workspace); what the messages give is kept.
+    if let (Some(sidecar), Some(rebuilt)) = (sidecar, item.as_object_mut()) {
+        for (key, value) in sidecar {
+            if !value.is_null() {
+                rebuilt.entry(key).or_insert(value);
+            }
+        }
+    }
+    Some(item)
+}
+
+/// Whether `path` is a regular file itself, not a symlink to one.
+fn is_regular_file(path: &Path, report: &ScanReport) -> bool {
+    report
+        .symlink_metadata(path)
+        .is_some_and(|meta| meta.is_file())
 }
 
 /// A task item rebuilt from the task's own messages, for a task with no
@@ -722,7 +755,10 @@ fn item_from_messages(id: &str, messages: &[Value], model_id: Option<String>) ->
 /// `Primary:` folder there instead, which is not a path).
 fn request_cwd(request: &str) -> Option<&str> {
     const MARKER: &str = "# Current Working Directory (";
-    let rest = &request[request.find(MARKER)? + MARKER.len()..];
+    // The environment block is the writer's, appended after the prompt and
+    // the tool results, which may quote the same heading themselves.
+    let block = &request[request.rfind("<environment_details>")?..];
+    let rest = &block[block.find(MARKER)? + MARKER.len()..];
     let cwd = &rest[..rest.find(") Files")?];
     (!cwd.is_empty() && !cwd.starts_with("Primary:")).then_some(cwd)
 }
@@ -925,45 +961,59 @@ fn convert_cline_message(
 }
 
 /// Convert a task's `ui_messages.json` records, in order.
+fn convert_ui_messages(ui_messages: &[Value], session_id: &str) -> Vec<ClaudeMessage> {
+    converted_messages(ui_messages, session_id).collect()
+}
+
+/// [`convert_ui_messages`], one message at a time, so that a caller that stops
+/// early (a search that reached its limit) does not convert the rest.
 ///
 /// The user's first prompt is `say:"task"` in Cline (`cline/cline@e1bdeef`
 /// `apps/vscode/src/core/task/index.ts`: `this.say("task", task, images,
 /// files)`) but `say:"text"` in classic Roo Code, which has no `task` say
 /// (`RooCodeInc/Roo-Code@b867ec9` `src/core/task/Task.ts` `startTask`:
 /// `this.say("text", task, images)`); that record is a user message.
-fn convert_ui_messages(ui_messages: &[Value], session_id: &str) -> Vec<ClaudeMessage> {
+fn converted_messages<'a>(
+    ui_messages: &'a [Value],
+    session_id: &'a str,
+) -> impl Iterator<Item = ClaudeMessage> + 'a {
     let prompt = prompt_index(ui_messages);
     let mut counter = 0u64;
-    let mut messages = Vec::new();
     // The id of the tool call whose result record has not come yet.
     let mut open_call: Option<String> = None;
-    for (index, msg) in ui_messages.iter().enumerate() {
-        // A call's request is a say, or an ask when it needed approval.
-        let say = msg
-            .get("say")
-            .or_else(|| msg.get("ask"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
-        let converted = convert_cline_message(msg, session_id, &mut counter, open_call.as_deref());
-        match say {
-            "use_mcp_server" | "browser_action_launch" | "browser_action" | "use_subagents" => {
-                open_call = converted
-                    .as_ref()
-                    .and_then(|m| m.content.as_ref()?.get(0)?.get("id")?.as_str())
-                    .map(str::to_string);
+    ui_messages
+        .iter()
+        .enumerate()
+        .filter_map(move |(index, msg)| {
+            // A call's request is a say, or an ask when it needed approval.
+            let say = msg
+                .get("say")
+                .or_else(|| msg.get("ask"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let text = msg.get("text").and_then(Value::as_str).unwrap_or("");
+            let converted =
+                convert_cline_message(msg, session_id, &mut counter, open_call.as_deref());
+            match say {
+                "use_mcp_server" | "browser_action_launch" | "browser_action" | "use_subagents" => {
+                    open_call = converted
+                        .as_ref()
+                        .and_then(|m| m.content.as_ref()?.get(0)?.get("id")?.as_str())
+                        .map(str::to_string);
+                }
+                "mcp_server_response" => open_call = None,
+                "browser_action_result" | "subagent" if !is_progress_record(say, text) => {
+                    open_call = None;
+                }
+                _ => {}
             }
-            "mcp_server_response" | "browser_action_result" | "subagent" => open_call = None,
-            _ => {}
-        }
-        if let Some(mut converted) = converted {
+            let mut converted = converted?;
             if prompt == Some(index) {
                 converted.message_type = "user".to_string();
                 converted.role = Some("user".to_string());
             }
-            messages.push(converted);
-        }
-    }
-    messages
+            Some(converted)
+        })
 }
 
 /// Index of the record that holds the user's first prompt: a `say:"task"`, or
@@ -998,22 +1048,15 @@ fn convert_say_message(
     open_call: Option<&str>,
 ) -> Option<ClaudeMessage> {
     match say {
-        "text" | "completion_result" => {
-            if text.is_empty() {
-                return None;
-            }
-            let content = serde_json::json!([{"type": "text", "text": text}]);
-            Some(build_provider_message(
-                "cline",
-                uuid.to_string(),
-                session_id,
-                timestamp.to_string(),
-                "assistant",
-                Some("assistant"),
-                Some(content),
-                None,
-            ))
-        }
+        // `plan_completion_result` is the turn-final plan-mode reply of
+        // Cline's SDK path (`ClineSay`, `cline/cline@e1bdeef`).
+        "text" | "completion_result" | "plan_completion_result" => blocks_message(
+            "assistant",
+            record_blocks(text, msg),
+            uuid,
+            session_id,
+            timestamp,
+        ),
         "reasoning" => {
             let reasoning_text = msg.get("reasoning").and_then(Value::as_str).unwrap_or(text);
             if reasoning_text.is_empty() {
@@ -1143,22 +1186,13 @@ fn convert_say_message(
         // The user's own prompt: Cline writes it as `say:"task"`; classic Roo
         // writes it as the first `say:"text"` (see `prompt_index`, which makes
         // `convert_ui_messages` a user message).
-        "task" | "user_feedback" | "user_feedback_diff" => {
-            if text.is_empty() {
-                return None;
-            }
-            let content = serde_json::json!([{"type": "text", "text": text}]);
-            Some(build_provider_message(
-                "cline",
-                uuid.to_string(),
-                session_id,
-                timestamp.to_string(),
-                "user",
-                Some("user"),
-                Some(content),
-                None,
-            ))
-        }
+        "task" | "user_feedback" | "user_feedback_diff" => blocks_message(
+            "user",
+            record_blocks(text, msg),
+            uuid,
+            session_id,
+            timestamp,
+        ),
         // Cline's request to use an MCP tool or resource, and the response
         // that follows it (Roo records the request as an ask, so its
         // response stands alone as pretty-printed text).
@@ -1232,7 +1266,7 @@ fn convert_say_message(
             ))
         }
         "subagent" => {
-            if text.is_empty() {
+            if text.is_empty() || is_progress_record(say, text) {
                 return None;
             }
             let blocks = vec![text_block(&subagent_summary(text))];
@@ -1254,46 +1288,14 @@ fn convert_say_message(
                 timestamp,
             ))
         }
-        // Skip internal/metadata messages: request bookkeeping and retry
-        // timers, checkpoints, context condensing/truncation markers, MCP
-        // request starts and payloads, and JSON progress records.
-        "api_req_started"
-        | "api_req_finished"
-        | "api_req_retried"
-        | "api_req_retry_delayed"
-        | "api_req_rate_limit_wait"
-        | "api_req_deleted"
-        | "deleted_api_reqs"
-        | "shell_integration_warning"
-        | "shell_integration_warning_with_suggestion"
-        | "checkpoint_created"
-        | "checkpoint_saved"
-        | "condense_context"
-        | "sliding_window_truncation"
-        | "compaction"
-        | "mcp_server_request_started"
-        | "too_many_tools_warning"
-        | "user_edit_todos"
-        | "subagent_usage"
-        | "cloud_provisioning"
-        | "load_mcp_documentation"
-        | "info"
-        | "task_progress"
-        | "hook_status"
-        | "hook_output_stream"
-        | "conditional_rules_applied" => None,
-        _ => {
-            // For any other say type with text, show as assistant text
-            if text.is_empty() {
-                return None;
-            }
-            Some(assistant_text(
-                text.to_string(),
-                uuid,
-                session_id,
-                timestamp,
-            ))
-        }
+        // Everything else is not shown: request bookkeeping and retry timers
+        // (`api_req_*`, `deleted_api_reqs`), checkpoints, context condensing,
+        // truncation and compaction markers, MCP request starts, usage and
+        // provisioning counters, hooks, shell-integration warnings and other
+        // JSON progress records. A kind this parser does not know is not the
+        // assistant's words either; one with content for the reader needs an
+        // arm above.
+        _ => None,
     }
 }
 
@@ -1309,6 +1311,65 @@ fn assistant_text(text: String, uuid: &str, session_id: &str, timestamp: &str) -
         Some(serde_json::json!([{"type": "text", "text": text}])),
         None,
     )
+}
+
+/// The blocks of a record that carries a prompt or a reply: its `text`, then
+/// each of its `images` that is a `data:image/…;base64,…` URL (Cline and Roo
+/// store attachments so).
+fn record_blocks(text: &str, msg: &Value) -> Vec<Value> {
+    let mut blocks = Vec::new();
+    if !text.is_empty() {
+        blocks.push(text_block(text));
+    }
+    blocks.extend(
+        msg.get("images")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .filter_map(image_block),
+    );
+    blocks
+}
+
+/// A message of `message_type` holding `blocks`; `None` when there are none.
+fn blocks_message(
+    message_type: &str,
+    blocks: Vec<Value>,
+    uuid: &str,
+    session_id: &str,
+    timestamp: &str,
+) -> Option<ClaudeMessage> {
+    if blocks.is_empty() {
+        return None;
+    }
+    Some(build_provider_message(
+        "cline",
+        uuid.to_string(),
+        session_id,
+        timestamp.to_string(),
+        message_type,
+        Some(message_type),
+        Some(Value::Array(blocks)),
+        None,
+    ))
+}
+
+/// Whether a record only reports progress of a call that is still open: the
+/// empty `browser_action_result` Cline writes to start its loading spinner,
+/// and a `subagent` status that is still `running`. The call's result is the
+/// record that follows.
+fn is_progress_record(say: &str, text: &str) -> bool {
+    match say {
+        "browser_action_result" => text.is_empty(),
+        "subagent" => {
+            serde_json::from_str::<Value>(text)
+                .ok()
+                .and_then(|status| status.get("status")?.as_str().map(|s| s == "running"))
+                == Some(true)
+        }
+        _ => false,
+    }
 }
 
 /// An assistant message that calls tool `name`; its `tool_use` id is
@@ -2238,6 +2299,7 @@ mod tests {
         let out = convert_ui_messages(
             &[
                 say("browser_action_launch", "http://localhost:3000"),
+                say("browser_action_result", ""),
                 say("browser_action_result", &result.to_string()),
                 say(
                     "browser_action",
@@ -2415,6 +2477,183 @@ mod tests {
         assert_eq!(blocks(&out[4])[0]["tool_use_id"], read["id"]);
     }
 
+    /// The empty `browser_action_result` that starts Cline's spinner shows
+    /// nothing and leaves the launch open for the real result.
+    #[test]
+    fn browser_loading_record_keeps_the_call_open() {
+        let result = json!({"logs": "ready", "currentUrl": "http://x/"});
+        let out = convert_ui_messages(
+            &[
+                say("browser_action_launch", "http://x"),
+                say("browser_action_result", ""),
+                say("browser_action_result", &result.to_string()),
+            ],
+            "t",
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].message_type, "user");
+        assert_eq!(blocks(&out[1])[0]["tool_use_id"], blocks(&out[0])[0]["id"]);
+    }
+
+    /// A `running` sub-agent status is progress; the terminal status that
+    /// follows it is the call's result.
+    #[test]
+    fn running_subagent_status_keeps_the_call_open() {
+        let running = json!({"status": "running", "total": 1, "completed": 0, "items": []});
+        let done = json!({"status": "completed", "total": 1, "completed": 1, "items": [
+            {"prompt": "p", "status": "completed", "result": "found it"}]});
+        let out = convert_ui_messages(
+            &[
+                say("use_subagents", r#"{"prompts":["p"]}"#),
+                say("subagent", &running.to_string()),
+                say("mcp_notification", "[srv] ping"),
+                say("subagent", &done.to_string()),
+            ],
+            "t",
+        );
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[1].message_type, "system");
+        let result = &blocks(&out[2])[0];
+        assert_eq!(result["tool_use_id"], blocks(&out[0])[0]["id"]);
+        assert!(result["content"].as_str().unwrap().contains("found it"));
+    }
+
+    /// A prompt may be attachments only (Roo `say("text", task, images)`,
+    /// Cline `say("task", task, images, files)`).
+    #[test]
+    fn image_only_prompts_are_kept() {
+        let roo = json!({"ts": 1, "type": "say", "say": "text", "text": "",
+                         "images": ["data:image/png;base64,QUJD", "not an image"]});
+        let cline = json!({"ts": 1, "type": "say", "say": "task", "text": "see this",
+                           "images": ["data:image/png;base64,QUJD"]});
+        let image = json!({"type": "image",
+                           "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}});
+        let out = convert_ui_messages(&[roo, say("api_req_started", "{}")], "t");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].message_type, "user");
+        assert_eq!(blocks(&out[0]), &vec![image.clone()]);
+
+        let out = convert_ui_messages(&[cline], "t");
+        assert_eq!(out[0].message_type, "user");
+        assert_eq!(
+            blocks(&out[0]),
+            &vec![json!({"type": "text", "text": "see this"}), image]
+        );
+        // Nothing to show: no message.
+        let empty = json!({"ts": 1, "type": "say", "say": "text", "text": "", "images": []});
+        assert!(convert_ui_messages(&[empty], "t").is_empty());
+    }
+
+    /// A say kind the parser does not know is not assistant chat.
+    #[test]
+    fn unknown_say_kinds_are_not_shown() {
+        let records = [
+            say("future_bookkeeping", r#"{"some":"payload"}"#),
+            say("plan_completion_result", "The plan."),
+        ];
+        assert_eq!(
+            converted(&records),
+            vec![("assistant".to_string(), "The plan.".to_string())]
+        );
+    }
+
+    /// The iterator converts as it is consumed, so a search that stops at its
+    /// limit leaves the rest of the task unconverted.
+    #[test]
+    fn messages_are_converted_one_at_a_time() {
+        let records = [say("text", "one"), say("text", "two"), say("text", "three")];
+        let mut messages = converted_messages(&records, "t");
+        assert_eq!(first_text(&messages.next().unwrap()), "one");
+        let rest: Vec<String> = messages.map(|m| first_text(&m)).collect();
+        assert_eq!(rest, ["two", "three"]);
+    }
+
+    /// The working directory is read from Cline's environment block, not
+    /// from a heading the prompt or a tool result quotes.
+    #[test]
+    fn cwd_comes_from_the_environment_block() {
+        let request = "<task>\nwhat does `# Current Working Directory (/example) Files` mean?\n\
+                       </task>\n\n<environment_details>\n# Visible Files\n\n\n\
+                       # Current Working Directory (/work/app) Files\nsrc/\n</environment_details>";
+        assert_eq!(request_cwd(request), Some("/work/app"));
+        let quoted_only = "<task>\n# Current Working Directory (/example) Files\n</task>";
+        assert_eq!(request_cwd(quoted_only), None);
+    }
+
+    /// A `history_item.json` with no time or title does not make an item with
+    /// neither: the task is rebuilt from its messages, keeping what the
+    /// sidecar does say.
+    #[test]
+    fn incomplete_sidecar_is_rebuilt_from_the_messages() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().join("globalStorage/rooveterinaryinc.roo-cline");
+        let ui = json!([
+            {"type": "say", "say": "text", "text": "add a README", "ts": 1_700_000_000_000u64},
+            {"type": "say", "say": "api_req_started", "text": "{}", "ts": 1_700_000_001_000u64}
+        ]);
+        write_task_files(
+            &base,
+            "empty",
+            &[
+                ("ui_messages.json", ui.to_string()),
+                ("history_item.json", "{}".to_string()),
+            ],
+        );
+        write_task_files(
+            &base,
+            "partial",
+            &[
+                ("ui_messages.json", ui.to_string()),
+                (
+                    "history_item.json",
+                    json!({"workspace": "/w/x"}).to_string(),
+                ),
+            ],
+        );
+        let history = load_task_history(&base, &ScanReport::default());
+        assert_eq!(history.len(), 2);
+        for item in &history {
+            assert_eq!(item["ts"], 1_700_000_000_000u64);
+            assert_eq!(item["task"], "add a README");
+        }
+        assert_eq!(history[0]["id"], "empty");
+        assert_eq!(task_cwd(&history[0]), None);
+        assert_eq!(task_cwd(&history[1]), Some("/w/x"));
+    }
+
+    /// A symlinked transcript is not a task, and a symlinked sidecar is
+    /// ignored, so one task's files never show up as another's.
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_task_files_are_not_followed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let base = tmp.path().join("globalStorage/rooveterinaryinc.roo-cline");
+        let ui = r#"[{"type":"say","say":"text","text":"mine","ts":1700000000000}]"#;
+        write_task_files(&base, "real", &[("ui_messages.json", ui.to_string())]);
+        let real = base.join("tasks/real/ui_messages.json");
+
+        // A transcript that is a link to another task's.
+        fs::create_dir_all(base.join("tasks/linked")).unwrap();
+        std::os::unix::fs::symlink(&real, base.join("tasks/linked/ui_messages.json")).unwrap();
+
+        // A task whose sidecar is a link to a complete one elsewhere.
+        let elsewhere = tmp.path().join("elsewhere.json");
+        fs::write(
+            &elsewhere,
+            json!({"id": "x", "ts": 5, "task": "someone else's", "workspace": "/other"})
+                .to_string(),
+        )
+        .unwrap();
+        write_task_files(&base, "own", &[("ui_messages.json", ui.to_string())]);
+        std::os::unix::fs::symlink(&elsewhere, base.join("tasks/own/history_item.json")).unwrap();
+
+        let history = load_task_history(&base, &ScanReport::default());
+        let ids: Vec<&str> = history.iter().map(|i| i["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, ["own", "real"]);
+        assert_eq!(history[0]["task"], "mine");
+        assert_eq!(task_cwd(&history[0]), None);
+    }
+
     fn write_task_files(base: &Path, id: &str, files: &[(&str, String)]) {
         let dir = base.join("tasks").join(id);
         fs::create_dir_all(&dir).unwrap();
@@ -2492,7 +2731,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let base = tmp.path().join("globalStorage/saoudrizwan.claude-dev");
         let request = json!({
-            "request": "<task>\nfix it\n</task>\n\n# Current Working Directory (/work/app) Files\nsrc/",
+            "request": "<task>\nfix it\n</task>\n\n<environment_details>\n# Current Working Directory (/work/app) Files\nsrc/\n</environment_details>",
             "tokensIn": 100, "tokensOut": 20
         });
         let second = json!({"request": "again", "tokensIn": 7, "tokensOut": 3});
