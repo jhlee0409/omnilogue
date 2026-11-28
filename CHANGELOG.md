@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.1] - 2026-11-28
+
 ### Fixed
 - **Antigravity CLI sessions started through `agy acp` are listed once, under their folder** (desktop and WebUI). `agy acp` writes no line to `history.jsonl`, so these sessions landed in the "Antigravity CLI" project; their folder and title are now read from the CLI's `conversation_summaries.db`. When the Antigravity app is also installed, it keeps a summary row of each CLI session without its messages, and the app listed that row a second time under the folder, where it opened as "No messages"; those rows are no longer listed as app sessions. (#890)
 - **Zed threads are grouped by their project folder** (desktop and WebUI). Zed records a thread's folders one per line, and the app read them as a JSON list, so every thread landed in one "unknown" project. Threads now group under the folder Zed shows first. Tool calls show their arguments instead of a `{"type":"json","value":…}` wrapper, a thread Zed has not titled yet is named by its first prompt instead of its id, a compacted thread shows its summary as a "Context compacted" marker, and images attached to a prompt are shown. Sub-agent threads started with `spawn_agent` are no longer listed as threads of their own; they appear in the SubAgent panel of the thread that started them, linked to that call. (#855)
