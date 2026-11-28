@@ -1,37 +1,49 @@
 //! Cursor Agent CLI provider.
 //!
 //! Reads conversation transcripts written by the Cursor Agent CLI under
-//! `~/.cursor/projects/<encoded-project>/agent-transcripts/<uuid>/<uuid>.jsonl`.
-//! This is a different data source from the `cursor` provider (which reads the
-//! Cursor IDE's `SQLite` storage) — see issue #304.
+//! `~/.cursor/projects/<encoded-project>/agent-transcripts/<uuid>/<uuid>.jsonl`
+//! (`CURSOR_DATA_DIR` moves `~/.cursor` here), and the older flat
+//! `agent-transcripts/<uuid>.jsonl`. This is a different data source from the
+//! `cursor` provider (which reads the Cursor IDE's `SQLite` storage) — see
+//! issue #304.
 //!
-//! Transcript format (one JSON object per line):
+//! The transcript is a lossy mirror the CLI regenerates from its chat store
+//! (`agent-transcript` in the CLI bundle, 2026.11.22). One JSON object per
+//! line:
 //! ```json
-//! {"role":"user"|"assistant","message":{"content":[{"type":"text","text":"..."}]}}
+//! {"role":"user","message":{"content":[{"type":"text","text":"<user_query>\n…\n</user_query>"}]}}
+//! {"role":"assistant","message":{"content":[{"type":"text","text":"…"},{"type":"tool_use","name":"Read","input":{…}}]}}
+//! {"type":"turn_ended","status":"success"}
 //! ```
-//! There is no per-line `id`/`timestamp`/`sessionId`; the session id is the
-//! transcript file's UUID stem and times come from the file mtime.
+//! An assistant line's text is the visible text, then the reasoning, with
+//! `[REDACTED]` for each redacted reasoning part; each tool call follows as a
+//! `tool_use` with no id and no result. User text has the CLI's context tags
+//! removed and keeps the `<user_query>` wrapper. There is no per-line
+//! `id`/`timestamp`/`sessionId`; the session id is the transcript file's UUID
+//! stem and times come from the file mtime.
 //!
 //! ## Session titles (`/rename`)
 //!
 //! Transcripts carry no title. The CLI stores the title it shows in its own
 //! resume picker (updated by the `/rename` slash command) under
-//! `~/.cursor/chats/<md5(cwd)>/<session-uuid>/meta.json` (`title` field,
-//! mirrored as `name` in that directory's `store.db`). The session UUID is
-//! shared with the transcript path, so [`load_sessions`] merges that stored
-//! title over the first-prompt fallback chain.
+//! `<config root>/chats/<md5(cwd)>/<session-uuid>/meta.json` (`title` field,
+//! mirrored as `name` in that directory's `store.db`); the config root is
+//! `~/.cursor` unless `CURSOR_CONFIG_DIR` or `XDG_CONFIG_HOME` moves it. The
+//! session UUID is shared with the transcript path, so [`load_sessions`]
+//! merges that stored title over the first-prompt fallback chain.
 //!
 //! ## Content-block normalisation (issue #472)
-//!
-//! Cursor agent injects several non-prose block types that must be handled
-//! before content reaches the viewer:
 //!
 //! | Block type | Behaviour |
 //! |---|---|
 //! | `{"type":"text","text":"<user_query>…</user_query>"}` | Strip XML wrapper; drop trailing `<context>` blob |
-//! | `{"type":"redacted","data":"[REDACTED]"}` | Skip message when *all* blocks are redacted |
+//! | `{"type":"text","text":"…\n\n[REDACTED]"}` | Drop the `[REDACTED]` lines; skip the message when nothing is left |
+//! | `{"type":"tool_use","name":…,"input":{…}}` | A tool call (no result is recorded) |
 //! | `{"type":"tool_result","content":[…]}` | Recurse into nested content array |
 //! | `{"type":"command_output","output":"…"}` | Surface shell stdout/stderr |
+//!
+//! A `<user_query>` that opens like the notices Cursor adds when a sub-agent
+//! or background command finishes is not shown as a prompt.
 
 use super::ProviderInfo;
 use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession};
@@ -65,10 +77,9 @@ pub fn detect() -> Option<ProviderInfo> {
     })
 }
 
-/// Base path for Cursor Agent transcripts: `~/.cursor/projects`.
+/// Base path for Cursor Agent transcripts: `<data root>/projects`.
 pub fn get_base_path() -> Option<String> {
-    let home = crate::utils::home_dir()?;
-    let projects = home.join(".cursor").join("projects");
+    let projects = data_root()?.join("projects");
     if projects.is_dir() {
         Some(projects.to_string_lossy().to_string())
     } else {
@@ -76,17 +87,52 @@ pub fn get_base_path() -> Option<String> {
     }
 }
 
-/// Root of the Cursor Agent CLI chat metadata store: `~/.cursor/chats`.
-pub(crate) fn chats_root() -> Option<PathBuf> {
-    chats_root_in(&crate::utils::home_dir()?)
+/// The value of `name` when set to something other than blanks, as the CLI
+/// reads its directory overrides.
+fn non_blank_env(name: &str) -> Option<PathBuf> {
+    // A test build ignores `XDG_CONFIG_HOME`, as `utils::config_dir` does:
+    // CI runners set it, which would move every sandboxed `~/.cursor`.
+    if cfg!(test) && name == "XDG_CONFIG_HOME" {
+        return None;
+    }
+    std::env::var_os(name)
+        .filter(|value| !value.to_string_lossy().trim().is_empty())
+        .map(PathBuf::from)
 }
 
-/// `.cursor/chats` under `home`, or `None` when missing or a symlink.
+/// The CLI's config root, which holds `chats/` and `acp-sessions/`.
+pub(crate) fn config_root() -> Option<PathBuf> {
+    config_root_from(non_blank_env, crate::utils::home_dir())
+}
+
+/// `CURSOR_CONFIG_DIR`, else `$XDG_CONFIG_HOME/cursor`, else `~/.cursor`
+/// (`cursor-config/dist/paths.js` in the CLI bundle).
+fn config_root_from(
+    env: impl Fn(&str) -> Option<PathBuf>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    env("CURSOR_CONFIG_DIR")
+        .or_else(|| env("XDG_CONFIG_HOME").map(|dir| dir.join("cursor")))
+        .or_else(|| Some(home?.join(".cursor")))
+}
+
+/// The CLI's data root, which holds `projects/` (the transcripts):
+/// `CURSOR_DATA_DIR`, else `~/.cursor`.
+fn data_root() -> Option<PathBuf> {
+    non_blank_env("CURSOR_DATA_DIR").or_else(|| Some(crate::utils::home_dir()?.join(".cursor")))
+}
+
+/// Root of the Cursor Agent CLI chat metadata store: `<config root>/chats`.
+pub(crate) fn chats_root() -> Option<PathBuf> {
+    chats_root_in(&config_root()?)
+}
+
+/// `chats` under the config root, or `None` when missing or a symlink.
 ///
 /// `WalkDir` follows a symlinked traversal root by default, so reject it here
 /// rather than reading titles from an unintended location.
-fn chats_root_in(home: &Path) -> Option<PathBuf> {
-    let chats = home.join(".cursor").join("chats");
+fn chats_root_in(config_root: &Path) -> Option<PathBuf> {
+    let chats = config_root.join("chats");
     if chats.is_dir() && !is_symlink(&chats) {
         Some(chats)
     } else {
@@ -234,6 +280,10 @@ pub fn load_messages(session_path: &str) -> Result<Vec<ClaudeMessage>, String> {
 
 /// Convert a transcript file's contents into messages. Pure (no filesystem /
 /// validation) so it can be unit-tested directly.
+///
+/// A message's uuid is `<session>-<n>`, `n` counting every user/assistant
+/// line, shown or not, so a search hit (also from this function) resolves
+/// to the same message in [`load_messages`].
 fn parse_transcript(data: &str, session_id: &str, timestamp: &str) -> Vec<ClaudeMessage> {
     let mut messages = Vec::new();
     let mut msg_index = 0u64;
@@ -248,15 +298,10 @@ fn parse_transcript(data: &str, session_id: &str, timestamp: &str) -> Vec<Claude
         if !is_conversation_turn(&value) {
             continue;
         }
-        // Skip messages that carry nothing but redacted placeholders.
-        if is_only_redacted(&value) {
-            msg_index += 1;
-            continue;
-        }
         if let Some(msg) = convert_message(&value, session_id, timestamp, msg_index) {
             messages.push(msg);
-            msg_index += 1;
         }
+        msg_index += 1;
     }
     messages
 }
@@ -269,7 +314,8 @@ pub fn search(query: &str, limit: usize) -> Result<Vec<ClaudeMessage>, String> {
     Ok(search_in(Path::new(&base), query, limit))
 }
 
-/// Implementation of [`search`] parameterised by the projects root.
+/// Implementation of [`search`] parameterised by the projects root. Only
+/// what a transcript shows is searched.
 fn search_in(base: &Path, query: &str, limit: usize) -> Vec<ClaudeMessage> {
     let query_lower = query.to_lowercase();
     let mut results = Vec::new();
@@ -293,35 +339,19 @@ fn search_in(base: &Path, query: &str, limit: usize) -> Vec<ClaudeMessage> {
             let session_id = file_uuid(path);
             let timestamp = file_mtime_rfc3339(path);
 
-            let mut msg_index = 0u64;
-            for line in data.lines() {
-                let line = line.trim();
-                if line.is_empty() {
+            for mut msg in parse_transcript(&data, &session_id, &timestamp) {
+                let hit = msg.content.as_ref().is_some_and(|content| {
+                    search_json_value_case_insensitive(content, &query_lower)
+                });
+                if !hit {
                     continue;
                 }
-                let Ok(value) = serde_json::from_str::<Value>(line) else {
-                    continue;
-                };
-                if !is_conversation_turn(&value) {
-                    continue;
+                msg.project_name = Some(project_name.clone());
+                msg.project_path = Some(project_path.clone());
+                results.push(msg);
+                if results.len() >= limit {
+                    return results;
                 }
-                if is_only_redacted(&value) {
-                    msg_index += 1;
-                    continue;
-                }
-                if search_json_value_case_insensitive(&value, &query_lower) {
-                    if let Some(mut msg) =
-                        convert_message(&value, &session_id, &timestamp, msg_index)
-                    {
-                        msg.project_name = Some(project_name.clone());
-                        msg.project_path = Some(project_path.clone());
-                        results.push(msg);
-                        if results.len() >= limit {
-                            return results;
-                        }
-                    }
-                }
-                msg_index += 1;
             }
         }
     }
@@ -332,36 +362,6 @@ fn search_in(base: &Path, query: &str, limit: usize) -> Vec<ClaudeMessage> {
 // ============================================================================
 // Content-block normalisation (issue #472)
 // ============================================================================
-
-/// Returns `true` when every content block in the message is a redaction
-/// placeholder, meaning there is nothing useful to show the user.
-///
-/// Cursor emits two forms of redacted blocks:
-/// - `{"type":"redacted","data":"[REDACTED]"}` — explicit redaction type
-/// - `{"type":"text","text":"[REDACTED]"}` — literal string sentinel
-fn is_only_redacted(value: &Value) -> bool {
-    let Some(blocks) = value
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(Value::as_array)
-    else {
-        return false;
-    };
-    if blocks.is_empty() {
-        return false;
-    }
-    blocks.iter().all(|b| {
-        let ty = b.get("type").and_then(Value::as_str).unwrap_or("");
-        if ty == "redacted" {
-            return true;
-        }
-        if ty == "text" {
-            let text = b.get("text").and_then(Value::as_str).unwrap_or("").trim();
-            return text == "[REDACTED]";
-        }
-        false
-    })
-}
 
 /// Strip Cursor's `<user_query>…</user_query>` XML envelope from a user text
 /// block and remove any trailing `<context>` or similar XML blobs.
@@ -407,49 +407,54 @@ fn strip_xml_tags(s: &str) -> String {
     out
 }
 
-/// Collect displayable text from *all* content block types in a message,
-/// including tool results and command output (issue #472 — missing shell output).
-///
-/// Block types handled:
-/// - `{"type":"text","text":"…"}` — normal prose; user text is cleaned of XML
-/// - `{"type":"tool_result","content":[…]}` — recurse into nested content array
-/// - `{"type":"command_output","output":"…"}` — shell stdout/stderr
-/// - `{"type":"redacted",…}` — skipped (not useful)
-fn extract_text_all_blocks(value: &Value) -> Option<String> {
-    let role = value.get("role").and_then(Value::as_str).unwrap_or("");
-    let blocks = value
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(Value::as_array)?;
+/// The sentinel the CLI writes for each redacted reasoning part, on its own
+/// line after the visible text.
+const REDACTED: &str = "[REDACTED]";
 
-    let mut parts: Vec<String> = Vec::new();
-
-    for block in blocks {
-        collect_block_text(block, role, &mut parts);
+/// `text` without its `[REDACTED]` lines.
+fn without_redacted(text: &str) -> String {
+    if !text.contains(REDACTED) {
+        return text.trim().to_string();
     }
-
-    if parts.is_empty() {
-        None
-    } else {
-        Some(parts.join("\n"))
-    }
+    text.lines()
+        .filter(|line| line.trim() != REDACTED)
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
 }
 
-/// Recursively collect text from a single content block into `out`.
+/// Openings of the `<user_query>` messages Cursor adds when a sub-agent or a
+/// background command finishes. The model is told the result; the user did
+/// not type them (the `INJECTED_QUERY_PREFIXES` of the `CursorDump` exporter,
+/// observed in real transcripts).
+const INJECTED_QUERY_PREFIXES: &[&str] = &[
+    "The beginning of the above subagent result",
+    "The above subagent result",
+    "A subagent has completed",
+    "The background shell command",
+    "Briefly inform the user about the task result",
+];
+
+fn is_injected_query(text: &str) -> bool {
+    let text = text.trim_start();
+    INJECTED_QUERY_PREFIXES
+        .iter()
+        .any(|prefix| text.starts_with(prefix))
+}
+
+/// Recursively collect text from a legacy `tool_result` / `command_output`
+/// block, or a text block nested in one, into `out` (issue #472).
 fn collect_block_text(block: &Value, role: &str, out: &mut Vec<String>) {
     let ty = block.get("type").and_then(Value::as_str).unwrap_or("");
 
     match ty {
         "text" => {
-            let raw = block.get("text").and_then(Value::as_str).unwrap_or("");
-            // Skip bare [REDACTED] sentinels.
-            if raw.trim() == "[REDACTED]" {
-                return;
-            }
+            let raw = without_redacted(block.get("text").and_then(Value::as_str).unwrap_or(""));
             let cleaned = if role == "user" {
-                clean_user_text(raw)
+                clean_user_text(&raw)
             } else {
-                raw.to_string()
+                raw
             };
             if !cleaned.trim().is_empty() {
                 out.push(cleaned);
@@ -495,12 +500,16 @@ fn is_conversation_turn(value: &Value) -> bool {
     )
 }
 
-/// Convert one transcript line into a `ClaudeMessage`. `msg_index` makes the
-/// generated UUID stable/deterministic so global-search navigation can resolve
-/// it back inside `load_messages`.
+/// Convert one transcript line into a `ClaudeMessage`, or `None` when it
+/// shows nothing: only redacted reasoning, or a notification Cursor injected
+/// as a user message. `msg_index` makes the generated UUID
+/// stable/deterministic so global-search navigation can resolve it back
+/// inside `load_messages`.
 ///
-/// The `content` field is rebuilt from the full block set (including tool /
-/// command-output blocks) so the rendered conversation is complete.
+/// Text blocks are kept, cleaned. The CLI writes each tool call as
+/// `{"type":"tool_use","name","input"}` with no id and no result, so a call
+/// gets an id from its line and position. Legacy `tool_result` /
+/// `command_output` blocks become text.
 fn convert_message(
     value: &Value,
     session_id: &str,
@@ -508,25 +517,74 @@ fn convert_message(
     msg_index: u64,
 ) -> Option<ClaudeMessage> {
     let role = value.get("role").and_then(Value::as_str)?;
+    let uuid = format!("{session_id}-{msg_index}");
+    let blocks = value
+        .get("message")
+        .and_then(|m| m.get("content"))
+        .and_then(Value::as_array)?;
 
-    // Build a normalised content array for the viewer.
-    // We reconstruct it as a JSON array of {"type":"text","text":"…"} objects
-    // so the frontend's existing text-block renderer handles it without changes.
-    let normalised_text = extract_text_all_blocks(value)?;
-    let content = serde_json::json!([
-        {"type": "text", "text": normalised_text}
-    ]);
+    let mut content: Vec<Value> = Vec::new();
+    let mut texts: Vec<String> = Vec::new();
+    let flush = |texts: &mut Vec<String>, content: &mut Vec<Value>| {
+        if !texts.is_empty() {
+            content.push(serde_json::json!({"type": "text", "text": texts.join("\n")}));
+            texts.clear();
+        }
+    };
+    for block in blocks {
+        if block.get("type").and_then(Value::as_str) == Some("tool_use") {
+            flush(&mut texts, &mut content);
+            let name = block.get("name").and_then(Value::as_str).unwrap_or("tool");
+            let input = block
+                .get("input")
+                .filter(|input| input.is_object())
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            content.push(serde_json::json!({
+                "type": "tool_use",
+                "id": format!("{uuid}-tool-{}", content.len()),
+                "name": name,
+                "input": input,
+            }));
+        } else {
+            collect_block_text(block, role, &mut texts);
+        }
+    }
+    flush(&mut texts, &mut content);
 
-    Some(build_provider_message(
+    if content.is_empty() {
+        return None;
+    }
+    // Only a `<user_query>` the harness wrote can be a notice; text the user
+    // typed that merely opens the same way stays a prompt.
+    let is_notice = role == "user"
+        && blocks.iter().any(|block| {
+            block
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|raw| raw.contains("<user_query>"))
+                .is_some_and(|raw| is_injected_query(&clean_user_text(raw)))
+        });
+    if is_notice {
+        return None;
+    }
+
+    let tool_use = content
+        .iter()
+        .find(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .cloned();
+    let mut msg = build_provider_message(
         PROVIDER_ID,
-        format!("{session_id}-{msg_index}"),
+        uuid,
         session_id,
         timestamp.to_string(),
         role,
         Some(role),
-        Some(content),
+        Some(Value::Array(content)),
         None,
-    ))
+    );
+    msg.tool_use = tool_use;
+    Some(msg)
 }
 
 // ============================================================================
@@ -567,37 +625,25 @@ fn extract_session_info(
     native_titles: &HashMap<String, String>,
 ) -> Option<ClaudeSession> {
     let data = fs::read_to_string(file_path).ok()?;
-
-    let mut message_count = 0usize;
-    let mut summary: Option<String> = None;
-    for line in data.lines() {
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        if !is_conversation_turn(&value) {
-            continue;
-        }
-        if is_only_redacted(&value) {
-            continue;
-        }
-        message_count += 1;
-        if summary.is_none() && value.get("role").and_then(Value::as_str) == Some("user") {
-            // Use the narrow text-only helper for the title so tool noise
-            // doesn't bleed into the session summary.
-            summary = extract_title_text(&value).map(|t| summarize(&t));
-        }
-    }
-
-    if message_count == 0 {
-        return None;
-    }
-
     let uuid = file_uuid(file_path);
     let mtime = file_mtime_rfc3339(file_path);
+
+    // Count and title what the transcript shows.
+    let messages = parse_transcript(&data, &uuid, &mtime);
+    if messages.is_empty() {
+        return None;
+    }
+    let has_tool_use = messages.iter().any(|m| m.tool_use.is_some());
+    let summary = messages
+        .iter()
+        .filter(|m| m.message_type == "user")
+        .find_map(|m| {
+            m.content
+                .as_ref()?
+                .as_array()?
+                .iter()
+                .find_map(|block| block.get("text")?.as_str().map(summarize))
+        });
     let native_title = native_titles.get(&uuid);
 
     Some(ClaudeSession {
@@ -605,11 +651,11 @@ fn extract_session_info(
         actual_session_id: uuid.clone(),
         file_path: file_path.to_string_lossy().to_string(),
         project_name: project_name.to_string(),
-        message_count,
+        message_count: messages.len(),
         first_message_time: mtime.clone(),
         last_message_time: mtime.clone(),
         last_modified: mtime,
-        has_tool_use: false,
+        has_tool_use,
         has_errors: false,
         // Stored title (the CLI's resume-picker name, updated by `/rename`)
         // wins over the first-prompt fallback, which wins over the raw UUID.
@@ -619,34 +665,6 @@ fn extract_session_info(
         storage_type: Some("json".to_string()),
         entrypoint: None,
     })
-}
-
-/// Narrow helper: extract only `text`-type block text for use in session
-/// titles.  Tool results and command output are intentionally excluded so the
-/// title reflects the user's actual query, not the tool noise that follows.
-fn extract_title_text(value: &Value) -> Option<String> {
-    let content = value
-        .get("message")
-        .and_then(|m| m.get("content"))
-        .and_then(Value::as_array)?;
-    let mut out = String::new();
-    for item in content {
-        if item.get("type").and_then(Value::as_str) == Some("text") {
-            if let Some(text) = item.get("text").and_then(Value::as_str) {
-                if text.trim() != "[REDACTED]" {
-                    if !out.is_empty() {
-                        out.push(' ');
-                    }
-                    out.push_str(text);
-                }
-            }
-        }
-    }
-    if out.is_empty() {
-        None
-    } else {
-        Some(out)
-    }
 }
 
 /// Build a short session title from the first user prompt, stripping the
@@ -704,16 +722,35 @@ pub(crate) fn project_display(project_dir: &Path) -> (String, String) {
     }
 }
 
-/// Non-symlinked `*.jsonl` files under an `agent-transcripts` directory
-/// (`<uuid>/<uuid>.jsonl`, depth 2).
+/// Non-symlinked `*.jsonl` transcripts under an `agent-transcripts`
+/// directory: `<uuid>/<uuid>.jsonl`, and the older flat `<uuid>.jsonl` the
+/// CLI still reads (`agent-transcript/dist/paths.js`) when that chat has no
+/// file in the current layout. A sub-agent's `<uuid>/subagents/*.jsonl` is
+/// not a session.
+///
+/// A symlinked `agent-transcripts` is not walked: it could lead outside the
+/// projects root.
 fn transcript_files(transcripts_dir: &Path) -> Vec<DirEntry> {
-    WalkDir::new(transcripts_dir)
-        .min_depth(2)
+    if is_symlink(transcripts_dir) {
+        return Vec::new();
+    }
+    let files: Vec<DirEntry> = WalkDir::new(transcripts_dir)
+        .min_depth(1)
         .max_depth(2)
         .into_iter()
         .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_file())
         .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("jsonl"))
         .filter(|e| !is_symlink(e.path()))
+        .collect();
+    let current: std::collections::HashSet<String> = files
+        .iter()
+        .filter(|e| e.depth() == 2)
+        .map(|e| file_uuid(e.path()))
+        .collect();
+    files
+        .into_iter()
+        .filter(|e| e.depth() == 2 || !current.contains(&file_uuid(e.path())))
         .collect()
 }
 
@@ -1104,7 +1141,7 @@ mod tests {
         // A real chats directory is accepted.
         let good = base.join("good");
         fs::create_dir_all(good.join(".cursor").join("chats")).unwrap();
-        assert!(chats_root_in(&good).is_some());
+        assert!(chats_root_in(&good.join(".cursor")).is_some());
 
         // A symlinked chats directory is rejected.
         let target = base.join("elsewhere");
@@ -1117,8 +1154,159 @@ mod tests {
         #[cfg(windows)]
         std::os::windows::fs::symlink_dir(&target, &link).unwrap();
         assert!(
-            chats_root_in(&bad).is_none(),
+            chats_root_in(&bad.join(".cursor")).is_none(),
             "symlinked chats root must be rejected"
         );
+    }
+
+    /// Lines as the CLI's transcript writer (`agent-transcript`, 2026.11.22)
+    /// produces them.
+    const TOOL_SESSION: &str = concat!(
+        r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>\nRead the config\nand fix it\n</user_query>"}]}}"#,
+        "\n",
+        r#"{"role":"assistant","message":{"content":[{"type":"text","text":"[REDACTED]"},{"type":"tool_use","name":"Read","input":{"path":"src/config.ts"}},{"type":"tool_use","name":"Shell","input":{"command":"npm test"}}]}}"#,
+        "\n",
+        r#"{"role":"user","message":{"content":[{"type":"text","text":"<user_query>\nThe above subagent result is already visible to the user. Briefly summarise it.\n</user_query>"}]}}"#,
+        "\n",
+        r#"{"role":"assistant","message":{"content":[{"type":"text","text":"Fixed the port.\n\n[REDACTED]\n[REDACTED]"}]}}"#,
+        "\n",
+        r#"{"type":"turn_ended","status":"success"}"#,
+        "\n",
+    );
+
+    /// Only a harness-written `<user_query>` can be a notice: a prompt typed
+    /// without the wrapper that opens like one is still the user's.
+    #[test]
+    fn a_typed_prompt_that_opens_like_a_notice_is_kept() {
+        let line = r#"{"role":"user","message":{"content":[{"type":"text","text":"The background shell command fails on Windows. Please fix it."}]}}"#;
+        let messages = parse_transcript(line, "s", "");
+        assert_eq!(messages.len(), 1);
+    }
+
+    #[test]
+    fn tool_only_turns_show_their_calls_and_injected_notices_are_not_prompts() {
+        let messages = parse_transcript(TOOL_SESSION, "s", "");
+        let types: Vec<&str> = messages.iter().map(|m| m.message_type.as_str()).collect();
+        assert_eq!(types, ["user", "assistant", "assistant"]);
+
+        let calls = messages[1].content.as_ref().unwrap().as_array().unwrap();
+        assert_eq!(calls.len(), 2, "the redacted reasoning is not shown");
+        assert_eq!(calls[0]["type"], "tool_use");
+        assert_eq!(calls[0]["name"], "Read");
+        assert_eq!(
+            calls[0]["input"],
+            serde_json::json!({"path": "src/config.ts"})
+        );
+        assert_eq!(
+            calls[1]["input"],
+            serde_json::json!({"command": "npm test"})
+        );
+        assert_ne!(calls[0]["id"], calls[1]["id"]);
+        assert!(messages[1].tool_use.is_some());
+
+        let reply = messages[2].content.as_ref().unwrap();
+        assert_eq!(reply[0]["text"], "Fixed the port.");
+
+        // The skipped notice still takes its index, so ids match search hits.
+        assert_eq!(messages[2].uuid, "s-3");
+    }
+
+    #[test]
+    fn session_counts_and_titles_what_is_shown_and_search_finds_tool_input() {
+        let tmp = TempDir::new().unwrap();
+        let base = tmp.path();
+        write_transcript(base, "Users-jack-client-foo", "uuid-1", TOOL_SESSION);
+        let file = base.join("Users-jack-client-foo/agent-transcripts/uuid-1/uuid-1.jsonl");
+        let session = extract_session_info(&file, "foo", &HashMap::new()).unwrap();
+        assert_eq!(session.message_count, 3);
+        assert!(session.has_tool_use);
+        assert_eq!(
+            session.summary.as_deref(),
+            Some("Read the config and fix it")
+        );
+
+        let hits = search_in(base, "npm test", 10);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].uuid, "uuid-1-1");
+        // A notice is not a hit, and a wrapper tag is not searched.
+        assert!(search_in(base, "subagent result", 10).is_empty());
+        assert!(search_in(base, "user_query", 10).is_empty());
+    }
+
+    #[test]
+    fn legacy_flat_transcripts_are_sessions_unless_the_current_file_exists() {
+        let tmp = TempDir::new().unwrap();
+        let transcripts = tmp.path().join("proj").join("agent-transcripts");
+        fs::create_dir_all(transcripts.join("both/subagents")).unwrap();
+        fs::write(transcripts.join("flat.jsonl"), SAMPLE).unwrap();
+        fs::write(transcripts.join("both.jsonl"), SAMPLE).unwrap();
+        fs::write(transcripts.join("both/both.jsonl"), SAMPLE).unwrap();
+        fs::write(transcripts.join("both/subagents/sub.jsonl"), SAMPLE).unwrap();
+
+        let mut files: Vec<String> = transcript_files(&transcripts)
+            .iter()
+            .map(|e| {
+                e.path()
+                    .strip_prefix(&transcripts)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        files.sort();
+        assert_eq!(files, ["both/both.jsonl", "flat.jsonl"]);
+    }
+
+    #[test]
+    fn config_root_follows_the_cli_order() {
+        let home = Some(PathBuf::from("/home/me"));
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| PathBuf::from(value))
+            }
+        };
+        assert_eq!(
+            config_root_from(env(&[]), home.clone()),
+            Some(PathBuf::from("/home/me/.cursor"))
+        );
+        assert_eq!(
+            config_root_from(env(&[("XDG_CONFIG_HOME", "/xdg")]), home.clone()),
+            Some(PathBuf::from("/xdg/cursor"))
+        );
+        assert_eq!(
+            config_root_from(
+                env(&[("XDG_CONFIG_HOME", "/xdg"), ("CURSOR_CONFIG_DIR", "/cfg")]),
+                home
+            ),
+            Some(PathBuf::from("/cfg"))
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cursor_data_dir_moves_the_transcripts() {
+        let _home = crate::test_utils::SandboxHome::new();
+        let data = TempDir::new().unwrap();
+        let data_dir = data.path().canonicalize().unwrap();
+        let projects = data_dir.join("projects");
+        write_transcript(&projects, "Users-me-app", "uuid-1", SAMPLE);
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("CURSOR_DATA_DIR", value),
+                    None => std::env::remove_var("CURSOR_DATA_DIR"),
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("CURSOR_DATA_DIR"));
+        std::env::set_var("CURSOR_DATA_DIR", &data_dir);
+
+        assert_eq!(get_base_path().map(PathBuf::from), Some(projects.clone()));
+        let project = scan_projects().unwrap().remove(0);
+        let sessions = load_sessions(&project.path, false).unwrap();
+        assert_eq!(load_messages(&sessions[0].file_path).unwrap().len(), 2);
     }
 }

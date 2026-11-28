@@ -282,20 +282,22 @@ impl Drop for EnvGuard {
 
 /// Every variable a token-reporting provider reads to locate its store.
 /// Cleared, the sandbox home is the only place a store could be.
-pub const STORE_ENV: [&str; 25] = [
+pub const STORE_ENV: [&str; 27] = [
     "ANTIGRAVITY_USER_DIR",
     "CLINE_DATA_DIR",
     "CLINE_DIR",
     "CLINE_SESSION_DATA_DIR",
     "CODEX_HOME",
-    "COPILOT_CLI_HOME",
+    "COPILOT_HOME",
+    "CURSOR_CONFIG_DIR",
+    "CURSOR_DATA_DIR",
     "CURSOR_USER_DIR",
     "FORGE_CONFIG",
     "GEMINI_HOME",
     "GROK_HOME",
     "HERMES_HOME",
     "INTERPRETER_HOME",
-    "KILO_HOME",
+    "KILO_DB",
     "KIMI_CODE_HOME",
     "KIMI_HOME",
     "KIMI_SHARE_DIR",

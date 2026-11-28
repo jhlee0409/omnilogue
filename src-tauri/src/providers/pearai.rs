@@ -9,6 +9,12 @@
 //! so would let a Continue user's override dir be scanned twice (once per
 //! provider) and mislabel Continue sessions as `PearAI`. `PearAI` uses
 //! `~/.pearai` exclusively.
+//!
+//! A "`PearAI` Search" (Perplexity) session keeps its conversation in
+//! `perplexityHistory` instead of `history`; the family reader takes
+//! whichever is filled. The `PearAI` agent, a Roo Code fork
+//! (`PearAI.pearai-roo-cline`), is read by [`super::cline`] with the other
+//! Cline-family extensions, including those inside the `PearAI` editor.
 
 use super::continue_dev::{
     base_path_for, detect_for, load_messages_for, load_sessions_for, scan_projects_for, search_for,

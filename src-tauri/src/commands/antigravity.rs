@@ -524,7 +524,19 @@ pub(crate) struct ConversationSummaryMeta {
     pub step_count: u32,
     pub fts_turn_count: u32,
     pub fts_text_bytes: usize,
+    /// The row is a CLI conversation the desktop app mirrored
+    /// (`source = 'CORTEX_TRAJECTORY_SOURCE_CLI'`); its transcript lives in the
+    /// CLI store, not under this root.
+    pub from_cli: bool,
     pub last_modified_ms: u64,
+}
+
+impl ConversationSummaryMeta {
+    /// A CLI conversation the desktop app only mirrored: the row says so and
+    /// the store holds none of its text.
+    pub(crate) fn is_cli_mirror(&self) -> bool {
+        self.from_cli && self.fts_text_bytes == 0
+    }
 }
 
 /// Turns a workspace value (`file:///…` URI or plain path) into the folder path
@@ -748,6 +760,23 @@ pub(crate) fn load_conversation_summaries_map(
                     let a_turns =
                         parse_fts_offset_count(row.get_ref(8).ok(), !agent_body.trim().is_empty());
                     entry.fts_turn_count = entry.fts_turn_count.saturating_add(u_turns + a_turns);
+                }
+            }
+        }
+    }
+
+    // A column older stores may lack: the statement then fails and no row is
+    // marked.
+    if let Ok(mut stmt) = conn.prepare(
+        "SELECT conversation_id FROM conversation_summaries \
+         WHERE source = 'CORTEX_TRAJECTORY_SOURCE_CLI'",
+    ) {
+        if let Ok(mut rows) = stmt.query([]) {
+            while let Ok(Some(row)) = rows.next() {
+                if let Ok(conv_id) = row.get::<_, String>(0) {
+                    if let Some(entry) = map.get_mut(&conv_id) {
+                        entry.from_cli = true;
+                    }
                 }
             }
         }
@@ -1326,10 +1355,13 @@ fn build_state_from_token_monitor_sources(
             &mut persisted,
             summaries_map.get(&candidate.session_id),
         );
-        // Reject completely empty brain directories that have no files, no rpc artifact, and no summary/db metadata
+        // Reject completely empty brain directories that have no files, no rpc
+        // artifact, and no summary/db metadata (a mirrored CLI row is none).
         if !has_rpc_artifact
             && candidate.file_paths.is_empty()
-            && !summaries_map.contains_key(&candidate.session_id)
+            && summaries_map
+                .get(&candidate.session_id)
+                .is_none_or(ConversationSummaryMeta::is_cli_mirror)
             && conversation_db_path(root, &candidate.session_id).is_none()
         {
             continue;
@@ -1446,7 +1478,18 @@ fn build_state_from_token_monitor_sources(
             .map(|p| file_mtime_ms(p))
             .max()
             .unwrap_or(0);
-        if let Some(db_path) = conversation_db_path(root, &session_id) {
+        let db_path = conversation_db_path(root, &session_id);
+        // A CLI conversation the desktop app only mirrored a summary row of:
+        // nothing of it is under this root, so it is listed by the CLI store
+        // and would be an empty duplicate here.
+        let summary = summaries_map.get(&session_id);
+        if summary.is_some_and(ConversationSummaryMeta::is_cli_mirror)
+            && token_files.is_empty()
+            && db_path.is_none()
+        {
+            continue;
+        }
+        if let Some(db_path) = db_path {
             last_modified = last_modified.max(file_mtime_ms(&db_path));
         }
 
@@ -2270,6 +2313,35 @@ mod tests {
         assert!(conversation_db_path(root, "sess-outside").is_none());
         let state = build_state_from_token_monitor_sources(root, &ScanReport::default()).unwrap();
         assert!(state.sessions.is_empty(), "{:?}", state.sessions.keys());
+    }
+
+    /// The desktop app mirrors a summary row of each CLI conversation
+    /// (`source = 'CORTEX_TRAJECTORY_SOURCE_CLI'`) without its transcript:
+    /// that row is no desktop session. A desktop row is still one.
+    #[test]
+    fn test_mirrored_cli_summary_rows_are_not_desktop_sessions() {
+        let dir = TempDir::new().unwrap();
+        let root = dir.path();
+        let conn = rusqlite::Connection::open(root.join("conversation_summaries.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE conversation_summaries (
+                conversation_id TEXT PRIMARY KEY, title TEXT, preview TEXT,
+                step_count INTEGER, last_modified_time TEXT,
+                last_user_input_time TEXT, workspace_uris TEXT, source TEXT
+            );
+            INSERT INTO conversation_summaries (conversation_id, title, step_count, workspace_uris, source)
+            VALUES ('sess-cli', 'from agy', 3, '[\"file:///work/demo\"]', 'CORTEX_TRAJECTORY_SOURCE_CLI'),
+                   ('sess-app', 'from the app', 3, '[\"file:///work/demo\"]', 'CORTEX_TRAJECTORY_SOURCE_CASCADE_CLIENT');",
+        )
+        .unwrap();
+        drop(conn);
+        // An empty `brain/<id>` folder is no more of the conversation.
+        std::fs::create_dir_all(root.join("brain").join("sess-cli")).unwrap();
+
+        let state = build_state_from_token_monitor_sources(root, &ScanReport::default()).unwrap();
+        let mut ids: Vec<&String> = state.sessions.keys().collect();
+        ids.sort();
+        assert_eq!(ids, vec!["sess-app"]);
     }
 
     #[test]

@@ -9,7 +9,7 @@ use memmap2::Mmap;
 use serde_json::Value;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 const PROVIDER_ID: &str = "codebuddy";
@@ -27,11 +27,21 @@ pub fn detect() -> Option<ProviderInfo> {
     })
 }
 
-/// Get the `CodeBuddy` projects base path (`~/.codebuddy/projects`)
+/// The `CodeBuddy` projects root, `${CODEBUDDY_CONFIG_DIR:-~/.codebuddy}/projects`,
+/// as the CLI resolves its config dir (`CODEBUDDY_CONFIG_DIR?.trim() ?
+/// CODEBUDDY_CONFIG_DIR : ~/.codebuddy`, `dist/codebuddy.js` of 2.187.0).
+pub fn projects_root() -> Option<PathBuf> {
+    let config = match std::env::var("CODEBUDDY_CONFIG_DIR") {
+        Ok(dir) if !dir.trim().is_empty() => PathBuf::from(dir),
+        _ => crate::utils::home_dir()?.join(".codebuddy"),
+    };
+    Some(config.join("projects"))
+}
+
+/// The `CodeBuddy` projects root ([`projects_root`]) when it is a directory.
 pub fn get_base_path() -> Option<String> {
-    let home = crate::utils::home_dir()?;
-    let projects_path = home.join(".codebuddy").join("projects");
-    if projects_path.exists() && projects_path.is_dir() {
+    let projects_path = projects_root()?;
+    if projects_path.is_dir() {
         Some(projects_path.to_string_lossy().to_string())
     } else {
         None
@@ -384,10 +394,9 @@ fn project_path(project_dir: &Path) -> String {
     project_dir.to_string_lossy().to_string()
 }
 
-/// Validate that a session path is within `~/.codebuddy/projects`
+/// Validate that a session path is within the projects root ([`projects_root`])
 fn validate_session_path(path: &Path) -> Result<(), String> {
-    let home = crate::utils::home_dir().ok_or("Could not find home directory")?;
-    let allowed = home.join(".codebuddy").join("projects");
+    let allowed = projects_root().ok_or("Could not find home directory")?;
 
     let canonical = if path.exists() {
         path.canonicalize()
@@ -433,32 +442,110 @@ fn convert_timestamp(val: &Value) -> String {
     }
 }
 
-/// Convert content array: `input_text`/`output_text` -> `text`
-fn convert_content_array(content: Option<&Value>) -> Option<Value> {
-    let arr = content?.as_array()?;
+/// Openings of text `CodeBuddy` adds to a user turn itself: reminders, local
+/// command echoes, teammate messages and task notifications.
+const INJECTED_TEXT_PREFIXES: [&str; 5] = [
+    "<system-reminder",
+    "<command-name>",
+    "<local-command-stdout>",
+    "<teammate-message",
+    "<task-notification>",
+];
 
-    let items: Vec<Value> = arr
-        .iter()
-        .filter_map(|item| {
-            let ctype = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            match ctype {
-                "input_text" | "output_text" | "text" => {
-                    let text = item.get("text").and_then(|t| t.as_str()).unwrap_or("");
-                    Some(serde_json::json!({
-                        "type": "text",
-                        "text": text
-                    }))
+/// Convert content: `input_text`/`output_text` -> `text`. In a user turn,
+/// text `CodeBuddy` injected ([`INJECTED_TEXT_PREFIXES`]) is dropped and a
+/// `<user_query>` wrapper is removed, as `stripUserQueryTags` does.
+fn convert_content_array(content: Option<&Value>, is_user: bool) -> Option<Value> {
+    let text_block = |text: &str| {
+        if !is_user {
+            return Some(serde_json::json!({"type": "text", "text": text}));
+        }
+        let trimmed = text.trim_start();
+        if trimmed.is_empty()
+            || INJECTED_TEXT_PREFIXES
+                .iter()
+                .any(|prefix| trimmed.starts_with(prefix))
+        {
+            return None;
+        }
+        let text = trimmed
+            .strip_prefix("<user_query>")
+            .and_then(|rest| rest.trim_end().strip_suffix("</user_query>"))
+            .map_or(text, str::trim);
+        // `<user_query> </user_query>` is as empty as blank text.
+        if text.trim().is_empty() {
+            return None;
+        }
+        Some(serde_json::json!({"type": "text", "text": text}))
+    };
+    let items: Vec<Value> = match content? {
+        Value::String(text) => text_block(text).into_iter().collect(),
+        Value::Array(arr) => arr
+            .iter()
+            .filter_map(|item| {
+                let ctype = item.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                match ctype {
+                    "input_text" | "output_text" | "text" => {
+                        text_block(item.get("text").and_then(|t| t.as_str()).unwrap_or(""))
+                    }
+                    "image_blob_ref" => Some(item.clone()),
+                    _ => None,
                 }
-                "image_blob_ref" => Some(item.clone()),
-                _ => None,
-            }
-        })
-        .collect();
+            })
+            .collect(),
+        _ => return None,
+    };
 
     if items.is_empty() {
         None
     } else {
         Some(Value::Array(items))
+    }
+}
+
+/// What a `message` record is, by the checks `CodeBuddy`'s own
+/// `isRealUserMessageItem` / `isRealUserMessageForTitle` make (2.187.0).
+#[derive(PartialEq)]
+enum MessageKind {
+    /// A turn to show.
+    Turn,
+    /// A compaction boundary (`isCompacted` / `isSummary`): its text is the
+    /// summary that replaced the earlier turns.
+    Compaction,
+    /// The client's own plumbing written as a user record: `skipRun` (hook
+    /// output, local commands), `isMeta`, `isCompactInternal` (continue
+    /// prompts), `agent: "compact"` (the `/compact` instruction) and
+    /// teammate messages.
+    Hidden,
+}
+
+fn message_kind(val: &Value) -> MessageKind {
+    if val.get("role").and_then(Value::as_str) != Some("user") {
+        return MessageKind::Turn;
+    }
+    let Some(data) = val.get("providerData") else {
+        return MessageKind::Turn;
+    };
+    let flag = |key: &str| data.get(key).and_then(Value::as_bool) == Some(true);
+    if (flag("isCompacted") || flag("isSummary"))
+        && !flag("isPtlRecovery")
+        && !flag("isMediaBodyRecovery")
+    {
+        return MessageKind::Compaction;
+    }
+    let teammate = data
+        .get("teammateMessage")
+        .and_then(|t| t.get("from"))
+        .is_some_and(Value::is_string);
+    if flag("skipRun")
+        || flag("isMeta")
+        || flag("isCompactInternal")
+        || data.get("agent").and_then(Value::as_str) == Some("compact")
+        || teammate
+    {
+        MessageKind::Hidden
+    } else {
+        MessageKind::Turn
     }
 }
 
@@ -470,48 +557,65 @@ fn convert_message(
     counter: &mut u64,
 ) -> Option<ClaudeMessage> {
     let role = val.get("role").and_then(|r| r.as_str())?;
+    let kind = message_kind(val);
+    if kind == MessageKind::Hidden {
+        return None;
+    }
 
-    // Skip system-injected messages (providerData.skipRun with XML content)
-    if val
-        .get("providerData")
-        .and_then(|pd| pd.get("skipRun"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        if let Some(content) = val.get("content") {
-            if let Some(arr) = content.as_array() {
-                if let Some(first) = arr.first() {
-                    if let Some(text) = first.get("text").and_then(|t| t.as_str()) {
-                        if text.starts_with("<system-reminder")
-                            || text.starts_with("<command-name>")
-                            || text.starts_with("<local-command-stdout>")
-                        {
-                            return None;
-                        }
-                    }
-                }
-            }
-        }
+    let uuid = |counter: u64| {
+        val.get("id")
+            .and_then(|v| v.as_str())
+            .map_or_else(|| format!("codebuddy-{counter}"), String::from)
+    };
+
+    if kind == MessageKind::Compaction {
+        let summary = convert_content_array(val.get("content"), false).and_then(|blocks| {
+            let texts: Vec<&str> = blocks
+                .as_array()?
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .collect();
+            (!texts.is_empty()).then(|| texts.join("\n\n"))
+        });
+        let text = summary.map_or_else(
+            || "Context compacted".to_string(),
+            |summary| format!("Context compacted\n\n{summary}"),
+        );
+        *counter += 1;
+        let mut message = build_provider_message(
+            PROVIDER_ID,
+            uuid(*counter),
+            session_id,
+            timestamp.to_string(),
+            "system",
+            None,
+            Some(Value::String(text)),
+            None,
+        );
+        message.subtype = Some("compact_boundary".to_string());
+        message.level = Some("info".to_string());
+        return Some(message);
+    }
+
+    let is_user = role == "user";
+    let content = convert_content_array(val.get("content"), is_user);
+    // A user record whose every text was injected is not a prompt.
+    if is_user && content.is_none() {
+        return None;
     }
 
     *counter += 1;
-    let uuid = val
-        .get("id")
-        .and_then(|v| v.as_str())
-        .map(String::from)
-        .unwrap_or_else(|| format!("codebuddy-{counter}"));
-
     let message_type = match role {
         "assistant" => "assistant",
         "system" => "system",
         _ => "user",
     };
 
-    let content = convert_content_array(val.get("content"));
-
     Some(build_provider_message(
         PROVIDER_ID,
-        uuid,
+        uuid(*counter),
         session_id,
         timestamp.to_string(),
         message_type,
@@ -662,6 +766,12 @@ fn convert_function_call_result(
     msg
 }
 
+/// A title `CodeBuddy` itself skips (`isGeneratedPlaceholderTitle`): blank,
+/// `(No content)` or `/compact`.
+fn is_placeholder_title(title: &str) -> bool {
+    matches!(title, "" | "(No content)" | "/compact")
+}
+
 /// Extract session metadata from a JSONL file
 #[allow(unsafe_code)]
 fn extract_session_info(file_path: &Path) -> Option<ClaudeSession> {
@@ -675,7 +785,11 @@ fn extract_session_info(file_path: &Path) -> Option<ClaudeSession> {
     let mut first_time = String::new();
     let mut last_time = String::new();
     let mut has_tool_use = false;
-    let mut summary: Option<String> = None;
+    // Title candidates, newest of each kind; CodeBuddy's
+    // `getEffectiveSessionTitle` prefers them in this order.
+    let mut custom_title: Option<String> = None;
+    let mut ai_title: Option<String> = None;
+    let mut topic: Option<String> = None;
     let mut first_user_text: Option<String> = None;
 
     for &(start, end) in &ranges {
@@ -688,19 +802,20 @@ fn extract_session_info(file_path: &Path) -> Option<ClaudeSession> {
 
         let line_type = val.get("type").and_then(|t| t.as_str()).unwrap_or("");
         let timestamp = convert_timestamp(&val);
+        let title_field = |key: &str| {
+            val.get(key)
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|t| !is_placeholder_title(t))
+                .map(ToOwned::to_owned)
+        };
 
         match line_type {
             "message" => {
-                let role = val.get("role").and_then(|r| r.as_str()).unwrap_or("");
-
-                if val
-                    .get("providerData")
-                    .and_then(|pd| pd.get("skipRun"))
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
+                // Counted exactly when `load_messages` shows it.
+                let Some(message) = convert_message(&val, "", &timestamp, &mut 0) else {
                     continue;
-                }
+                };
 
                 if session_id.is_empty() {
                     if let Some(sid) = val.get("sessionId").and_then(|v| v.as_str()) {
@@ -715,22 +830,21 @@ fn extract_session_info(file_path: &Path) -> Option<ClaudeSession> {
                 }
                 last_time = timestamp;
 
-                if first_user_text.is_none() && role == "user" {
-                    if let Some(content) = val.get("content").and_then(|c| c.as_array()) {
-                        for item in content {
-                            if let Some(text) = item.get("text").and_then(|t| t.as_str()) {
-                                if !text.starts_with('<') {
-                                    let truncated = if text.chars().count() > 100 {
-                                        format!("{}...", text.chars().take(100).collect::<String>())
-                                    } else {
-                                        text.to_string()
-                                    };
-                                    first_user_text = Some(truncated);
-                                    break;
-                                }
+                if first_user_text.is_none() && message.message_type == "user" {
+                    first_user_text = message
+                        .content
+                        .as_ref()
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .find_map(|item| item.get("text").and_then(Value::as_str))
+                        .map(|text| {
+                            if text.chars().count() > 100 {
+                                format!("{}...", text.chars().take(100).collect::<String>())
+                            } else {
+                                text.to_string()
                             }
-                        }
-                    }
+                        });
                 }
             }
             "function_call" | "function_call_result" => {
@@ -742,20 +856,19 @@ fn extract_session_info(file_path: &Path) -> Option<ClaudeSession> {
                 }
                 last_time = timestamp;
             }
-            "summary" => {
-                if let Some(s) = val.get("summary").and_then(|v| v.as_str()) {
-                    summary = Some(s.to_string());
+            "custom-title" => {
+                if let Some(title) = title_field("customTitle") {
+                    custom_title = Some(title);
+                }
+            }
+            "ai-title" => {
+                if let Some(title) = title_field("aiTitle") {
+                    ai_title = Some(title);
                 }
             }
             "topic" => {
-                // Last-wins: CodeBuddy may emit multiple `topic` entries as
-                // the conversation evolves. The latest one is the current
-                // session title, so always overwrite (ignoring empty strings).
-                if let Some(topic) = val.get("topic").and_then(|v| v.as_str()) {
-                    let trimmed = topic.trim();
-                    if !trimmed.is_empty() {
-                        summary = Some(trimmed.to_string());
-                    }
+                if let Some(title) = title_field("topic") {
+                    topic = Some(title);
                 }
             }
             _ => {}
@@ -784,7 +897,8 @@ fn extract_session_info(file_path: &Path) -> Option<ClaudeSession> {
         })
         .unwrap_or_else(|| Utc::now().to_rfc3339());
 
-    let final_summary = summary.or(first_user_text);
+    let is_renamed = custom_title.is_some();
+    let final_summary = custom_title.or(ai_title).or(topic).or(first_user_text);
 
     Some(ClaudeSession {
         session_id: file_path_str.clone(),
@@ -814,7 +928,7 @@ fn extract_session_info(file_path: &Path) -> Option<ClaudeSession> {
         has_tool_use,
         has_errors: false,
         summary: final_summary,
-        is_renamed: false,
+        is_renamed,
         provider: Some(PROVIDER_ID.to_string()),
         storage_type: None,
         entrypoint: Some("cli".to_string()),
@@ -1298,5 +1412,129 @@ mod tests {
             assert_eq!(hit.project_path.as_deref(), Some(project.path.as_str()));
         }
         assert_ne!(results[0].project_path, results[1].project_path);
+    }
+
+    /// Records in the shapes `dist/codebuddy.js` (2.187.0) writes: hook output
+    /// (`skipRun`), the `/compact` instruction (`agent: "compact"`), a
+    /// continue prompt (`isCompactInternal`), the compaction boundary
+    /// (`isCompacted` + `isCompactInternal`), a teammate message, a reminder
+    /// riding in a prompt, a `<user_query>`-wrapped prompt, and titles.
+    fn plumbing_session() -> Vec<Value> {
+        let user = |text: &str, data: Value| {
+            json!({"type": "message", "role": "user", "sessionId": "s1",
+                   "timestamp": 1_700_000_000_000i64,
+                   "content": [{"type": "input_text", "text": text}],
+                   "providerData": data})
+        };
+        vec![
+            user("<user_query>fix the build</user_query>", json!({})),
+            json!({"type": "message", "role": "assistant", "sessionId": "s1",
+                   "timestamp": 1_700_000_001_000i64,
+                   "content": [{"type": "output_text", "text": "Fixed."}]}),
+            user("hook said hi", json!({"skipRun": true})),
+            user("Summarize the conversation", json!({"agent": "compact"})),
+            user(
+                "The build was fixed.",
+                json!({"isCompacted": true, "isCompactInternal": true, "isSummary": true}),
+            ),
+            user(
+                "Continue from where you left off.",
+                json!({"isCompactInternal": true}),
+            ),
+            user("status?", json!({"teammateMessage": {"from": "agent-2"}})),
+            json!({"type": "message", "role": "user", "sessionId": "s1",
+                   "timestamp": 1_700_000_002_000i64,
+                   "content": [
+                       {"type": "input_text", "text": "<system-reminder>todo list</system-reminder>"},
+                       {"type": "input_text", "text": "now add tests"}]}),
+            user(
+                "<task-notification><task-id>t1</task-id></task-notification>",
+                json!({}),
+            ),
+            user("<user_query> \n </user_query>", json!({})),
+            json!({"type": "topic", "topic": "Build fix"}),
+            json!({"type": "ai-title", "aiTitle": "Fixing the build"}),
+            json!({"type": "custom-title", "customTitle": "My rename"}),
+            json!({"type": "ai-title", "aiTitle": "(No content)"}),
+        ]
+    }
+
+    /// Restores `CODEBUDDY_CONFIG_DIR` on drop.
+    struct ConfigDirGuard(Option<std::ffi::OsString>);
+    impl ConfigDirGuard {
+        fn set(value: &Path) -> Self {
+            let previous = std::env::var_os("CODEBUDDY_CONFIG_DIR");
+            std::env::set_var("CODEBUDDY_CONFIG_DIR", value);
+            Self(previous)
+        }
+    }
+    impl Drop for ConfigDirGuard {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(v) => std::env::set_var("CODEBUDDY_CONFIG_DIR", v),
+                None => std::env::remove_var("CODEBUDDY_CONFIG_DIR"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn client_plumbing_is_not_shown_as_prompts_and_counts_match() {
+        let home = crate::test_utils::SandboxHome::new();
+        let config = home.path().join("custom-codebuddy");
+        let _guard = ConfigDirGuard::set(&config);
+        let project_dir = config.join("projects").join("Users-me-app");
+        std::fs::create_dir_all(&project_dir).expect("create project");
+        let session_path = project_dir.join("s1.jsonl");
+        std::fs::write(&session_path, join_jsonl(&plumbing_session())).expect("write");
+
+        let projects = scan_projects().expect("CODEBUDDY_CONFIG_DIR store found");
+        assert_eq!(projects.len(), 1);
+
+        let messages = load_messages(&session_path.to_string_lossy()).expect("load");
+        let shown: Vec<(String, Value)> = messages
+            .iter()
+            .map(|m| (m.message_type.clone(), m.content.clone().unwrap()))
+            .collect();
+        assert_eq!(
+            shown,
+            vec![
+                (
+                    "user".into(),
+                    json!([{"type": "text", "text": "fix the build"}])
+                ),
+                (
+                    "assistant".into(),
+                    json!([{"type": "text", "text": "Fixed."}])
+                ),
+                (
+                    "system".into(),
+                    json!("Context compacted\n\nThe build was fixed.")
+                ),
+                (
+                    "user".into(),
+                    json!([{"type": "text", "text": "now add tests"}])
+                ),
+            ]
+        );
+        assert_eq!(messages[2].subtype.as_deref(), Some("compact_boundary"));
+
+        let sessions = load_sessions(&project_dir.to_string_lossy(), false).expect("sessions");
+        assert_eq!(sessions[0].message_count, messages.len());
+        assert_eq!(sessions[0].summary.as_deref(), Some("My rename"));
+        assert!(sessions[0].is_renamed);
+    }
+
+    #[test]
+    fn ai_title_wins_over_topic_and_placeholders_are_skipped() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session_path = tmp.path().join("s.jsonl");
+        let mut lines = plumbing_session();
+        lines.retain(|l| l["type"] != "custom-title");
+        std::fs::write(&session_path, join_jsonl(&lines)).expect("write");
+
+        let session = extract_session_info(&session_path).expect("session");
+        assert_eq!(session.summary.as_deref(), Some("Fixing the build"));
+        assert!(!session.is_renamed);
     }
 }

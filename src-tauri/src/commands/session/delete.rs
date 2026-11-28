@@ -95,8 +95,14 @@ fn is_safe_session_id(id: &str) -> bool {
 
 /// What deleting one Cursor Agent CLI session removes.
 pub(super) struct CursorAgentTargets {
-    /// The `<projects>/<project>/agent-transcripts/<id>/` folder.
+    /// The `<projects>/<project>/agent-transcripts/<id>/` folder, or the
+    /// older flat `agent-transcripts/<id>.jsonl` file.
     pub session_dir: PathBuf,
+    /// The same chat in the other layout, when both exist: the flat
+    /// `agent-transcripts/<id>.jsonl` beside a nested session, or the nested
+    /// `<id>/` folder beside a flat one. Trashed before `session_dir`, so a
+    /// failed delete can be retried with the same transcript path.
+    pub other_layout: Option<PathBuf>,
     /// The `<project>` folder name the transcript sits in.
     pub project: String,
     /// The CLI's `<chats>/<workspace-hash>/<id>/` metadata folders.
@@ -104,11 +110,12 @@ pub(super) struct CursorAgentTargets {
 }
 
 /// Cursor Agent CLI session: `<projects>/<project>/agent-transcripts/<id>/<id>.jsonl`
-/// plus the CLI's chat metadata at `<chats>/<workspace-hash>/<id>/`.
+/// (or the older flat `agent-transcripts/<id>.jsonl`) plus the CLI's chat
+/// metadata at `<chats>/<workspace-hash>/<id>/`.
 ///
 /// The delete target is resolved here from the transcript path and must be the
-/// `<id>/` transcript folder strictly inside `projects_root`; the metadata
-/// folders must be strictly inside `chats_root`.
+/// `<id>/` transcript folder (the flat file itself) strictly inside
+/// `projects_root`; the metadata folders must be strictly inside `chats_root`.
 pub(super) fn resolve_cursor_agent_targets(
     projects_root: &Path,
     chats_root: Option<&Path>,
@@ -121,23 +128,33 @@ pub(super) fn resolve_cursor_agent_targets(
     }
 
     let (root, parts) = components_inside(projects_root, transcript)?;
-    let [project, transcripts, id, file] = parts.as_slice() else {
-        return Err("Not a Cursor Agent transcript path".to_string());
+    let (project, transcripts, id, session_dir) = match parts.as_slice() {
+        [project, transcripts, id, file] if *file == format!("{id}.jsonl") => (
+            project,
+            transcripts,
+            id.clone(),
+            root.join(project).join(transcripts).join(id),
+        ),
+        [project, transcripts, file] => (
+            project,
+            transcripts,
+            file.strip_suffix(".jsonl").unwrap_or_default().to_string(),
+            root.join(project).join(transcripts).join(file),
+        ),
+        _ => return Err("Not a Cursor Agent transcript path".to_string()),
     };
     if transcripts != "agent-transcripts"
-        || !is_safe_session_id(id)
-        || *file != format!("{id}.jsonl")
+        || !is_safe_session_id(&id)
         || !crate::utils::is_safe_storage_id(project)
     {
         return Err("Not a Cursor Agent transcript path".to_string());
     }
-    let session_dir = root.join(project).join(transcripts).join(id);
 
     let metadata_dirs: Vec<PathBuf> = match chats_root.map(Path::canonicalize) {
         Some(Ok(chats)) => fs::read_dir(&chats)
             .map_err(|e| format!("Failed to read Cursor Agent chats: {e}"))?
             .filter_map(Result::ok)
-            .map(|workspace| workspace.path().join(id))
+            .map(|workspace| workspace.path().join(&id))
             .filter(|dir| {
                 fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
             })
@@ -146,8 +163,37 @@ pub(super) fn resolve_cursor_agent_targets(
         _ => Vec::new(),
     };
 
+    let transcripts_dir = root.join(project).join(transcripts);
+    let flat = transcripts_dir.join(format!("{id}.jsonl"));
+    let nested = transcripts_dir.join(&id);
+    let (other, want_dir) = if session_dir == flat {
+        (nested, true)
+    } else {
+        (flat, false)
+    };
+    // Only absence means "no other copy"; an entry that cannot be inspected
+    // fails the delete before anything is trashed.
+    let other_layout = match fs::symlink_metadata(&other) {
+        Ok(m)
+            if !m.file_type().is_symlink()
+                && (m.is_dir() == want_dir)
+                && (m.is_file() != want_dir) =>
+        {
+            Some(other)
+        }
+        Ok(_) => None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            return Err(format!(
+                "Cannot inspect the other copy of the session {}: {e}",
+                other.display()
+            ))
+        }
+    };
+
     Ok(CursorAgentTargets {
         session_dir,
+        other_layout,
         project: project.clone(),
         metadata_dirs,
     })
@@ -161,6 +207,9 @@ fn delete_cursor_agent_session(
     transcript: &Path,
 ) -> Result<(), String> {
     let targets = resolve_cursor_agent_targets(projects_root, chats_root, transcript)?;
+    if let Some(other) = &targets.other_layout {
+        trash_only(other).map_err(|e| format!("Failed to delete session: {e}"))?;
+    }
     trash_only(&targets.session_dir).map_err(|e| format!("Failed to delete session: {e}"))?;
     for dir in targets.metadata_dirs {
         trash_only(&dir).map_err(|e| {
@@ -432,6 +481,44 @@ mod tests {
         assert!(other_dir.exists());
         assert!(other_meta.exists());
         assert!(session_dir.parent().unwrap().is_dir());
+    }
+
+    /// The older flat `agent-transcripts/<id>.jsonl` is the session itself.
+    #[tokio::test]
+    #[serial]
+    async fn cursor_agent_delete_trashes_a_legacy_flat_transcript() {
+        let home = crate::test_utils::SandboxHome::new();
+        let id = "flat-1";
+        let (_, current_dir, _) = cursor_agent_session(home.path(), "keep-me");
+        let flat = current_dir.parent().unwrap().join(format!("{id}.jsonl"));
+        fs::write(&flat, "{}\n").unwrap();
+        let meta_dir = home.path().join(".cursor/chats/0123abcd").join(id);
+        fs::create_dir_all(&meta_dir).unwrap();
+
+        delete_session(flat.to_string_lossy().into()).await.unwrap();
+        assert!(!flat.exists());
+        assert!(!meta_dir.exists());
+        assert!(current_dir.exists());
+    }
+
+    /// A chat with both layouts goes away whole, whichever transcript the
+    /// request names: the other copy would otherwise be listed again.
+    #[tokio::test]
+    #[serial]
+    async fn cursor_agent_delete_takes_the_other_layout_too() {
+        let home = crate::test_utils::SandboxHome::new();
+        for (id, name_flat) in [("both-1", false), ("both-2", true)] {
+            let (transcript, session_dir, _) = cursor_agent_session(home.path(), id);
+            let flat = session_dir.parent().unwrap().join(format!("{id}.jsonl"));
+            fs::write(&flat, "{}\n").unwrap();
+            let named = if name_flat { &flat } else { &transcript };
+
+            delete_session(named.to_string_lossy().into())
+                .await
+                .unwrap();
+            assert!(!session_dir.exists(), "nested copy of {id}");
+            assert!(!flat.exists(), "flat copy of {id}");
+        }
     }
 
     /// Only `<id>/<id>.jsonl` names a Cursor Agent session; any other path

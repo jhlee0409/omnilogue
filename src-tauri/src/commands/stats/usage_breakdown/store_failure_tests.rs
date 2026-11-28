@@ -22,6 +22,8 @@ struct Store {
     /// Parts of the store its scan reads; each one alone at mode 000 leaves
     /// the session unreadable.
     locks: Vec<PathBuf>,
+    /// Locks after which the scan still reads the session, from another part.
+    partial: Vec<PathBuf>,
 }
 
 impl Store {
@@ -30,11 +32,18 @@ impl Store {
             provider,
             env: Vec::new(),
             locks,
+            partial: Vec::new(),
         }
     }
 
     fn with_env(mut self, key: &'static str, value: &Path) -> Self {
         self.env.push(EnvGuard::set(key, value));
+        self
+    }
+
+    /// Parts whose loss another part covers (see [`PARTIAL`]).
+    fn with_partial(mut self, parts: Vec<PathBuf>) -> Self {
+        self.partial = parts;
         self
     }
 }
@@ -43,6 +52,8 @@ type Fixture = fn(&Path) -> Store;
 
 const READABLE: &str = "scanned, 1 session read";
 const UNREADABLE: &str = "unreadable, 0 sessions read";
+/// A lock whose part another part of the store covers: the session is read.
+const PARTIAL: &str = "partial, 1 session read";
 
 /// The provider's coverage in an `all` request for it alone. Each request
 /// starts with a cold contribution cache: it keys on size and mtime, which a
@@ -83,6 +94,7 @@ async fn check(fixtures: &[Fixture]) {
             provider,
             env: _env,
             locks,
+            partial,
         } = fixture(home.path());
         seen.push((
             provider,
@@ -106,7 +118,12 @@ async fn check(fixtures: &[Fixture]) {
                 part.clone(),
                 coverage_of(provider, home.path()).await,
             ));
-            expected.push((provider, part, UNREADABLE.to_string()));
+            let outcome = if partial.contains(lock) {
+                PARTIAL
+            } else {
+                UNREADABLE
+            };
+            expected.push((provider, part, outcome.to_string()));
         }
     }
     assert_eq!(seen, expected);
@@ -210,6 +227,7 @@ async fn the_other_commands_answer_an_unreadable_store_as_before() {
             provider,
             env: _env,
             locks,
+            ..
         } = fixture(home.path());
         assert_eq!(
             before.len(),
@@ -498,8 +516,8 @@ const DEVELOP_ANSWERS: &[(Fixture, &[&str])] = &[
             "0 E 0 E E 0 E", // absent
             "0 E 0 E E 0 E", // globalStorage
             "0 0 0 0 0 0 E", // saoudrizwan.claude-dev
-            "0 0 0 0 0 0 1", // state
-            "0 0 0 0 0 0 1", // taskHistory.json
+            "1 0 0 0 0 1 1", // state
+            "1 0 0 0 0 1 1", // taskHistory.json
             "1 1 0 E E 0 E", // tasks
             "1 1 0 E E 0 E", // task-1
             "1 1 0 E E 0 E", // ui_messages.json
@@ -519,12 +537,14 @@ const DEVELOP_ANSWERS: &[(Fixture, &[&str])] = &[
     (
         copilot_vscode,
         &[
-            "1 1 1 1 1 1 E", // readable
+            // The last command reads a legacy `.json` session as Copilot
+            // (#854); it fell through to Claude before.
+            "1 1 1 1 1 1 2", // readable
             "0 0 0 0 0 0 E", // absent
             "0 0 0 0 0 0 E", // User
             "0 0 0 0 0 0 E", // workspaceStorage
             "0 0 0 0 0 0 E", // abc123
-            "0 1 1 1 1 0 E", // workspace.json
+            "0 1 1 1 1 0 2", // workspace.json
             "0 0 0 0 0 0 E", // chatSessions
             "0 0 0 0 0 0 E", // vs-1.json
         ],
@@ -924,18 +944,21 @@ fn cline(home: &Path) -> Store {
                   "ts": 1_760_605_200_000_u64}])],
     );
     assert!(global.starts_with(home));
+    // The task index is only a list: its tasks are also found from their own
+    // folders, so losing it leaves the session read (under no project).
     Store::new(
         "cline",
         vec![
             global,
             ext.clone(),
             ext.join("state"),
-            history,
+            history.clone(),
             ext.join("tasks"),
             task,
             messages,
         ],
     )
+    .with_partial(vec![ext.join("state"), history])
 }
 
 /// Copilot CLI: `~/.copilot/session-state/<id>/events.jsonl`.

@@ -148,8 +148,10 @@ pub(crate) fn is_safe_history_file_path(path: &std::path::Path) -> Result<(), St
         home.join(".local").join("share").join("kilo"),
         home.join(".cline").join("tasks"),
         home.join(".cursor"),
-        home.join(".codebuddy").join("projects"),
     ];
+    if let Some(codebuddy_root) = crate::providers::codebuddy::projects_root() {
+        allowed.push(codebuddy_root);
+    }
     if let Some(kimi_base) = crate::providers::kimi::get_base_path() {
         allowed.push(PathBuf::from(kimi_base).join("sessions"));
     }
@@ -196,13 +198,20 @@ pub(crate) fn is_safe_history_file_path(path: &std::path::Path) -> Result<(), St
     if let Some(oh_base) = crate::providers::openhands::get_base_path() {
         allowed.push(PathBuf::from(oh_base));
     }
-    if let Some(trae_base) = crate::providers::trae::get_base_path() {
-        allowed.push(PathBuf::from(trae_base));
-    }
+    // Trae and Trae CN workspace storage.
+    allowed.extend(crate::providers::trae::base_paths());
     // Qoder's transcript stores (CLI, Qoder CN, the IDE's embedded agent):
     // each `projects/` folder holds only session transcripts, their sidecars
     // and subagent transcripts, never the app's credentials.
     allowed.extend(crate::providers::qoder::store_dirs());
+    // Cursor Agent transcripts and ACP sessions where `CURSOR_DATA_DIR` /
+    // `CURSOR_CONFIG_DIR` / `XDG_CONFIG_HOME` moved them out of `~/.cursor`.
+    if let Some(cursor_projects) = crate::providers::cursor_agent::get_base_path() {
+        allowed.push(PathBuf::from(cursor_projects));
+    }
+    if let Some(cursor_config) = crate::providers::cursor_agent::config_root() {
+        allowed.push(cursor_config.join("acp-sessions"));
+    }
     // Claude directories the user configured (Settings → Custom Claude
     // Directories, `CLAUDE_CONFIG_DIR`) — the same sources `scan_all_projects`
     // reads. Each must pass the custom-directory validator, which already

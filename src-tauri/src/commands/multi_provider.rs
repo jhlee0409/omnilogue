@@ -231,13 +231,13 @@ pub async fn scan_all_projects(
                 let projects = scan().map(|projects| {
                     let store = match name {
                         "opencode" => providers::opencode::get_base_path()
-                            .map(|base| (base, OPENCODE_DB_FILE)),
+                            .map(|base| (base, OPENCODE_DB_FILE.to_string())),
                         "kilo" => providers::kilo::get_base_path()
-                            .map(|base| (base, providers::kilo::DB_FILE)),
+                            .map(|base| (base, providers::kilo::db_file())),
                         _ => None,
                     };
                     if let Some((base, db)) = store {
-                        sidebar::group_projects(&base, db, projects)
+                        sidebar::group_projects(&base, &db, projects)
                     } else {
                         projects.into_iter().map(ListedProject::from).collect()
                     }

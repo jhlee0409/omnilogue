@@ -518,3 +518,147 @@ async fn statistics_open_a_conversation_but_never_count_an_export() {
     assert_eq!(summary.total_sessions, 0);
     assert_eq!(summary.total_tokens, 0);
 }
+
+/// A conversation in the shape of a 2026 export: no `current_leaf_message_uuid`,
+/// messages linked by `parent_message_uuid` (the root's parent is the
+/// all-zero uuid). The first reply was regenerated, so the prompt has two
+/// replies, and the conversation went on from the newer one.
+fn regenerated_conversation() -> Value {
+    let message = |uuid: &str, parent: &str, sender: &str, at: &str, content: Value| {
+        json!({"uuid": uuid, "parent_message_uuid": parent, "sender": sender,
+               "created_at": at, "updated_at": at, "text": "", "content": content,
+               "attachments": [], "files": []})
+    };
+    let text = |t: &str| json!([{"type": "text", "text": t}]);
+    json!({
+        "uuid": "0b6a2f4e-1c3d-4e5f-8a9b-0000000000aa",
+        "name": "Regenerated",
+        "summary": "",
+        "created_at": "2026-10-01T10:00:00Z",
+        "updated_at": "2026-10-01T10:05:00Z",
+        "account": {"uuid": "acc"},
+        "chat_messages": [
+            message("m1", "00000000-0000-4000-8000-000000000000", "human", "2026-10-01T10:00:00Z",
+                json!([
+                    {"type": "injected_prompt_block", "text": "context claude.ai added"},
+                    {"type": "text", "text": "first prompt"}
+                ])),
+            message("m2-old", "m1", "assistant", "2026-10-01T10:00:10Z", text("old reply")),
+            message("m2-new", "m1", "assistant", "2026-10-01T10:01:00Z", text("new reply")),
+            message("m3", "m2-new", "human", "2026-10-01T10:02:00Z", text("follow-up")),
+            message("m4", "m3", "assistant", "2026-10-01T10:02:10Z", text("answer")),
+        ],
+    })
+}
+
+fn shown_texts(conversation: &Conversation) -> Vec<&str> {
+    conversation
+        .messages
+        .iter()
+        .flat_map(|m| m.blocks.iter())
+        .map(|b| b["text"].as_str().unwrap_or("<non-text block>"))
+        .collect()
+}
+
+#[test]
+fn without_a_recorded_leaf_the_latest_branch_is_shown() {
+    let Ok(conversation) = Conversation::from_value(regenerated_conversation()) else {
+        panic!("conversation rejected");
+    };
+    assert_eq!(
+        shown_texts(&conversation),
+        vec!["first prompt", "new reply", "follow-up", "answer"],
+        "one branch, the regenerated reply's; the injected block is not shown"
+    );
+}
+
+#[test]
+fn a_recorded_leaf_still_wins_over_the_latest_branch() {
+    let mut value = regenerated_conversation();
+    value["current_leaf_message_uuid"] = json!("m2-old");
+    let Ok(conversation) = Conversation::from_value(value) else {
+        panic!("conversation rejected");
+    };
+    assert_eq!(
+        shown_texts(&conversation),
+        vec!["first prompt", "old reply"]
+    );
+}
+
+/// Links that are neither a known uuid nor the root sentinel, and repeated
+/// uuids, leave the export's order as it is.
+#[test]
+fn malformed_links_keep_the_export_order() {
+    let all = vec![
+        "first prompt",
+        "old reply",
+        "new reply",
+        "follow-up",
+        "answer",
+    ];
+    for (index, field, value) in [(2, "parent_message_uuid", "unknown"), (1, "uuid", "m2-new")] {
+        let mut conversation = regenerated_conversation();
+        conversation["chat_messages"][index][field] = json!(value);
+        let Ok(conversation) = Conversation::from_value(conversation) else {
+            panic!("conversation rejected");
+        };
+        assert_eq!(shown_texts(&conversation), all, "{field} = {value}");
+    }
+}
+
+/// A message whose uuid is blank, hanging off the root sentinel, next to a
+/// normal fork: its uuid is the root's own key, so the export's order is
+/// kept (and the walk from the root ends).
+#[test]
+fn a_blank_uuid_keeps_the_export_order() {
+    let mut conversation = regenerated_conversation();
+    let messages = conversation["chat_messages"].as_array_mut().unwrap();
+    let mut blank = messages[0].clone();
+    blank["uuid"] = json!("");
+    blank["content"] = json!([{"type": "text", "text": "blank"}]);
+    messages.push(blank);
+    let Ok(conversation) = Conversation::from_value(conversation) else {
+        panic!("conversation rejected");
+    };
+    assert_eq!(
+        shown_texts(&conversation),
+        vec![
+            "first prompt",
+            "old reply",
+            "new reply",
+            "follow-up",
+            "answer",
+            "blank"
+        ]
+    );
+}
+
+/// A cycle cut off from the root (`x → y → x`) next to a normal fork: the
+/// links are not a tree, so the export's order is kept.
+#[test]
+fn a_detached_cycle_keeps_the_export_order() {
+    let mut conversation = regenerated_conversation();
+    let messages = conversation["chat_messages"].as_array_mut().unwrap();
+    for (uuid, parent) in [("x", "y"), ("y", "x")] {
+        let mut message = messages[4].clone();
+        message["uuid"] = json!(uuid);
+        message["parent_message_uuid"] = json!(parent);
+        message["content"] = json!([{"type": "text", "text": uuid}]);
+        messages.push(message);
+    }
+    let Ok(conversation) = Conversation::from_value(conversation) else {
+        panic!("conversation rejected");
+    };
+    assert_eq!(
+        shown_texts(&conversation),
+        vec![
+            "first prompt",
+            "old reply",
+            "new reply",
+            "follow-up",
+            "answer",
+            "x",
+            "y"
+        ]
+    );
+}

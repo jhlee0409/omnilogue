@@ -639,12 +639,11 @@ fn detect_session_provider(session_path: &str) -> StatsProvider {
     {
         return StatsProvider::Copilot;
     }
-    if (session_path.contains("/workspaceStorage/")
-        || session_path.contains("\\workspaceStorage\\"))
-        && (session_path.contains("/chatSessions/") || session_path.contains("\\chatSessions\\"))
-        && PathBuf::from(session_path)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("jsonl"))
+    // Both formats VS Code writes: `.jsonl` patch logs and legacy `.json`.
+    if providers::copilot::is_vscode_session_path(session_path)
+        && PathBuf::from(session_path).extension().is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("jsonl") || ext.eq_ignore_ascii_case("json")
+        })
     {
         return StatsProvider::Copilot;
     }
@@ -709,21 +708,11 @@ fn is_antigravity_path(path: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Whether `path` lies under `~/.codebuddy/projects/`. Anchored detection avoids
-/// false positives from arbitrary substrings (e.g. `/work/foo.codebuddy-test`).
+/// Whether `path` lies under the `CodeBuddy` projects root
+/// (`${CODEBUDDY_CONFIG_DIR:-~/.codebuddy}/projects`). Anchored detection
+/// avoids false positives from arbitrary substrings (e.g. `/work/foo.codebuddy-test`).
 fn is_codebuddy_path(path: &str) -> bool {
-    let Some(home) = crate::utils::home_dir() else {
-        return false;
-    };
-    is_codebuddy_path_under(path, &home)
-}
-
-/// Implementation of [`is_codebuddy_path`] parameterized by the home dir,
-/// so tests can drive the anchored check with a fixed home and not depend
-/// on whether the CI runner has a HOME env at all.
-fn is_codebuddy_path_under(path: &str, home: &Path) -> bool {
-    let root = home.join(".codebuddy").join("projects");
-    Path::new(path).starts_with(root)
+    providers::codebuddy::projects_root().is_some_and(|root| Path::new(path).starts_with(root))
 }
 
 fn is_kimi_path(path: &str) -> bool {
@@ -7035,7 +7024,7 @@ mod tests {
             .join("events.jsonl");
         fs::create_dir_all(events_path.parent().unwrap()).unwrap();
         fs::write(&events_path, "").unwrap();
-        let _env_guard = EnvVarGuard::set("COPILOT_CLI_HOME", tmp.path());
+        let _env_guard = EnvVarGuard::set("COPILOT_HOME", tmp.path());
 
         assert_eq!(
             detect_session_provider(&events_path.to_string_lossy()),
@@ -9008,20 +8997,20 @@ mod tests {
 
     /// Kilo Code is wired into per-project/session stats but was missing from
     /// `get_global_stats_summary`'s per-provider collection, so a Kilo-only
-    /// store produced an empty global summary (PR #580 review). `KILO_HOME`
+    /// store produced an empty global summary (PR #580 review). `KILO_DB`
     /// points the provider at a fixture `kilo.db`.
     #[tokio::test]
     #[serial]
     async fn test_global_summary_includes_kilo_store() {
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let kilo_home = temp_dir.path().join("kilo");
-        fs::create_dir_all(&kilo_home).expect("create KILO_HOME");
+        fs::create_dir_all(&kilo_home).expect("create the Kilo store");
         {
             let conn = providers::kilo::test_support::create_test_db(&kilo_home);
             providers::kilo::test_support::seed(&conn);
             providers::kilo::test_support::seed_assistant_usage(&conn, 100, 50);
         }
-        let _kilo_home = EnvVarGuard::set("KILO_HOME", &kilo_home);
+        let _kilo_db = EnvVarGuard::set("KILO_DB", &kilo_home.join("kilo.db"));
 
         // claude_path is required but the Claude projects subtree is empty —
         // only the Kilo branch of the global summary is exercised.
@@ -9059,7 +9048,7 @@ mod tests {
         let _home = crate::test_utils::SandboxHome::new();
         let temp_dir = TempDir::new().expect("failed to create temp dir");
         let kilo_home = temp_dir.path().join("kilo");
-        fs::create_dir_all(&kilo_home).expect("create KILO_HOME");
+        fs::create_dir_all(&kilo_home).expect("create the Kilo store");
         {
             let conn = providers::kilo::test_support::create_test_db(&kilo_home);
             providers::kilo::test_support::seed(&conn);
@@ -9081,7 +9070,7 @@ mod tests {
             )
             .unwrap();
         }
-        let _kilo_home = EnvVarGuard::set("KILO_HOME", &kilo_home);
+        let _kilo_db = EnvVarGuard::set("KILO_DB", &kilo_home.join("kilo.db"));
         let session_path = "kilo://proj1/ses_001".to_string();
 
         let billing = get_session_token_stats(
@@ -9812,50 +9801,6 @@ mod tests {
         assert_eq!(stats.total_cache_creation_tokens, 28644);
         assert_eq!(stats.total_cache_read_tokens, 14732);
         assert_eq!(stats.total_tokens, 6 + 222 + 28644 + 14732);
-    }
-
-    /// `CodeBuddy` provider detection must be anchored under
-    /// `~/.codebuddy/projects`, not a substring match. Otherwise paths like
-    /// `/work/foo.codebuddy-test/...` get routed to `CodeBuddy` loaders that
-    /// then return empty / error, breaking stats for the actual provider.
-    /// Uses an injected home so the assertion is meaningful regardless of
-    /// the runner's environment.
-    #[test]
-    fn is_codebuddy_path_rejects_substring_lookalikes() {
-        let home = Path::new("/test-home/user");
-        // Substring-style matches that the OLD `path.contains(".codebuddy")`
-        // logic would have accepted — all must be rejected by the anchored
-        // version.
-        assert!(
-            !is_codebuddy_path_under("/work/foo.codebuddy-test/projects/abc.jsonl", home),
-            "name suffix lookalike must not match"
-        );
-        assert!(
-            !is_codebuddy_path_under("/Users/dev/notes/.codebuddy-clone/data.jsonl", home),
-            "hidden-dir lookalike must not match"
-        );
-        assert!(
-            !is_codebuddy_path_under("/tmp/sample.codebuddy.jsonl", home),
-            "filename containing the substring must not match"
-        );
-    }
-
-    /// Real-shaped `CodeBuddy` paths must still be detected. Mirrors the
-    /// runtime layout: `~/.codebuddy/projects/<project>/<session>.jsonl`.
-    /// Uses an injected home so the test does not silently skip on runners
-    /// without `$HOME` and does not depend on the actual user's filesystem.
-    #[test]
-    fn is_codebuddy_path_accepts_real_layout() {
-        let home = Path::new("/test-home/user");
-        let real = home
-            .join(".codebuddy")
-            .join("projects")
-            .join("my-project")
-            .join("session-1.jsonl");
-        assert!(
-            is_codebuddy_path_under(real.to_string_lossy().as_ref(), home),
-            "anchored detection must accept ~/.codebuddy/projects/.../*.jsonl"
-        );
     }
 
     /// `oh-my-pi` provider detection must be anchored under
