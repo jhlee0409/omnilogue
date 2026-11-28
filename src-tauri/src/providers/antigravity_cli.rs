@@ -13,6 +13,10 @@
 //! ├── history.jsonl                # conversation index, one line per prompt:
 //! │                                #   {"display", "timestamp" (unix ms),
 //! │                                #    "workspace", "type"?, "conversationId"?}
+//! ├── conversation_summaries.db    # SQLite, `conversation_summaries` rows
+//! │                                #   (`conversation_id`, `title`,
+//! │                                #   `workspace_uris`): the workspace of
+//! │                                #   sessions `history.jsonl` lacks (`agy acp`)
 //! └── brain/<conversation-uuid>/
 //!     └── .system_generated/logs/transcript_full.jsonl
 //!                                  # step records: {"step_index", "source"
@@ -29,6 +33,7 @@
 //! `conversations/<uuid>.db` protobuf SQLite, `implicit/*.pb`,
 //! per-conversation markdown, `scratch/`) are intentionally NOT parsed.
 
+use crate::commands::antigravity::{load_conversation_summaries_map, ConversationSummaryMeta};
 use crate::models::{ClaudeMessage, ClaudeProject, ClaudeSession};
 use crate::utils::{is_symlink, search_json_value_case_insensitive};
 use chrono::{DateTime, Utc};
@@ -200,14 +205,15 @@ pub(crate) fn load_messages_from_root(
 }
 
 /// The project path (`antigravity-cli://<workspace>`) the project list puts
-/// conversation `conversation_id` under — the same `history.jsonl` lookup
+/// conversation `conversation_id` under — the same lookup
 /// [`collect_sessions`] groups by, so the file watcher names the project the
 /// UI holds.
 pub(crate) fn project_path_for_conversation(root: &Path, conversation_id: &str) -> String {
-    let workspace = read_index(root)
-        .remove(conversation_id)
-        .and_then(|entry| entry.workspace)
-        .unwrap_or_else(|| UNKNOWN_WORKSPACE.to_string());
+    let summaries = load_conversation_summaries_map(root);
+    let workspace = workspace_for(
+        read_index(root).get(conversation_id),
+        summaries.get(conversation_id),
+    );
     project_path_for_workspace(&workspace)
 }
 
@@ -383,11 +389,13 @@ fn list_session_dirs(root: &Path) -> Vec<(String, PathBuf)> {
 /// mapping to zero viewer messages are dropped.
 fn collect_sessions(root: &Path) -> Vec<CliSession> {
     let index = read_index(root);
+    let summaries = load_conversation_summaries_map(root);
 
     list_session_dirs(root)
         .into_iter()
         .filter_map(|(conversation_id, dir)| {
             let entry = index.get(&conversation_id);
+            let summary_row = summaries.get(&conversation_id);
             let transcript = transcript_path(&dir);
             let fallback_ts = entry
                 .and_then(|e| e.timestamp_ms)
@@ -402,11 +410,10 @@ fn collect_sessions(root: &Path) -> Vec<CliSession> {
 
             let summary = entry
                 .and_then(|e| e.display.clone())
+                .or_else(|| summary_row.and_then(|m| m.title.clone()))
                 .or_else(|| first_user_text(&messages))
                 .map(|text| truncate_chars(&text, SUMMARY_MAX_CHARS));
-            let workspace = entry
-                .and_then(|e| e.workspace.clone())
-                .unwrap_or_else(|| UNKNOWN_WORKSPACE.to_string());
+            let workspace = workspace_for(entry, summary_row);
 
             Some(CliSession {
                 conversation_id,
@@ -417,6 +424,17 @@ fn collect_sessions(root: &Path) -> Vec<CliSession> {
             })
         })
         .collect()
+}
+
+/// A conversation's workspace: the one `history.jsonl` records, else the one
+/// `conversation_summaries.db` records (`agy acp` sessions, and recent
+/// `history.jsonl` lines without a `conversationId`, are only there), else
+/// [`UNKNOWN_WORKSPACE`].
+fn workspace_for(entry: Option<&IndexEntry>, summary: Option<&ConversationSummaryMeta>) -> String {
+    entry
+        .and_then(|e| e.workspace.clone())
+        .or_else(|| summary.and_then(|m| m.workspace.clone()))
+        .unwrap_or_else(|| UNKNOWN_WORKSPACE.to_string())
 }
 
 fn project_name_for_workspace(workspace: &str) -> String {
@@ -693,6 +711,54 @@ mod tests {
         assert_eq!(sessions[0].session_id, "conv-orphan");
         assert_eq!(sessions[0].summary.as_deref(), Some("orphan prompt"));
         assert_eq!(sessions[0].project_name, FALLBACK_PROJECT_NAME);
+    }
+
+    /// A `conversation_summaries` row, the columns Antigravity writes.
+    fn write_summary(root: &Path, id: &str, title: &str, workspace_uris: &str, source: &str) {
+        let conn = rusqlite::Connection::open(root.join("conversation_summaries.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS conversation_summaries (
+                conversation_id TEXT PRIMARY KEY, title TEXT, preview TEXT,
+                step_count INTEGER, last_modified_time TEXT,
+                last_user_input_time TEXT, workspace_uris TEXT, source TEXT,
+                project_id TEXT
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO conversation_summaries
+             (conversation_id, title, step_count, workspace_uris, source, project_id)
+             VALUES (?1, ?2, 1, ?3, ?4, 'default-cli-project')",
+            rusqlite::params![id, title, workspace_uris, source],
+        )
+        .unwrap();
+    }
+
+    /// `agy acp` writes no `history.jsonl` line; the conversation's workspace
+    /// and title are in `conversation_summaries.db`.
+    #[test]
+    fn a_session_missing_from_the_index_takes_its_workspace_from_the_summaries() {
+        let temp = TempDir::new().expect("temp dir");
+        let root = cli_root(&temp);
+        write_fixture(&root);
+        write_summary(
+            &root,
+            "conv-orphan",
+            "ACP task",
+            r#"["file:///tmp/proj-acp"]"#,
+            "CORTEX_TRAJECTORY_SOURCE_CLI",
+        );
+
+        assert!(load_sessions_from_root(&root, UNKNOWN_WORKSPACE).is_empty());
+        let sessions = load_sessions_from_root(&root, "/tmp/proj-acp");
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].session_id, "conv-orphan");
+        assert_eq!(sessions[0].summary.as_deref(), Some("ACP task"));
+        assert_eq!(sessions[0].project_name, "proj-acp");
+        assert_eq!(
+            project_path_for_conversation(&root, "conv-orphan"),
+            format!("{SCHEME}/tmp/proj-acp")
+        );
     }
 
     #[test]
