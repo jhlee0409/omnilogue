@@ -28,10 +28,17 @@
 //!   holds `text`, `thinking`, `tool_use` and `tool_result` blocks (older
 //!   exports have only `text`).
 //! - `projects.json`: an array of `{uuid, name, …}`, used for project names.
+//!   Recent exports instead put one `projects/<uuid>.json` per project, in a
+//!   download part of their own; it is not read, since nothing links to it.
 //! - `users.json` holds account details and is never read.
 //!
-//! Conversations in a claude.ai Project are grouped under that project; the
-//! rest go to one "Claude.ai" project per export. When a conversation records
+//! A conversation that names its claude.ai Project (`project_uuid` or
+//! `project.uuid`) is grouped under that project; the rest go to one
+//! "Claude.ai" project per export. Exports since 2026 name no project on a
+//! conversation and list no conversations on a project
+//! (anthropics/claude-code#40411; ModelBrain's export, 2026-10-30), so all
+//! their conversations land in that one project; matching by name or wording
+//! would be guesswork and is not done. When a conversation records
 //! its active branch (`current_leaf_message_uuid` + parent links), only that
 //! branch is shown, as claude.ai shows it. Exports from 2026 record no leaf
 //! (ModelBrain's 272-conversation export, 2026-10-30): a conversation with
