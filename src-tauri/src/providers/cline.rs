@@ -901,6 +901,7 @@ fn convert_cline_message(
     msg: &Value,
     session_id: &str,
     counter: &mut u64,
+    open_call: Option<&str>,
 ) -> Option<ClaudeMessage> {
     let msg_type = msg.get("type").and_then(Value::as_str)?;
     let ts = msg.get("ts").and_then(Value::as_f64).unwrap_or(0.0) as u64;
@@ -913,7 +914,7 @@ fn convert_cline_message(
     match msg_type {
         "say" => {
             let say = msg.get("say").and_then(Value::as_str).unwrap_or("");
-            convert_say_message(say, text, msg, &uuid, session_id, &timestamp)
+            convert_say_message(say, text, msg, &uuid, session_id, &timestamp, open_call)
         }
         "ask" => {
             let ask = msg.get("ask").and_then(Value::as_str).unwrap_or("");
@@ -934,8 +935,22 @@ fn convert_ui_messages(ui_messages: &[Value], session_id: &str) -> Vec<ClaudeMes
     let prompt = prompt_index(ui_messages);
     let mut counter = 0u64;
     let mut messages = Vec::new();
+    // The id of the tool call whose result record has not come yet.
+    let mut open_call: Option<String> = None;
     for (index, msg) in ui_messages.iter().enumerate() {
-        if let Some(mut converted) = convert_cline_message(msg, session_id, &mut counter) {
+        let say = msg.get("say").and_then(Value::as_str).unwrap_or("");
+        let converted = convert_cline_message(msg, session_id, &mut counter, open_call.as_deref());
+        match say {
+            "use_mcp_server" | "browser_action_launch" | "browser_action" | "use_subagents" => {
+                open_call = converted
+                    .as_ref()
+                    .and_then(|m| m.content.as_ref()?.get(0)?.get("id")?.as_str())
+                    .map(str::to_string);
+            }
+            "mcp_server_response" | "browser_action_result" | "subagent" => open_call = None,
+            _ => {}
+        }
+        if let Some(mut converted) = converted {
             if prompt == Some(index) {
                 converted.message_type = "user".to_string();
                 converted.role = Some("user".to_string());
@@ -975,6 +990,7 @@ fn convert_say_message(
     uuid: &str,
     session_id: &str,
     timestamp: &str,
+    open_call: Option<&str>,
 ) -> Option<ClaudeMessage> {
     match say {
         "text" | "completion_result" => {
@@ -1138,10 +1154,22 @@ fn convert_say_message(
                 None,
             ))
         }
-        // MCP tool / resource output (Roo `UseMcpToolTool`, pretty-printed text).
+        // Cline's request to use an MCP tool or resource, and the response
+        // that follows it (Roo records the request as an ask, so its
+        // response stands alone as pretty-printed text).
+        "use_mcp_server" => convert_mcp_request(text, uuid, session_id, timestamp),
         "mcp_server_response" => {
             if text.is_empty() {
                 return None;
+            }
+            if open_call.is_some() {
+                return call_result(
+                    open_call,
+                    vec![text_block(text)],
+                    uuid,
+                    session_id,
+                    timestamp,
+                );
             }
             Some(assistant_text(
                 format!("```\n{text}\n```"),
@@ -1150,6 +1178,62 @@ fn convert_say_message(
                 timestamp,
             ))
         }
+        // Cline's browser tool: the launch URL, each action, and the page it
+        // leaves (logs, URL, screenshot).
+        "browser_action_launch" => {
+            if text.is_empty() {
+                return None;
+            }
+            let input = serde_json::json!({"action": "launch", "url": text});
+            Some(tool_call(
+                "browser_action",
+                input,
+                uuid,
+                session_id,
+                timestamp,
+            ))
+        }
+        "browser_action" => {
+            if text.is_empty() {
+                return None;
+            }
+            Some(tool_call(
+                "browser_action",
+                json_input(text),
+                uuid,
+                session_id,
+                timestamp,
+            ))
+        }
+        "browser_action_result" => call_result(
+            open_call,
+            browser_result_blocks(text),
+            uuid,
+            session_id,
+            timestamp,
+        ),
+        // Cline's sub-agents: the prompts it started them with, and their
+        // final status.
+        "use_subagents" => {
+            if text.is_empty() {
+                return None;
+            }
+            Some(tool_call(
+                "use_subagents",
+                json_input(text),
+                uuid,
+                session_id,
+                timestamp,
+            ))
+        }
+        "subagent" => {
+            if text.is_empty() {
+                return None;
+            }
+            let blocks = vec![text_block(&subagent_summary(text))];
+            call_result(open_call, blocks, uuid, session_id, timestamp)
+        }
+        "image" => convert_image(text, uuid, session_id, timestamp),
         // Roo `CodebaseSearchTool`: JSON `{tool, content: {query, results:
         // [{filePath, startLine, endLine, codeChunk, ..}]}}`.
         "codebase_search_result" => convert_codebase_search(text, uuid, session_id, timestamp),
@@ -1183,15 +1267,8 @@ fn convert_say_message(
         | "sliding_window_truncation"
         | "compaction"
         | "mcp_server_request_started"
-        | "use_mcp_server"
         | "too_many_tools_warning"
         | "user_edit_todos"
-        | "image"
-        | "browser_action_launch"
-        | "browser_action"
-        | "browser_action_result"
-        | "subagent"
-        | "use_subagents"
         | "subagent_usage"
         | "cloud_provisioning"
         | "load_mcp_documentation"
@@ -1226,6 +1303,236 @@ fn assistant_text(text: String, uuid: &str, session_id: &str, timestamp: &str) -
         Some("assistant"),
         Some(serde_json::json!([{"type": "text", "text": text}])),
         None,
+    )
+}
+
+/// An assistant message that calls tool `name`; its `tool_use` id is
+/// `cline_tool_<uuid>`, which the result record that follows is paired by.
+fn tool_call(
+    name: &str,
+    input: Value,
+    uuid: &str,
+    session_id: &str,
+    timestamp: &str,
+) -> ClaudeMessage {
+    build_provider_message(
+        "cline",
+        uuid.to_string(),
+        session_id,
+        timestamp.to_string(),
+        "assistant",
+        Some("assistant"),
+        Some(serde_json::json!([{
+            "type": "tool_use",
+            "id": format!("cline_tool_{uuid}"),
+            "name": name,
+            "input": input
+        }])),
+        None,
+    )
+}
+
+/// The result record of the open call `call_id`: a user message holding a
+/// `tool_result`. A result with no open call (Cline records the request as an
+/// ask, which is not read, when it was not auto-approved) is an assistant
+/// message of the blocks themselves. `None` when there is nothing to show.
+fn call_result(
+    call_id: Option<&str>,
+    blocks: Vec<Value>,
+    uuid: &str,
+    session_id: &str,
+    timestamp: &str,
+) -> Option<ClaudeMessage> {
+    if blocks.is_empty() {
+        return None;
+    }
+    let (message_type, content) = match call_id {
+        Some(id) => {
+            let result = match blocks.as_slice() {
+                [only] if only["type"] == "text" => only["text"].clone(),
+                _ => Value::Array(blocks),
+            };
+            (
+                "user",
+                serde_json::json!([{
+                    "type": "tool_result",
+                    "tool_use_id": id,
+                    "content": result
+                }]),
+            )
+        }
+        None => ("assistant", Value::Array(blocks)),
+    };
+    Some(build_provider_message(
+        "cline",
+        uuid.to_string(),
+        session_id,
+        timestamp.to_string(),
+        message_type,
+        Some(message_type),
+        Some(content),
+        None,
+    ))
+}
+
+fn text_block(text: &str) -> Value {
+    serde_json::json!({"type": "text", "text": text})
+}
+
+/// The input of a tool call recorded as a JSON object; the raw text when it
+/// is anything else.
+fn json_input(text: &str) -> Value {
+    serde_json::from_str::<Value>(text)
+        .ok()
+        .filter(Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({"text": text}))
+}
+
+/// An image block for a `data:image/…;base64,…` URL.
+fn image_block(data_url: &str) -> Option<Value> {
+    let (media_type, data) = data_url.strip_prefix("data:")?.split_once(";base64,")?;
+    if !media_type.starts_with("image/") || data.is_empty() {
+        return None;
+    }
+    Some(serde_json::json!({
+        "type": "image",
+        "source": {"type": "base64", "media_type": media_type, "data": data}
+    }))
+}
+
+/// Cline's `say:"use_mcp_server"`: JSON `{serverName, type, toolName?,
+/// arguments?, uri?}` (`ClineAskUseMcpServer`, `cline/cline@e1bdeef`
+/// `apps/vscode/src/shared/ExtensionMessage.ts`; `arguments` is a JSON
+/// string). A tool call is named `mcp__<server>__<tool>`, as MCP tools are
+/// in Claude's transcripts; a resource read is `access_mcp_resource`.
+fn convert_mcp_request(
+    text: &str,
+    uuid: &str,
+    session_id: &str,
+    timestamp: &str,
+) -> Option<ClaudeMessage> {
+    let Ok(Value::Object(request)) = serde_json::from_str::<Value>(text) else {
+        return (!text.is_empty())
+            .then(|| assistant_text(text.to_string(), uuid, session_id, timestamp));
+    };
+    let field = |key: &str| request.get(key).and_then(Value::as_str).unwrap_or("");
+    if field("type") == "access_mcp_resource" {
+        let input = serde_json::json!({"server_name": field("serverName"), "uri": field("uri")});
+        return Some(tool_call(
+            "access_mcp_resource",
+            input,
+            uuid,
+            session_id,
+            timestamp,
+        ));
+    }
+    let input = match request.get("arguments") {
+        Some(Value::String(args)) if args.is_empty() => serde_json::json!({}),
+        Some(Value::String(args)) => serde_json::from_str::<Value>(args)
+            .unwrap_or_else(|_| serde_json::json!({"arguments": args})),
+        Some(other) if !other.is_null() => other.clone(),
+        _ => serde_json::json!({}),
+    };
+    let name = format!("mcp__{}__{}", field("serverName"), field("toolName"));
+    Some(tool_call(&name, input, uuid, session_id, timestamp))
+}
+
+/// Cline's `say:"browser_action_result"`: JSON `BrowserActionResult
+/// {screenshot?, logs?, currentUrl?, currentMousePosition?}`, the screenshot
+/// a `data:image/…;base64,…` URL. Empty (a close) when there is nothing.
+fn browser_result_blocks(text: &str) -> Vec<Value> {
+    let Ok(Value::Object(result)) = serde_json::from_str::<Value>(text) else {
+        return if text.is_empty() {
+            Vec::new()
+        } else {
+            vec![text_block(text)]
+        };
+    };
+    let field = |key: &str| {
+        result
+            .get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let mut lines = Vec::new();
+    if let Some(logs) = field("logs") {
+        lines.push(logs.to_string());
+    }
+    if let Some(url) = field("currentUrl") {
+        lines.push(format!("URL: {url}"));
+    }
+    let mut blocks = Vec::new();
+    if !lines.is_empty() {
+        blocks.push(text_block(&lines.join("\n")));
+    }
+    blocks.extend(field("screenshot").and_then(image_block));
+    blocks
+}
+
+/// Cline's `say:"subagent"`: JSON `ClineSaySubagentStatus {status, total,
+/// completed, items: [{prompt, status, result?, error?, ..}], ..}`, the final
+/// state of a `use_subagents` call.
+fn subagent_summary(text: &str) -> String {
+    let Ok(status) = serde_json::from_str::<Value>(text) else {
+        return text.to_string();
+    };
+    let count = |key: &str| status.get(key).and_then(Value::as_u64).unwrap_or(0);
+    let mut lines = vec![format!(
+        "Subagents {}: {} of {} done",
+        status
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown"),
+        count("completed"),
+        count("total")
+    )];
+    for (index, item) in status
+        .get("items")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .enumerate()
+    {
+        let field = |key: &str| item.get(key).and_then(Value::as_str).unwrap_or("");
+        lines.push(format!(
+            "{}. [{}] {}",
+            index + 1,
+            field("status"),
+            field("prompt")
+        ));
+        for detail in [field("result"), field("error")] {
+            if !detail.is_empty() {
+                lines.push(truncate_chars(detail, 2000, "...(truncated)"));
+            }
+        }
+    }
+    lines.join("\n")
+}
+
+/// Roo's `say:"image"` (`generate_image`): JSON `{imageUri, imagePath}`. The
+/// `imageUri` is a webview URI that cannot be opened here, so the file's path
+/// is shown; a `data:image/…` URL, if one is recorded, is shown as the image.
+fn convert_image(
+    text: &str,
+    uuid: &str,
+    session_id: &str,
+    timestamp: &str,
+) -> Option<ClaudeMessage> {
+    if let Some(image) = image_block(text) {
+        return call_result(None, vec![image], uuid, session_id, timestamp);
+    }
+    let path = serde_json::from_str::<Value>(text)
+        .ok()?
+        .get("imagePath")?
+        .as_str()?
+        .to_string();
+    system_notice(
+        &format!("Generated image: {path}"),
+        "notice",
+        "info",
+        uuid,
+        session_id,
+        timestamp,
     )
 }
 
@@ -1563,7 +1870,7 @@ mod tests {
             "text": "Hello from Cline"
         });
         let mut counter = 0;
-        let result = convert_cline_message(&msg, "test", &mut counter).unwrap();
+        let result = convert_cline_message(&msg, "test", &mut counter, None).unwrap();
         assert_eq!(result.message_type, "assistant");
         assert_eq!(result.provider, Some("cline".to_string()));
     }
@@ -1577,7 +1884,7 @@ mod tests {
             "text": "{\"tool\":\"readFile\",\"path\":\"/test.txt\",\"content\":\"file contents\"}"
         });
         let mut counter = 0;
-        let result = convert_cline_message(&msg, "test", &mut counter).unwrap();
+        let result = convert_cline_message(&msg, "test", &mut counter, None).unwrap();
         let content = result.content.unwrap();
         let arr = content.as_array().unwrap();
         assert_eq!(arr[0]["type"], "tool_use");
@@ -1594,7 +1901,7 @@ mod tests {
             "text": "npm test"
         });
         let mut counter = 0;
-        let result = convert_cline_message(&msg, "test", &mut counter).unwrap();
+        let result = convert_cline_message(&msg, "test", &mut counter, None).unwrap();
         let content = result.content.unwrap();
         let arr = content.as_array().unwrap();
         assert_eq!(arr[0]["name"], "Bash");
@@ -1609,7 +1916,7 @@ mod tests {
             "text": "thinking about this..."
         });
         let mut counter = 0;
-        let result = convert_cline_message(&msg, "test", &mut counter).unwrap();
+        let result = convert_cline_message(&msg, "test", &mut counter, None).unwrap();
         let content = result.content.unwrap();
         let arr = content.as_array().unwrap();
         assert_eq!(arr[0]["type"], "thinking");
@@ -1624,7 +1931,7 @@ mod tests {
             "text": "Something went wrong"
         });
         let mut counter = 0;
-        let result = convert_cline_message(&msg, "test", &mut counter).unwrap();
+        let result = convert_cline_message(&msg, "test", &mut counter, None).unwrap();
         assert_eq!(result.message_type, "system");
         assert_eq!(result.level, Some("error".to_string()));
     }
@@ -1658,7 +1965,7 @@ mod tests {
         // #849 C2: the model's question is an assistant message, not the user's.
         let msg = ask("followup", "Can you explain more?");
         let mut counter = 0;
-        let result = convert_cline_message(&msg, "test", &mut counter).unwrap();
+        let result = convert_cline_message(&msg, "test", &mut counter, None).unwrap();
         assert_eq!(result.message_type, "assistant");
         assert_eq!(result.role.as_deref(), Some("assistant"));
         assert_eq!(first_text(&result), "Can you explain more?");
@@ -1792,6 +2099,8 @@ mod tests {
             "too_many_tools_warning",
             "user_edit_todos",
             "compaction",
+            "subagent_usage",
+            "cloud_provisioning",
         ] {
             let records = [say(kind, r#"{"some":"payload"}"#)];
             assert!(
@@ -1844,6 +2153,172 @@ mod tests {
         assert_eq!(blocks[1]["type"], "tool_result");
         assert_eq!(blocks[1]["tool_use_id"], blocks[0]["id"]);
         assert_eq!(blocks[1]["content"], "src/auth.rs:3-9\nfn login() {}");
+    }
+
+    fn blocks(message: &ClaudeMessage) -> &Vec<Value> {
+        message.content.as_ref().unwrap().as_array().unwrap()
+    }
+
+    /// Cline's `use_mcp_server` request is a tool call named like Claude's MCP
+    /// tools, and the `mcp_server_response` after it is that call's result.
+    #[test]
+    fn mcp_request_and_response_are_a_paired_tool_call() {
+        let request = json!({"serverName": "gh", "type": "use_mcp_tool",
+                             "toolName": "create_issue", "arguments": "{\"title\":\"x\"}"});
+        let out = convert_ui_messages(
+            &[
+                say("use_mcp_server", &request.to_string()),
+                say("mcp_server_request_started", ""),
+                say("mcp_server_response", "created #1"),
+                say("mcp_server_response", "stray"),
+            ],
+            "t",
+        );
+        assert_eq!(out.len(), 3);
+        let call = &blocks(&out[0])[0];
+        assert_eq!(out[0].message_type, "assistant");
+        assert_eq!(call["type"], "tool_use");
+        assert_eq!(call["name"], "mcp__gh__create_issue");
+        assert_eq!(call["input"], json!({"title": "x"}));
+        assert_eq!(out[1].message_type, "user");
+        let result = &blocks(&out[1])[0];
+        assert_eq!(result["type"], "tool_result");
+        assert_eq!(result["tool_use_id"], call["id"]);
+        assert_eq!(result["content"], "created #1");
+        // A response after the call was answered stands alone.
+        assert_eq!(out[2].message_type, "assistant");
+        assert_eq!(first_text(&out[2]), "```\nstray\n```");
+    }
+
+    #[test]
+    fn mcp_resource_request_and_unparsable_arguments() {
+        let resource =
+            json!({"serverName": "fs", "type": "access_mcp_resource", "uri": "file:///a"});
+        let tool = json!({"serverName": "fs", "type": "use_mcp_tool", "toolName": "t",
+                          "arguments": "not json"});
+        let out = convert_ui_messages(
+            &[
+                say("use_mcp_server", &resource.to_string()),
+                say("use_mcp_server", &tool.to_string()),
+            ],
+            "t",
+        );
+        let first = &blocks(&out[0])[0];
+        assert_eq!(first["name"], "access_mcp_resource");
+        assert_eq!(
+            first["input"],
+            json!({"server_name": "fs", "uri": "file:///a"})
+        );
+        let second = &blocks(&out[1])[0];
+        assert_eq!(second["name"], "mcp__fs__t");
+        assert_eq!(second["input"], json!({"arguments": "not json"}));
+    }
+
+    /// `browser_action_launch` text is the URL; `browser_action` is JSON
+    /// `{action, coordinate?, text?}`; `browser_action_result` is JSON
+    /// `{screenshot?, logs?, currentUrl?, currentMousePosition?}`.
+    #[test]
+    fn browser_actions_are_tool_calls_with_their_results() {
+        let result = json!({"screenshot": "data:image/webp;base64,AAAA", "logs": "console: ok",
+                            "currentUrl": "http://localhost:3000/"});
+        let out = convert_ui_messages(
+            &[
+                say("browser_action_launch", "http://localhost:3000"),
+                say("browser_action_result", &result.to_string()),
+                say(
+                    "browser_action",
+                    r#"{"action":"click","coordinate":"450,300"}"#,
+                ),
+                say("browser_action_result", ""),
+            ],
+            "t",
+        );
+        // The empty result (a close) shows nothing.
+        assert_eq!(out.len(), 3);
+        let launch = &blocks(&out[0])[0];
+        assert_eq!(launch["name"], "browser_action");
+        assert_eq!(
+            launch["input"],
+            json!({"action": "launch", "url": "http://localhost:3000"})
+        );
+
+        assert_eq!(out[1].message_type, "user");
+        let paired = &blocks(&out[1])[0];
+        assert_eq!(paired["tool_use_id"], launch["id"]);
+        assert_eq!(
+            paired["content"],
+            json!([
+                {"type": "text", "text": "console: ok\nURL: http://localhost:3000/"},
+                {"type": "image",
+                 "source": {"type": "base64", "media_type": "image/webp", "data": "AAAA"}}
+            ])
+        );
+
+        let click = &blocks(&out[2])[0];
+        assert_eq!(
+            click["input"],
+            json!({"action": "click", "coordinate": "450,300"})
+        );
+    }
+
+    #[test]
+    fn browser_result_without_a_call_is_shown_as_the_page_it_left() {
+        let result = json!({"logs": "(No new logs)", "currentUrl": "http://x/"});
+        let out = convert_ui_messages(&[say("browser_action_result", &result.to_string())], "t");
+        assert_eq!(out[0].message_type, "assistant");
+        assert_eq!(first_text(&out[0]), "(No new logs)\nURL: http://x/");
+    }
+
+    /// `use_subagents` is JSON `{prompts}`; `subagent` is its final status.
+    #[test]
+    fn subagents_are_a_tool_call_with_their_final_status() {
+        let prompts = json!({"prompts": ["find the bug", "write a test"]});
+        let status = json!({"status": "completed", "total": 2, "completed": 2, "items": [
+            {"index": 0, "prompt": "find the bug", "status": "completed", "result": "in lib.rs"},
+            {"index": 1, "prompt": "write a test", "status": "failed", "error": "timed out"}]});
+        let out = convert_ui_messages(
+            &[
+                say("use_subagents", &prompts.to_string()),
+                say("subagent", &status.to_string()),
+                say("subagent_usage", r#"{"source":"subagents","tokensIn":1}"#),
+            ],
+            "t",
+        );
+        assert_eq!(out.len(), 2);
+        let call = &blocks(&out[0])[0];
+        assert_eq!(call["name"], "use_subagents");
+        assert_eq!(call["input"], prompts);
+        let result = &blocks(&out[1])[0];
+        assert_eq!(result["tool_use_id"], call["id"]);
+        assert_eq!(
+            result["content"],
+            "Subagents completed: 2 of 2 done\n1. [completed] find the bug\nin lib.rs\n\
+             2. [failed] write a test\ntimed out"
+        );
+    }
+
+    /// Roo's `generate_image` says `{imageUri, imagePath}`: the webview URI
+    /// cannot be opened, so the path is shown.
+    #[test]
+    fn roo_image_shows_its_path_and_a_data_url_as_an_image() {
+        let payload = json!({"imageUri": "https://file+.vscode-resource.vscode-cdn.net/a.png?t=1",
+                             "imagePath": "/w/a.png"});
+        let out = convert_ui_messages(
+            &[
+                say("image", &payload.to_string()),
+                say("image", "data:image/png;base64,QUJD"),
+                say("image", "not an image"),
+            ],
+            "t",
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].message_type, "system");
+        assert_eq!(first_text(&out[0]), "Generated image: /w/a.png");
+        assert_eq!(
+            blocks(&out[1])[0],
+            json!({"type": "image",
+                   "source": {"type": "base64", "media_type": "image/png", "data": "QUJD"}})
+        );
     }
 
     fn write_task_files(base: &Path, id: &str, files: &[(&str, String)]) {
@@ -1990,7 +2465,7 @@ mod tests {
             "text": "{}"
         });
         let mut counter = 0;
-        assert!(convert_cline_message(&msg, "test", &mut counter).is_none());
+        assert!(convert_cline_message(&msg, "test", &mut counter, None).is_none());
     }
 
     #[test]
