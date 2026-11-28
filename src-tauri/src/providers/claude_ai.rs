@@ -37,7 +37,8 @@
 //! "Claude.ai" project per export. Exports since 2026 name no project on a
 //! conversation and list no conversations on a project
 //! (anthropics/claude-code#40411; ModelBrain's export, 2026-10-30), so all
-//! their conversations land in that one project; matching by name or wording
+//! their conversations with messages land in that one project (empty
+//! drafts are not listed); matching by name or wording
 //! would be guesswork and is not done. When a conversation records
 //! its active branch (`current_leaf_message_uuid` + parent links), only that
 //! branch is shown, as claude.ai shows it. Exports from 2026 record no leaf
