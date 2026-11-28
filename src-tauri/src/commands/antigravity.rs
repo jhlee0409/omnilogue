@@ -531,6 +531,14 @@ pub(crate) struct ConversationSummaryMeta {
     pub last_modified_ms: u64,
 }
 
+impl ConversationSummaryMeta {
+    /// A CLI conversation the desktop app only mirrored: the row says so and
+    /// the store holds none of its text.
+    pub(crate) fn is_cli_mirror(&self) -> bool {
+        self.from_cli && self.fts_text_bytes == 0
+    }
+}
+
 /// Turns a workspace value (`file:///…` URI or plain path) into the folder path
 /// the project list groups by. A Windows drive URI (`file:///C:/work`, or VS
 /// Code's `file:///c%3A/work`) becomes `C:/work`: the leading slash RFC 8089
@@ -1347,10 +1355,13 @@ fn build_state_from_token_monitor_sources(
             &mut persisted,
             summaries_map.get(&candidate.session_id),
         );
-        // Reject completely empty brain directories that have no files, no rpc artifact, and no summary/db metadata
+        // Reject completely empty brain directories that have no files, no rpc
+        // artifact, and no summary/db metadata (a mirrored CLI row is none).
         if !has_rpc_artifact
             && candidate.file_paths.is_empty()
-            && !summaries_map.contains_key(&candidate.session_id)
+            && summaries_map
+                .get(&candidate.session_id)
+                .is_none_or(ConversationSummaryMeta::is_cli_mirror)
             && conversation_db_path(root, &candidate.session_id).is_none()
         {
             continue;
@@ -1472,7 +1483,7 @@ fn build_state_from_token_monitor_sources(
         // nothing of it is under this root, so it is listed by the CLI store
         // and would be an empty duplicate here.
         let summary = summaries_map.get(&session_id);
-        if summary.is_some_and(|m| m.from_cli && m.fts_text_bytes == 0)
+        if summary.is_some_and(ConversationSummaryMeta::is_cli_mirror)
             && token_files.is_empty()
             && db_path.is_none()
         {
@@ -2324,6 +2335,8 @@ mod tests {
         )
         .unwrap();
         drop(conn);
+        // An empty `brain/<id>` folder is no more of the conversation.
+        std::fs::create_dir_all(root.join("brain").join("sess-cli")).unwrap();
 
         let state = build_state_from_token_monitor_sources(root, &ScanReport::default()).unwrap();
         let mut ids: Vec<&String> = state.sessions.keys().collect();
